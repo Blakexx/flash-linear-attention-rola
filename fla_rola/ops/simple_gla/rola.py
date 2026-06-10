@@ -19,10 +19,18 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
-from fla_rola.utils import autotune_cache_kwargs
+from fla_rola.utils import autotune_cache_kwargs, check_shared_mem
 
-_AT_CFGS = [triton.Config({}, num_warps=w, num_stages=s) for w in (2, 4, 8) for s in (1, 2, 3)]
+# Device-aware sizing (same mechanism as FLA's own kernels): the [BT, BG*BV] intermediates are
+# 64KB each at BT=32 — fine on >=ampere-class smem (~100-160KB), over the 64KB limit of sm75 (T4).
+# Small-smem devices: halve the chunk (BT=16) and cap pipeline stages at 2.
+_BIG_SMEM = check_shared_mem('ada')   # ada tier = 101376 B (RTX 30/40-class); A100/H100 also pass; sm75 (T4, 64KB) fails
+_AT_CFGS = [triton.Config({}, num_warps=w, num_stages=s)
+            for w in (2, 4, 8) for s in ((1, 2, 3) if _BIG_SMEM else (1,))]   # sm75: stages=2 still 68KB>64KB
 _AT_KEY = ['dqk', 'dv', 'nc']
+_CHUNK_FWD = 64 if _BIG_SMEM else 16     # RLA forward
+_CHUNK = 32 if _BIG_SMEM else 16         # GLA forward + all backwards (GLA needs BT<=32 for the
+                                         # fp32 decay floor; BT=16 keeps sm75 within 64KB)
 
 
 @triton.autotune(configs=_AT_CFGS, key=_AT_KEY, **autotune_cache_kwargs)
@@ -108,9 +116,10 @@ class _RoLARLAFn(torch.autograd.Function):
         return cast(dq), cast(dk), cast(dvv), cast(dw), cast(dr), None, None, None
 
 
-def rola_rla_triton(q, k, v, r, w, chunk=64, bwd_chunk=16, BG=16):
+def rola_rla_triton(q, k, v, r, w, chunk=None, bwd_chunk=16, BG=16):
     """Un-normalized routed RLA readout via Triton. q,k:[BH,L,K] v:[BH,L,V] r,w:[BH,L,nc]
     (r=read gate, w=write gate). Returns [BH,L,V]. Differentiable (fused Triton backward)."""
+    chunk = _CHUNK_FWD if chunk is None else min(chunk, _CHUNK_FWD)
     return _RoLARLAFn.apply(q, k, v, w, r, chunk, bwd_chunk, BG)
 
 
@@ -215,9 +224,10 @@ class _RoLAGLAFn(torch.autograd.Function):
         return cast(dq), cast(dk), cast(dvv), cast(dwg), cast(drg), cast(dld), None, None
 
 
-def rola_gla_triton(q, k, v, r, w, ld, chunk=32, BG=16):
+def rola_gla_triton(q, k, v, r, w, ld, chunk=None, BG=16):
     """Un-normalized routed GLA readout via Triton. q,k:[BH,L,K] v:[BH,L,V] r,w,ld:[BH,L,nc]
     (r=read gate, w=write gate, ld=per-state log-decay). Returns [BH,L,V]. Differentiable."""
+    chunk = _CHUNK if chunk is None else min(chunk, _CHUNK)
     return _RoLAGLAFn.apply(q, k, v, w, r, ld, chunk, BG)
 
 
@@ -483,7 +493,8 @@ def _alloc_split(q, v, wg, chunk, BG):
     return BD, BV, NB, NCH, Sb, dSa, dq, dk, dvo, dr, dw
 
 
-def _bwd_split_rla(q, k, v, wg, rg, g, chunk=32, BG=16):
+def _bwd_split_rla(q, k, v, wg, rg, g, chunk=None, BG=16):
+    chunk = _CHUNK if chunk is None else chunk
     B, L, dqk = q.shape; dv = v.shape[-1]; nc = wg.shape[-1]
     q, k, v, wg, rg, g = [x.contiguous() for x in (q, k, v, wg, rg, g)]
     BD, BV, NB, NCH, Sb, dSa, dq, dk, dvo, dr, dw = _alloc_split(q, v, wg, chunk, BG)
@@ -506,7 +517,8 @@ def _bwd_split_rla(q, k, v, wg, rg, g, chunk=32, BG=16):
     return dq.sum(1), dk.sum(1), dvo.sum(1)[..., :dv], dw, dr
 
 
-def _bwd_split_gla(q, k, v, wg, rg, ld, g, chunk=32, BG=16):
+def _bwd_split_gla(q, k, v, wg, rg, ld, g, chunk=None, BG=16):
+    chunk = _CHUNK if chunk is None else chunk
     B, L, dqk = q.shape; dv = v.shape[-1]; nc = wg.shape[-1]
     ld = ld.clamp(min=_GLA_FLOOR)
     q, k, v, wg, rg, ld, g = [x.contiguous() for x in (q, k, v, wg, rg, ld, g)]
@@ -549,3 +561,137 @@ def _bwd_split_gla(q, k, v, wg, rg, ld, g, chunk=32, BG=16):
     da[:, :, -1, :] = da[:, :, -1, :] + dlam
     dld = torch.flip(torch.cumsum(torch.flip(da, [2]), 2), [2]).reshape(B, Lp, nc)[:, :L]
     return dq.sum(1), dk.sum(1), dvo.sum(1)[..., :dv], dwg, drg, dld
+
+
+# ============================================================================
+# Phase G — per-state DENOMINATOR kernel (for kappa / per-state normalization).
+#
+# d[i,c] = Σ_{j≤i} (φq_i·φk_j) w_j^c — the mass state c contributes to token i's partition
+# function. Used to rescale read gates: r̃ = r·(d+ε)^{-κ(x)} (κ=0 global, κ=1 per-state, exact).
+# The eager torch version retains its chunk grams for backward (VRAM blowup at LM scale); this
+# is the same scan+parallel pattern as the main backward at [BD,BG] state scale (tiny buffers).
+# ============================================================================
+_DEN_KEY = ['dqk', 'nc']
+
+
+@triton.autotune(configs=_AT_CFGS, key=_DEN_KEY, **autotune_cache_kwargs)
+@triton.jit
+def _den_fwd(q_ptr, k_ptr, wg_ptr, d_ptr, Zb_ptr, L, dqk, nc,
+             sq_b, sq_l, sq_d, sg_b, sg_l, sg_c, sd_b, sd_l, sd_c,
+             szb_b, szb_n, szb_t, szb_d, szb_c,
+             BT: tl.constexpr, BD: tl.constexpr, BG: tl.constexpr, NCH: tl.constexpr):
+    b = tl.program_id(0); sb = tl.program_id(1)
+    offs_t = tl.arange(0, BT); offs_d = tl.arange(0, BD); offs_c = sb * BG + tl.arange(0, BG)
+    offs_g = tl.arange(0, BG)
+    dmask = offs_d < dqk; cmask = offs_c < nc
+    Z = tl.zeros([BD, BG], dtype=tl.float32)
+    for t in range(NCH):
+        rows = t * BT + offs_t; rmask = rows < L
+        qc = tl.load(q_ptr + b*sq_b + rows[:, None]*sq_l + offs_d[None, :]*sq_d, mask=rmask[:, None] & dmask[None, :], other=0.0)
+        kc = tl.load(k_ptr + b*sq_b + rows[:, None]*sq_l + offs_d[None, :]*sq_d, mask=rmask[:, None] & dmask[None, :], other=0.0)
+        wgc = tl.load(wg_ptr + b*sg_b + rows[:, None]*sg_l + offs_c[None, :]*sg_c, mask=rmask[:, None] & cmask[None, :], other=0.0)
+        tl.store(Zb_ptr + b*szb_b + sb*szb_n + t*szb_t + offs_d[:, None]*szb_d + offs_g[None, :]*szb_c,
+                 Z, mask=dmask[:, None])
+        G = tl.dot(qc, tl.trans(kc))
+        caus = (offs_t[:, None] >= offs_t[None, :]) & rmask[:, None] & rmask[None, :]
+        dch = tl.dot((G * caus).to(wgc.dtype), wgc) + tl.dot(qc, Z.to(qc.dtype))
+        tl.store(d_ptr + b*sd_b + rows[:, None]*sd_l + offs_c[None, :]*sd_c, dch, mask=rmask[:, None] & cmask[None, :])
+        Z += tl.dot(tl.trans(kc), wgc)
+
+
+@triton.autotune(configs=_AT_CFGS, key=_DEN_KEY, **autotune_cache_kwargs)
+@triton.jit
+def _den_bwd_scan(q_ptr, gd_ptr, dZa_ptr, L, dqk, nc,
+                  sq_b, sq_l, sq_d, sg_b, sg_l, sg_c,
+                  szb_b, szb_n, szb_t, szb_d, szb_c,
+                  BT: tl.constexpr, BD: tl.constexpr, BG: tl.constexpr, NCH: tl.constexpr):
+    b = tl.program_id(0); sb = tl.program_id(1)
+    offs_t = tl.arange(0, BT); offs_d = tl.arange(0, BD); offs_c = sb * BG + tl.arange(0, BG)
+    offs_g = tl.arange(0, BG)
+    dmask = offs_d < dqk; cmask = offs_c < nc
+    dZ = tl.zeros([BD, BG], dtype=tl.float32)
+    for ti in range(NCH):
+        t = NCH - 1 - ti
+        rows = t * BT + offs_t; rmask = rows < L
+        qc = tl.load(q_ptr + b*sq_b + rows[:, None]*sq_l + offs_d[None, :]*sq_d, mask=rmask[:, None] & dmask[None, :], other=0.0)
+        gdc = tl.load(gd_ptr + b*sg_b + rows[:, None]*sg_l + offs_c[None, :]*sg_c, mask=rmask[:, None] & cmask[None, :], other=0.0)
+        tl.store(dZa_ptr + b*szb_b + sb*szb_n + t*szb_t + offs_d[:, None]*szb_d + offs_g[None, :]*szb_c,
+                 dZ, mask=dmask[:, None])
+        dZ += tl.dot(tl.trans(qc), gdc)
+
+
+@triton.autotune(configs=_AT_CFGS, key=_DEN_KEY, **autotune_cache_kwargs)
+@triton.jit
+def _den_grad(q_ptr, k_ptr, wg_ptr, gd_ptr, Zb_ptr, dZa_ptr, dq_ptr, dk_ptr, dw_ptr,
+              L, dqk, nc,
+              sq_b, sq_l, sq_d, sg_b, sg_l, sg_c,
+              szb_b, szb_n, szb_t, szb_d, szb_c,
+              sdq_b, sdq_n, sdq_l, sdq_d, sdw_b, sdw_l, sdw_c,
+              BT: tl.constexpr, BD: tl.constexpr, BG: tl.constexpr, NCH: tl.constexpr):
+    b = tl.program_id(0); sb = tl.program_id(1); t = tl.program_id(2)
+    offs_t = tl.arange(0, BT); offs_d = tl.arange(0, BD); offs_c = sb * BG + tl.arange(0, BG)
+    offs_g = tl.arange(0, BG)
+    dmask = offs_d < dqk; cmask = offs_c < nc
+    rows = t * BT + offs_t; rmask = rows < L
+    qc = tl.load(q_ptr + b*sq_b + rows[:, None]*sq_l + offs_d[None, :]*sq_d, mask=rmask[:, None] & dmask[None, :], other=0.0)
+    kc = tl.load(k_ptr + b*sq_b + rows[:, None]*sq_l + offs_d[None, :]*sq_d, mask=rmask[:, None] & dmask[None, :], other=0.0)
+    wgc = tl.load(wg_ptr + b*sg_b + rows[:, None]*sg_l + offs_c[None, :]*sg_c, mask=rmask[:, None] & cmask[None, :], other=0.0)
+    gdc = tl.load(gd_ptr + b*sg_b + rows[:, None]*sg_l + offs_c[None, :]*sg_c, mask=rmask[:, None] & cmask[None, :], other=0.0)
+    Zb = tl.load(Zb_ptr + b*szb_b + sb*szb_n + t*szb_t + offs_d[:, None]*szb_d + offs_g[None, :]*szb_c, mask=dmask[:, None], other=0.0)
+    dZa = tl.load(dZa_ptr + b*szb_b + sb*szb_n + t*szb_t + offs_d[:, None]*szb_d + offs_g[None, :]*szb_c, mask=dmask[:, None], other=0.0)
+    caus = (offs_t[:, None] >= offs_t[None, :]) & rmask[:, None] & rmask[None, :]
+    G = tl.dot(qc, tl.trans(kc))
+    P = tl.dot(gdc, tl.trans(wgc))                                   # [BT,BT]
+    dq = tl.dot((P * caus).to(kc.dtype), kc) + tl.dot(gdc, tl.trans(Zb.to(gdc.dtype)))
+    dk = tl.dot(tl.trans(P * caus).to(qc.dtype), qc) + tl.dot(wgc, tl.trans(dZa.to(wgc.dtype)))
+    dw = tl.dot(tl.trans(G * caus).to(gdc.dtype), gdc) + tl.dot(kc, dZa.to(kc.dtype))
+    tl.store(dq_ptr + b*sdq_b + sb*sdq_n + rows[:, None]*sdq_l + offs_d[None, :]*sdq_d, dq, mask=rmask[:, None] & dmask[None, :])
+    tl.store(dk_ptr + b*sdq_b + sb*sdq_n + rows[:, None]*sdq_l + offs_d[None, :]*sdq_d, dk, mask=rmask[:, None] & dmask[None, :])
+    tl.store(dw_ptr + b*sdw_b + rows[:, None]*sdw_l + offs_c[None, :]*sdw_c, dw, mask=rmask[:, None] & cmask[None, :])
+
+
+class _DenFn(torch.autograd.Function):
+    """Per-state denominator d[i,c] on folded [BH,L,*] tensors, Triton fwd + chunk-parallel bwd."""
+    @staticmethod
+    def forward(ctx, q, k, wg, chunk, BG):
+        B, L, dqk = q.shape; nc = wg.shape[-1]
+        BD = max(16, triton.next_power_of_2(dqk)); NB = triton.cdiv(nc, BG); NCH = triton.cdiv(L, chunk)
+        q, k, wg = q.contiguous(), k.contiguous(), wg.contiguous()
+        d = torch.empty(B, L, nc, device=q.device, dtype=torch.float32)
+        Zb = torch.empty(B, NB, NCH, BD, BG, device=q.device, dtype=torch.float32)
+        _den_fwd[(B, NB)](q, k, wg, d, Zb, L, dqk, nc,
+            q.stride(0), q.stride(1), q.stride(2), wg.stride(0), wg.stride(1), wg.stride(2),
+            d.stride(0), d.stride(1), d.stride(2),
+            Zb.stride(0), Zb.stride(1), Zb.stride(2), Zb.stride(3), Zb.stride(4),
+            BT=chunk, BD=BD, BG=BG, NCH=NCH)
+        ctx.save_for_backward(q, k, wg, Zb)
+        ctx.meta = (chunk, BG, BD, NB, NCH)
+        return d
+
+    @staticmethod
+    def backward(ctx, gd):
+        q, k, wg, Zb = ctx.saved_tensors
+        chunk, BG, BD, NB, NCH = ctx.meta
+        B, L, dqk = q.shape; nc = wg.shape[-1]
+        gd = gd.contiguous().to(q.dtype)   # match input dtype (tl.dot requires same-dtype operands; fp32 accum regardless)
+        dZa = torch.empty_like(Zb)
+        _den_bwd_scan[(B, NB)](q, gd, dZa, L, dqk, nc,
+            q.stride(0), q.stride(1), q.stride(2), gd.stride(0), gd.stride(1), gd.stride(2),
+            dZa.stride(0), dZa.stride(1), dZa.stride(2), dZa.stride(3), dZa.stride(4),
+            BT=chunk, BD=BD, BG=BG, NCH=NCH)
+        dq = torch.empty(B, NB, L, dqk, device=q.device, dtype=torch.float32)
+        dk = torch.empty_like(dq)
+        dw = torch.empty(B, L, nc, device=q.device, dtype=torch.float32)
+        _den_grad[(B, NB, NCH)](q, k, wg, gd, Zb, dZa, dq, dk, dw, L, dqk, nc,
+            q.stride(0), q.stride(1), q.stride(2), gd.stride(0), gd.stride(1), gd.stride(2),
+            Zb.stride(0), Zb.stride(1), Zb.stride(2), Zb.stride(3), Zb.stride(4),
+            dq.stride(0), dq.stride(1), dq.stride(2), dq.stride(3), dw.stride(0), dw.stride(1), dw.stride(2),
+            BT=chunk, BD=BD, BG=BG, NCH=NCH)
+        cast = lambda t: t.to(q.dtype)
+        return cast(dq.sum(1)), cast(dk.sum(1)), cast(dw), None, None
+
+
+def rola_perstate_den_triton(q, k, w, chunk=None, BG=16):
+    """Per-state denominator on folded [BH,L,*] tensors. Differentiable (Triton fwd + parallel bwd)."""
+    chunk = _CHUNK if chunk is None else min(chunk, _CHUNK)
+    return _DenFn.apply(q, k, w, chunk, BG)
