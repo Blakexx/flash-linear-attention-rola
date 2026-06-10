@@ -5,7 +5,7 @@ import torch
 import torch.nn.functional as F
 import triton
 
-from fla.modules.l2norm import l2norm
+from fla_rola.modules.l2norm import l2norm
 
 
 @triton.testing.perf_report(
@@ -30,7 +30,7 @@ from fla.modules.l2norm import l2norm
     ),
 )
 def benchmark(B, H, D, T, provider):
-    from fla.utils import device
+    from fla_rola.utils import device
     dtype = torch.bfloat16
     requires_grad = True
     x = torch.randn(B * T, D, device=device, requires_grad=requires_grad, dtype=dtype)

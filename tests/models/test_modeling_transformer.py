@@ -2,7 +2,7 @@
 import pytest
 import torch
 
-from fla.models import TransformerConfig
+from fla_rola.models import TransformerConfig
 
 from .test_modeling_base import run_test_generation, run_test_model_forward_backward
 

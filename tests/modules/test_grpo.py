@@ -3,8 +3,8 @@
 import pytest
 import torch
 
-from fla.modules.grpo import fused_grpo_loss, grpo_loss_torch
-from fla.utils import IS_NVIDIA_HOPPER, assert_close, device, device_torch_lib
+from fla_rola.modules.grpo import fused_grpo_loss, grpo_loss_torch
+from fla_rola.utils import IS_NVIDIA_HOPPER, assert_close, device, device_torch_lib
 
 
 @pytest.mark.parametrize("B", [2])

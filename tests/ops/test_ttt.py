@@ -5,9 +5,9 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from fla.ops.ttt import chunk_ttt_linear, fused_chunk_ttt_linear
-from fla.ops.ttt.naive import chunk_ttt_linear_ref
-from fla.utils import assert_close, check_shared_mem, device
+from fla_rola.ops.ttt import chunk_ttt_linear, fused_chunk_ttt_linear
+from fla_rola.ops.ttt.naive import chunk_ttt_linear_ref
+from fla_rola.utils import assert_close, check_shared_mem, device
 
 
 @pytest.mark.parametrize(

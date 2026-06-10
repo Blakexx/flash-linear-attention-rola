@@ -5,9 +5,9 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from fla.ops.rwkv6 import chunk_rwkv6
-from fla.ops.rwkv6.fused_recurrent import fused_recurrent_rwkv6
-from fla.utils import assert_close, device, device_platform
+from fla_rola.ops.rwkv6 import chunk_rwkv6
+from fla_rola.ops.rwkv6.fused_recurrent import fused_recurrent_rwkv6
+from fla_rola.utils import assert_close, device, device_platform
 
 
 @pytest.mark.skipif(

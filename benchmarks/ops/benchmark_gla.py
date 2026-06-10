@@ -3,9 +3,9 @@ import torch
 import triton
 from torch.nn import functional as F
 
-from fla.ops.gla import chunk_gla, fused_chunk_gla, fused_recurrent_gla
-from fla.ops.retention import chunk_retention, parallel_retention
-from fla.ops.retention.naive import naive_retention
+from fla_rola.ops.gla import chunk_gla, fused_chunk_gla, fused_recurrent_gla
+from fla_rola.ops.retention import chunk_retention, parallel_retention
+from fla_rola.ops.retention.naive import naive_retention
 
 
 @triton.testing.perf_report(
@@ -32,7 +32,7 @@ from fla.ops.retention.naive import naive_retention
     ),
 )
 def benchmark(T, provider):
-    from fla.utils import device
+    from fla_rola.utils import device
     dtype = torch.bfloat16
 #    dtype = torch.float32
     requires_grad = True

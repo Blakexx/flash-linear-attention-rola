@@ -66,7 +66,7 @@ def preprocess(
     split: str = 'train',
     seed: int = 42,
     output: str = 'data',
-    tokenizer: str = 'fla-hub/gla-1.3B-100B',
+    tokenizer: str = 'fla_rola-hub/gla-1.3B-100B',
     num_proc: int = 64,
     batch_size: int = 2048,
     seq_len: int = 2048,
@@ -88,7 +88,7 @@ def preprocess(
         output:
             Output directory. Default: 'data'.
         tokenizer:
-            Tokenizer name. Default: 'fla-hub/gla-1.3B-100B'.
+            Tokenizer name. Default: 'fla_rola-hub/gla-1.3B-100B'.
         num_proc:
             Number of processes for parallel processing. Default: 64.
         batch_size:
@@ -136,7 +136,7 @@ if __name__ == "__main__":
     parser.add_argument("--split", default="train", help="Dataset split to process")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--output", default="data", help="Output directory")
-    parser.add_argument("--tokenizer", default="fla-hub/gla-1.3B-100B", help="Tokenizer name")
+    parser.add_argument("--tokenizer", default="fla_rola-hub/gla-1.3B-100B", help="Tokenizer name")
     parser.add_argument("--num_proc", type=int, default=64, help="Number of processes for parallel processing")
     parser.add_argument("--batch_size", type=int, default=2048, help="Batch size for processing")
     parser.add_argument("--seq_len", type=int, default=2048, help="Total sequence length for each training sample")

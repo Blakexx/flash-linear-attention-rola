@@ -10,7 +10,7 @@ except ImportError:
     def is_compiling():
         return False
 
-from fla.utils import device_torch_lib
+from fla_rola.utils import device_torch_lib
 
 # -----------------------------------------------------------------------------
 # Configuration
@@ -22,7 +22,7 @@ _ORIGINAL_NEW_EMPTY = torch.Tensor.new_empty
 
 
 def _is_called_from_fla():
-    """Check if the call is from fla package."""
+    """Check if the call is from fla_rola package."""
     frame = inspect.currentframe()
     try:
         # Skip the current frame and go up the call stack
@@ -43,8 +43,8 @@ def _is_called_from_fla():
 
             module = inspect.getmodule(frame)
             if module and hasattr(module, '__name__'):
-                # If call is from fla package, apply guard
-                if 'fla' in module.__name__:
+                # If call is from fla_rola package, apply guard
+                if 'fla_rola' in module.__name__:
                     return True
     finally:
         del frame

@@ -1,5 +1,5 @@
 
-# scripts for converting pretrained hf model weights to fla style
+# scripts for converting pretrained hf model weights to fla_rola style
 # calling the code to make conversions for mistralai/Mistral-7B-v0.1 would achieve the following results:
 # |    Tasks     |Version|Filter|n-shot|  Metric  |Value |   |Stderr|
 # |--------------|------:|------|-----:|----------|-----:|---|-----:|
@@ -28,7 +28,7 @@ import warnings
 import torch
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
-import fla  # noqa
+import fla_rola  # noqa
 
 
 def sizeof_fmt(num, suffix='B'):

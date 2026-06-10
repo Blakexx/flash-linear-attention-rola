@@ -4,9 +4,9 @@ import numpy as np
 import pytest
 import torch
 
-from fla.ops.log_linear_attn import chunk_log_linear_attn
-from fla.ops.log_linear_attn.naive import naive_log_linear_attn
-from fla.utils import assert_close, device, device_platform
+from fla_rola.ops.log_linear_attn import chunk_log_linear_attn
+from fla_rola.ops.log_linear_attn.naive import naive_log_linear_attn
+from fla_rola.utils import assert_close, device, device_platform
 
 
 @pytest.mark.parametrize(

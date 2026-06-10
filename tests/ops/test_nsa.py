@@ -5,10 +5,10 @@ import pytest
 import torch
 import triton
 
-from fla.ops.nsa.naive import naive_nsa
-from fla.ops.nsa.parallel import parallel_nsa
-from fla.ops.utils import prepare_token_indices
-from fla.utils import assert_close, device
+from fla_rola.ops.nsa.naive import naive_nsa
+from fla_rola.ops.nsa.parallel import parallel_nsa
+from fla_rola.ops.utils import prepare_token_indices
+from fla_rola.utils import assert_close, device
 
 
 # FIXME

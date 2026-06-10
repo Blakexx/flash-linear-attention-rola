@@ -5,7 +5,7 @@ import torch
 from benchmark import benchmark_backward, benchmark_combined, benchmark_forward
 from torch.nn import functional as F
 
-from fla.ops.titans.naive import chunk_titans_linear_ref
+from fla_rola.ops.titans.naive import chunk_titans_linear_ref
 
 # from flash_attn import flash_attn_func
 

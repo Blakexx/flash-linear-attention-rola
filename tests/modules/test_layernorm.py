@@ -5,9 +5,9 @@ import torch.nn as nn
 from einops import rearrange
 from transformers.models.llama.modeling_llama import LlamaRMSNorm
 
-from fla.modules import GroupNorm, GroupNormLinear, LayerNorm, LayerNormLinear, RMSNorm, RMSNormLinear
-from fla.modules.layernorm import GroupNormRef
-from fla.utils import assert_close, device
+from fla_rola.modules import GroupNorm, GroupNormLinear, LayerNorm, LayerNormLinear, RMSNorm, RMSNormLinear
+from fla_rola.modules.layernorm import GroupNormRef
+from fla_rola.utils import assert_close, device
 
 
 @pytest.mark.parametrize("B", [2])

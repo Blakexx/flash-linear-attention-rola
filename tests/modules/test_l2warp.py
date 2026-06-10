@@ -5,9 +5,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from fla.modules import FusedLinearCrossEntropyLoss
-from fla.modules.l2warp import l2_warp as standalone_l2_warp
-from fla.utils import IS_INTEL_ALCHEMIST, assert_close, device
+from fla_rola.modules import FusedLinearCrossEntropyLoss
+from fla_rola.modules.l2warp import l2_warp as standalone_l2_warp
+from fla_rola.utils import IS_INTEL_ALCHEMIST, assert_close, device
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])

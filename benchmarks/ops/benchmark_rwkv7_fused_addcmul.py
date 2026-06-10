@@ -3,7 +3,7 @@
 import torch
 import triton
 
-from fla.ops.rwkv7.fused_addcmul import fused_addcmul_rwkv7, torch_addcmul_rwkv7
+from fla_rola.ops.rwkv7.fused_addcmul import fused_addcmul_rwkv7, torch_addcmul_rwkv7
 
 
 @torch.compile
@@ -46,7 +46,7 @@ def torch_compile_addcmul(hidden_states, delta, x_r, x_w, x_k, x_v, x_a, x_g):
     ),
 )
 def benchmark(T, provider):
-    from fla.utils import device
+    from fla_rola.utils import device
     dtype = torch.bfloat16
     requires_grad = True
     hidden_size = 4096

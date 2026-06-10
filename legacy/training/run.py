@@ -5,7 +5,7 @@ from flame.logging import LogCallback, get_logger
 from flame.parser import get_train_args
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, Trainer
 
-import fla  # noqa
+import fla_rola  # noqa
 
 logger = get_logger(__name__)
 

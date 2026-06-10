@@ -2,8 +2,8 @@
 import torch
 import triton
 
-from fla.ops.based import fused_chunk_based, parallel_based
-from fla.ops.based.naive import naive_chunk_based, naive_parallel_based
+from fla_rola.ops.based import fused_chunk_based, parallel_based
+from fla_rola.ops.based.naive import naive_chunk_based, naive_parallel_based
 
 try:
     from flash_attn import flash_attn_func
@@ -37,7 +37,7 @@ except Exception:
     ),
 )
 def benchmark(T, provider):
-    from fla.utils import device
+    from fla_rola.utils import device
     dtype = torch.bfloat16
     requires_grad = True
     B, H, D = 8, 16, 128

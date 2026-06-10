@@ -5,9 +5,9 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from fla.ops.common.chunk_scaled_dot_kkt import chunk_scaled_dot_kkt_fwd
-from fla.ops.utils.solve_tril import solve_tril
-from fla.utils import assert_close, device, device_platform
+from fla_rola.ops.common.chunk_scaled_dot_kkt import chunk_scaled_dot_kkt_fwd
+from fla_rola.ops.utils.solve_tril import solve_tril
+from fla_rola.utils import assert_close, device, device_platform
 
 
 @pytest.mark.parametrize(

@@ -5,9 +5,9 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from fla.ops.gla import chunk_gla, fused_recurrent_gla
-from fla.ops.gla.naive import naive_recurrent_gla
-from fla.utils import assert_close, device, device_platform
+from fla_rola.ops.gla import chunk_gla, fused_recurrent_gla
+from fla_rola.ops.gla.naive import naive_recurrent_gla
+from fla_rola.utils import assert_close, device, device_platform
 
 
 @pytest.mark.parametrize(

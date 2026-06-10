@@ -10,7 +10,7 @@ from datasets import Dataset, load_dataset
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel, PreTrainedTokenizer
 
-from fla.modules.fused_cross_entropy import FusedCrossEntropyLoss
+from fla_rola.modules.fused_cross_entropy import FusedCrossEntropyLoss
 
 
 class PerplexityEvaluator:
@@ -166,8 +166,8 @@ class PerplexityEvaluator:
 
 def main():
     parser = argparse.ArgumentParser(description="Evaluate perplexity")
-    parser.add_argument('-p', '--path', type=str, default='fla-hub/gla-1.3B-100B')
-    parser.add_argument('-d', '--data', type=str, default='fla-hub/pg19')
+    parser.add_argument('-p', '--path', type=str, default='fla_rola-hub/gla-1.3B-100B')
+    parser.add_argument('-d', '--data', type=str, default='fla_rola-hub/pg19')
     parser.add_argument('-s', '--split', type=str, default='train')
     parser.add_argument('-n', '--column_name', type=str, default='text')
     parser.add_argument('--block_size', type=int, default=28672)
@@ -178,7 +178,7 @@ def main():
 
     # Set device and random seed
     if args.device is None:
-        from fla.utils import device
+        from fla_rola.utils import device
     else:
         device = args.device
     torch.manual_seed(0)

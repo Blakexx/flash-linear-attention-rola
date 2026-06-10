@@ -4,8 +4,8 @@ import torch
 import torch.nn.functional as F
 from einops import rearrange
 
-from fla.modules.convolution import ShortConvolution, causal_conv1d, causal_conv1d_update
-from fla.utils import assert_close, device
+from fla_rola.modules.convolution import ShortConvolution, causal_conv1d, causal_conv1d_update
+from fla_rola.utils import assert_close, device
 
 try:
     from causal_conv1d import causal_conv1d_fn
@@ -796,7 +796,7 @@ def test_fast_conv_varlen(
     if causal_conv1d_fn is None:
         pytest.skip("causal_conv1d is not installed for CUDA backend")
     assert has_residual is False
-    from fla.modules.convolution import fast_causal_conv1d_fn
+    from fla_rola.modules.convolution import fast_causal_conv1d_fn
     cu_seqlens = torch.cat([
         torch.tensor([0], dtype=torch.long),
         torch.arange(16, T)[torch.randperm(T - 16)[:N-1]],

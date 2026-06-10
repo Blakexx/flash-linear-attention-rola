@@ -4,8 +4,8 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from fla.ops.delta_rule import chunk_delta_rule, fused_recurrent_delta_rule
-from fla.utils import assert_close, device, device_platform
+from fla_rola.ops.delta_rule import chunk_delta_rule, fused_recurrent_delta_rule
+from fla_rola.utils import assert_close, device, device_platform
 
 
 @pytest.mark.parametrize(

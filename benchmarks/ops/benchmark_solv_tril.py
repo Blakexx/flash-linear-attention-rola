@@ -27,8 +27,8 @@ import triton
     ),
 )
 def benchmark(B, T, H, chunk_size, provider):
-    from fla.ops.utils.solve_tril import solve_tril
-    from fla.utils import device
+    from fla_rola.ops.utils.solve_tril import solve_tril
+    from fla_rola.utils import device
 
     requires_grad = True
     dtype = torch.float32

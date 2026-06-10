@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 from transformers import AutoModelForCausalLM
 
-from fla.utils import device
+from fla_rola.utils import device
 
 # Models that do not yet support variable sequence lengths (for modeling tests)
 MODELING_UNSUPPORTED_VARLEN = [

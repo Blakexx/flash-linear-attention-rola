@@ -3,8 +3,8 @@ import torch
 import triton
 from einops import rearrange
 
-from fla.modules.convolution import causal_conv1d
-from fla.ops.utils.index import prepare_sequence_ids
+from fla_rola.modules.convolution import causal_conv1d
+from fla_rola.ops.utils.index import prepare_sequence_ids
 
 try:
     from causal_conv1d import causal_conv1d_fn
@@ -34,7 +34,7 @@ except ImportError:
     ),
 )
 def benchmark(T, D, provider):
-    from fla.utils import device
+    from fla_rola.utils import device
     dtype = torch.bfloat16
     requires_grad = True
     B, N, W = 1, 16, 4

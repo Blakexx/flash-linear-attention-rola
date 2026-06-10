@@ -7,9 +7,9 @@ import torch
 import torch.nn.functional as F
 from einops import repeat
 
-from fla.ops.gated_delta_rule import chunk_gated_delta_rule, fused_recurrent_gated_delta_rule
-from fla.ops.gated_delta_rule.naive import naive_recurrent_gated_delta_rule
-from fla.utils import IS_INTEL_ALCHEMIST, assert_close, device
+from fla_rola.ops.gated_delta_rule import chunk_gated_delta_rule, fused_recurrent_gated_delta_rule
+from fla_rola.ops.gated_delta_rule.naive import naive_recurrent_gated_delta_rule
+from fla_rola.utils import IS_INTEL_ALCHEMIST, assert_close, device
 
 
 @pytest.mark.parametrize(

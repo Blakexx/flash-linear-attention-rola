@@ -1,7 +1,7 @@
 import subprocess
 import time
 
-from fla.utils import device_platform
+from fla_rola.utils import device_platform
 
 
 def get_xpu_memory_usage():

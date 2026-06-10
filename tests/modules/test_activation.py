@@ -3,8 +3,8 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from fla.modules.activations import logsigmoid, sigmoid, swiglu, swiglu_linear, swish
-from fla.utils import assert_close, device
+from fla_rola.modules.activations import logsigmoid, sigmoid, swiglu, swiglu_linear, swish
+from fla_rola.utils import assert_close, device
 
 
 @pytest.mark.parametrize(

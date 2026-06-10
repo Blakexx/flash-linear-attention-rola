@@ -76,7 +76,7 @@ def create_pyproject_toml(package_dir, name, version, dependencies, extras=None)
     deps_content = ', '.join(f'"{dep}"' for dep in dependencies)
 
     # Create description text
-    if name == 'fla-core':
+    if name == 'fla_rola-core':
         desc_text = 'Core operations for flash-linear-attention'
     else:
         desc_text = 'Fast linear attention models and layers'
@@ -94,8 +94,8 @@ requires-python = ">=3.10"
 dependencies = [{deps_content}]
 
 [project.urls]
-Homepage = "https://github.com/fla-org/flash-linear-attention"
-Repository = "https://github.com/fla-org/flash-linear-attention"
+Homepage = "https://github.com/fla_rola-org/flash-linear-attention"
+Repository = "https://github.com/fla_rola-org/flash-linear-attention"
 """
 
     content += extras_content
@@ -105,7 +105,7 @@ Repository = "https://github.com/fla-org/flash-linear-attention"
         content += """
 
 [tool.setuptools.packages.find]
-include = ["fla*"]
+include = ["fla_rola*"]
 namespaces = true
 """
 
@@ -120,7 +120,7 @@ def build_split_packages():
     root_dir = script_dir.parent
 
     # Get current version
-    init_file = root_dir / 'fla' / '__init__.py'
+    init_file = root_dir / 'fla_rola' / '__init__.py'
     with open(init_file, encoding='utf-8') as f:
         content = f.read()
     version_match = re.search(r"^__version__\s*=\s*['\"]([^'\"]+)['\"]\s*$", content, re.MULTILINE)
@@ -132,26 +132,26 @@ def build_split_packages():
     all_deps, extras = extract_dependencies()
     core_deps, ext_deps = categorize_dependencies(all_deps)
 
-    # Add version constraint for fla-core in extension package
-    ext_deps.insert(0, f'fla-core=={version}')
+    # Add version constraint for fla_rola-core in extension package
+    ext_deps.insert(0, f'fla_rola-core=={version}')
 
     # Create output directory
     output_dir = script_dir / 'dist'
     output_dir.mkdir(exist_ok=True)
 
-    # Create fla-core package
-    core_dir = output_dir / 'fla-core'
+    # Create fla_rola-core package
+    core_dir = output_dir / 'fla_rola-core'
     if core_dir.exists():
         shutil.rmtree(core_dir)
     core_dir.mkdir()
 
     # Copy core files
-    fla_core = core_dir / 'fla'
-    shutil.copytree(root_dir / 'fla' / 'ops', fla_core / 'ops')
-    shutil.copytree(root_dir / 'fla' / 'modules', fla_core / 'modules')
-    shutil.copy(root_dir / 'fla' / 'utils.py', fla_core / 'utils.py')
+    fla_core = core_dir / 'fla_rola'
+    shutil.copytree(root_dir / 'fla_rola' / 'ops', fla_core / 'ops')
+    shutil.copytree(root_dir / 'fla_rola' / 'modules', fla_core / 'modules')
+    shutil.copy(root_dir / 'fla_rola' / 'utils.py', fla_core / 'utils.py')
 
-    # Create fla-core __init__.py
+    # Create fla_rola-core __init__.py
     with open(fla_core / '__init__.py', 'w') as f:
         f.write(f"""# -*- coding: utf-8 -*-
 
@@ -165,8 +165,8 @@ __version__ = '{version}'
         if src.exists():
             shutil.copy(src, core_dir / fname)
 
-    # Create fla-core configs
-    create_pyproject_toml(core_dir, 'fla-core', version, core_deps)
+    # Create fla_rola-core configs
+    create_pyproject_toml(core_dir, 'fla_rola-core', version, core_deps)
 
     # Create flash-linear-attention package
     ext_dir = output_dir / 'flash-linear-attention'
@@ -175,12 +175,12 @@ __version__ = '{version}'
     ext_dir.mkdir()
 
     # Copy extension files
-    fla_ext = ext_dir / 'fla'
-    shutil.copytree(root_dir / 'fla' / 'models', fla_ext / 'models')
-    shutil.copytree(root_dir / 'fla' / 'layers', fla_ext / 'layers')
+    fla_ext = ext_dir / 'fla_rola'
+    shutil.copytree(root_dir / 'fla_rola' / 'models', fla_ext / 'models')
+    shutil.copytree(root_dir / 'fla_rola' / 'layers', fla_ext / 'layers')
 
-    # Intentionally do NOT create fla/__init__.py in the extension package.
-    # The top-level package is provided by fla-core (namespace via pkgutil).
+    # Intentionally do NOT create fla_rola/__init__.py in the extension package.
+    # The top-level package is provided by fla_rola-core (namespace via pkgutil).
 
     # Copy ancillary files (README.md, LICENSE) to extension package
     for fname in ("README.md", "LICENSE"):
@@ -197,8 +197,8 @@ __version__ = '{version}'
         f.write("""#!/bin/bash
 # Build both packages
 
-echo "Building fla-core..."
-cd fla-core
+echo "Building fla_rola-core..."
+cd fla_rola-core
 pip install -U build
 python -m build
 
@@ -212,7 +212,7 @@ echo "Build complete! Packages in dist/"
     build_script.chmod(0o755)
 
     print(f"✅ Split packages created in {output_dir}")
-    print(f"✅ fla-core dependencies: {len(core_deps)} packages")
+    print(f"✅ fla_rola-core dependencies: {len(core_deps)} packages")
     print(f"✅ flash-linear-attention dependencies: {len(ext_deps)} packages")
     print(f"✅ Version: {version}")
 
@@ -223,11 +223,11 @@ def build_packages(dist_dir):
     """Build wheels and source distributions for both packages."""
     print("Building packages...")
 
-    # Build fla-core (both wheel and sdist)
-    print("Building fla-core packages...")
+    # Build fla_rola-core (both wheel and sdist)
+    print("Building fla_rola-core packages...")
     try:
         subprocess.run(
-            [sys.executable, "-m", "build", str(dist_dir / "fla-core")],
+            [sys.executable, "-m", "build", str(dist_dir / "fla_rola-core")],
             check=True,
             timeout=1800,
             stdout=subprocess.PIPE,
@@ -235,11 +235,11 @@ def build_packages(dist_dir):
             text=True,
         )
     except subprocess.CalledProcessError as e:
-        print("Failed to build fla-core packages:")
+        print("Failed to build fla_rola-core packages:")
         print(e.stdout)
         return False
     except subprocess.TimeoutExpired:
-        print("Timed out building fla-core packages")
+        print("Timed out building fla_rola-core packages")
         return False
 
     # Build flash-linear-attention (both wheel and sdist)
@@ -276,13 +276,13 @@ def copy_packages_to_output(dist_dir):
     output_dir.mkdir(exist_ok=True)
 
     # Find wheels and source distributions
-    core_wheels = list((dist_dir / 'fla-core' / 'dist').glob('*.whl'))
-    core_sdist = list((dist_dir / 'fla-core' / 'dist').glob('*.tar.gz'))
+    core_wheels = list((dist_dir / 'fla_rola-core' / 'dist').glob('*.whl'))
+    core_sdist = list((dist_dir / 'fla_rola-core' / 'dist').glob('*.tar.gz'))
     ext_wheels = list((dist_dir / 'flash-linear-attention' / 'dist').glob('*.whl'))
     ext_sdist = list((dist_dir / 'flash-linear-attention' / 'dist').glob('*.tar.gz'))
 
     if not core_wheels:
-        print("No fla-core wheel found")
+        print("No fla_rola-core wheel found")
         return False
     if not ext_wheels:
         print("No flash-linear-attention wheel found")

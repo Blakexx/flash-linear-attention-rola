@@ -5,10 +5,10 @@ import triton
 from flash_attn import flash_attn_func
 from torch.nn import functional as F
 
-from fla.ops.comba import chunk_comba
-from fla.ops.gated_delta_rule import chunk_gated_delta_rule
-from fla.ops.generalized_delta_rule import chunk_dplr_delta_rule
-from fla.ops.kda import chunk_kda
+from fla_rola.ops.comba import chunk_comba
+from fla_rola.ops.gated_delta_rule import chunk_gated_delta_rule
+from fla_rola.ops.generalized_delta_rule import chunk_dplr_delta_rule
+from fla_rola.ops.kda import chunk_kda
 
 
 @triton.testing.perf_report(
@@ -33,7 +33,7 @@ from fla.ops.kda import chunk_kda
     ),
 )
 def benchmark(T, provider):
-    from fla.utils import device
+    from fla_rola.utils import device
     dtype = torch.bfloat16
     B, H, D = 1, 16, 128
 

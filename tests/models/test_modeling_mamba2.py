@@ -4,8 +4,8 @@ import os
 import pytest
 import torch
 
-from fla.models import Mamba2Config, Mamba2ForCausalLM
-from fla.utils import device
+from fla_rola.models import Mamba2Config, Mamba2ForCausalLM
+from fla_rola.utils import device
 
 from .test_modeling_base import run_test_generation
 

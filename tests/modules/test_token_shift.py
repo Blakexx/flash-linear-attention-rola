@@ -2,8 +2,8 @@
 import pytest
 import torch
 
-from fla.modules.token_shift import token_shift, token_shift_ref
-from fla.utils import assert_close, device
+from fla_rola.modules.token_shift import token_shift, token_shift_ref
+from fla_rola.utils import assert_close, device
 
 test_b_list = [4]
 test_t_list = [512, 4100, 8192]

@@ -5,9 +5,9 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from fla.ops.hgrn import chunk_hgrn, fused_recurrent_hgrn
-from fla.ops.hgrn.naive import naive_recurrent_hgrn
-from fla.utils import assert_close, device
+from fla_rola.ops.hgrn import chunk_hgrn, fused_recurrent_hgrn
+from fla_rola.ops.hgrn.naive import naive_recurrent_hgrn
+from fla_rola.utils import assert_close, device
 
 
 @pytest.mark.parametrize(

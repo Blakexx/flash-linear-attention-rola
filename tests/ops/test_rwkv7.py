@@ -6,13 +6,13 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from fla.ops.generalized_delta_rule.dplr.fused_recurrent import fused_recurrent_dplr_delta_rule
-from fla.ops.rwkv7.channel_mixing import channel_mixing_rwkv7, channel_mixing_rwkv7_torch
-from fla.ops.rwkv7.fused_addcmul import fused_addcmul_rwkv7, torch_addcmul_rwkv7
-from fla.ops.rwkv7.fused_k_update import fused_k_rwkv7, k_update_ref
-from fla.ops.rwkv7.fused_recurrent import fused_mul_recurrent_rwkv7
-from fla.ops.rwkv7.gate_output_correction import gate_output_correction, gate_output_correction_ref
-from fla.utils import IS_NVIDIA_HOPPER, assert_close, device
+from fla_rola.ops.generalized_delta_rule.dplr.fused_recurrent import fused_recurrent_dplr_delta_rule
+from fla_rola.ops.rwkv7.channel_mixing import channel_mixing_rwkv7, channel_mixing_rwkv7_torch
+from fla_rola.ops.rwkv7.fused_addcmul import fused_addcmul_rwkv7, torch_addcmul_rwkv7
+from fla_rola.ops.rwkv7.fused_k_update import fused_k_rwkv7, k_update_ref
+from fla_rola.ops.rwkv7.fused_recurrent import fused_mul_recurrent_rwkv7
+from fla_rola.ops.rwkv7.gate_output_correction import gate_output_correction, gate_output_correction_ref
+from fla_rola.utils import IS_NVIDIA_HOPPER, assert_close, device
 
 
 @pytest.mark.parametrize("B", [2])

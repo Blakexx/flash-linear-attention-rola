@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 import triton
 
-from fla.modules import GroupNorm, LayerNorm
+from fla_rola.modules import GroupNorm, LayerNorm
 
 
 @triton.testing.perf_report(
@@ -30,7 +30,7 @@ from fla.modules import GroupNorm, LayerNorm
     ),
 )
 def benchmark(T, provider):
-    from fla.utils import device
+    from fla_rola.utils import device
     dtype = torch.bfloat16
     requires_grad = True
     B, D = 16, 1024

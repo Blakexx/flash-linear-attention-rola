@@ -7,7 +7,7 @@ import torch
 from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-import fla  # noqa
+import fla_rola  # noqa
 
 
 def sizeof_fmt(num, suffix='B'):
@@ -20,8 +20,8 @@ def sizeof_fmt(num, suffix='B'):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Generation benchmarking")
-    parser.add_argument("--path", type=str, default="fla-hub/transformer-1.3B-100B")
-    parser.add_argument("--data", type=str, default="fla-hub/pg19")
+    parser.add_argument("--path", type=str, default="fla_rola-hub/transformer-1.3B-100B")
+    parser.add_argument("--data", type=str, default="fla_rola-hub/pg19")
     parser.add_argument("--length", type=int, default=128)
     parser.add_argument("--maxlen", type=int, default=256)
     parser.add_argument("--no-cache", action='store_true')

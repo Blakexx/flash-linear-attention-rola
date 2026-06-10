@@ -4,7 +4,7 @@ Test for Context Parallel (CP) Gated Delta Rule (GDN)
 Implementation Hierarchy and Relationships:
 ==========================================
 
-1. chunk_gated_delta_rule (fla/ops/gated_delta_rule/chunk.py):
+1. chunk_gated_delta_rule (fla_rola/ops/gated_delta_rule/chunk.py):
    - Production Triton kernel for GDN
    - Input g is per-token log-space decay, shape [B, T, H] (scalar per head, NOT per-dim)
    - Internally does chunk_local_cumsum on g
@@ -62,9 +62,9 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch.nn.functional as F
 
-from fla.ops.cp import build_cp_context
-from fla.ops.gated_delta_rule import chunk_gated_delta_rule
-from fla.utils import assert_close
+from fla_rola.ops.cp import build_cp_context
+from fla_rola.ops.gated_delta_rule import chunk_gated_delta_rule
+from fla_rola.utils import assert_close
 
 # Configure logging to see assert_close messages
 logging.basicConfig(level=logging.INFO, format='%(message)s')

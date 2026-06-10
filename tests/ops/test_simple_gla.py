@@ -5,12 +5,12 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from fla.ops.simple_gla.chunk import chunk_simple_gla
-from fla.ops.simple_gla.fused_chunk import fused_chunk_simple_gla
-from fla.ops.simple_gla.fused_recurrent import fused_recurrent_simple_gla
-from fla.ops.simple_gla.naive import naive_parallel_simple_gla, naive_recurrent_simple_gla
-from fla.ops.simple_gla.parallel import parallel_simple_gla
-from fla.utils import assert_close, device
+from fla_rola.ops.simple_gla.chunk import chunk_simple_gla
+from fla_rola.ops.simple_gla.fused_chunk import fused_chunk_simple_gla
+from fla_rola.ops.simple_gla.fused_recurrent import fused_recurrent_simple_gla
+from fla_rola.ops.simple_gla.naive import naive_parallel_simple_gla, naive_recurrent_simple_gla
+from fla_rola.ops.simple_gla.parallel import parallel_simple_gla
+from fla_rola.utils import assert_close, device
 
 
 @pytest.mark.parametrize(

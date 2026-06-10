@@ -5,9 +5,9 @@ import torch
 import torch.nn.functional as F
 from einops import rearrange
 
-from fla.ops.generalized_delta_rule.iplr.chunk import chunk_iplr_delta_rule
-from fla.ops.generalized_delta_rule.iplr.fused_recurrent import fused_recurrent_iplr_delta_rule
-from fla.utils import assert_close, device
+from fla_rola.ops.generalized_delta_rule.iplr.chunk import chunk_iplr_delta_rule
+from fla_rola.ops.generalized_delta_rule.iplr.fused_recurrent import fused_recurrent_iplr_delta_rule
+from fla_rola.utils import assert_close, device
 
 
 def chunk_iplr_delta_rule_ref(

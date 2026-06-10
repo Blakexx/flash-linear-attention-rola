@@ -1,7 +1,7 @@
 import torch
 import triton
 
-from fla.ops.rwkv7.fused_k_update import fused_k_rwkv7
+from fla_rola.ops.rwkv7.fused_k_update import fused_k_rwkv7
 
 
 def k_update_ref(k: torch.Tensor, a: torch.Tensor, ka: torch.Tensor) -> torch.Tensor:
@@ -30,7 +30,7 @@ def k_update_ref(k: torch.Tensor, a: torch.Tensor, ka: torch.Tensor) -> torch.Te
     ),
 )
 def benchmark(T, provider):
-    from fla.utils import device
+    from fla_rola.utils import device
     dtype = torch.bfloat16
     requires_grad = True
     B, D = 8, 4096

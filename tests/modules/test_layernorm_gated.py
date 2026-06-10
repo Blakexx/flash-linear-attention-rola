@@ -4,8 +4,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from fla.modules import FusedLayerNormGated, FusedRMSNormGated
-from fla.utils import assert_close, device
+from fla_rola.modules import FusedLayerNormGated, FusedRMSNormGated
+from fla_rola.utils import assert_close, device
 
 
 @pytest.mark.parametrize(

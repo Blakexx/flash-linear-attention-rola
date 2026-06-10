@@ -3,8 +3,8 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from fla.ops.titans.naive import chunk_titans_linear_ref
-from fla.utils import assert_close, device
+from fla_rola.ops.titans.naive import chunk_titans_linear_ref
+from fla_rola.utils import assert_close, device
 
 
 def initialize_chunked_param(B, H, T, BT, dtype=torch.float32):

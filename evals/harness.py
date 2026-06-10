@@ -1,13 +1,13 @@
 
 from __future__ import annotations
 
-import fla  # noqa
+import fla_rola  # noqa
 from lm_eval.__main__ import cli_evaluate
 from lm_eval.api.registry import register_model
 from lm_eval.models.huggingface import HFLM
 
 
-@register_model('fla')
+@register_model('fla_rola')
 class FlashLinearAttentionLMWrapper(HFLM):
     def __init__(self, **kwargs) -> FlashLinearAttentionLMWrapper:
 

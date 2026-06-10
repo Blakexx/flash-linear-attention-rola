@@ -2,8 +2,8 @@
 import pytest
 import torch
 
-from fla.models.utils import FLACache, FLALayer, LegacyFLACache
-from fla.utils import device
+from fla_rola.models.utils import FLACache, FLALayer, LegacyFLACache
+from fla_rola.utils import device
 
 
 # ===================================================================================
@@ -31,7 +31,7 @@ def test_cache_per_layer_seq_length(
     not a global counter. This is important for multi-layer models where
     each layer should maintain its own sequence length.
 
-    See: https://github.com/fla-org/flash-linear-attention/issues/747
+    See: https://github.com/fla_rola-org/flash-linear-attention/issues/747
     """
     cache = FLACache()
     head_dim = hidden_size // num_heads
@@ -283,7 +283,7 @@ def test_legacy_cache_decode_all_layers_see_same_past_length(
 
     Same issue as test_cache_decode_all_layers_see_same_past_length but for LegacyFLACache.
 
-    See: https://github.com/fla-org/flash-linear-attention/issues/766
+    See: https://github.com/fla_rola-org/flash-linear-attention/issues/766
     """
     # Skip if LegacyFLACache is not compatible with current transformers version
     try:
@@ -349,7 +349,7 @@ def test_cache_incremental_decode_consistency(num_decode_steps: int, num_layers:
     This catches the GitHub #766 issue where upper layers see inflated past_len
     because Layer 0's update() increments the seen-token count too early.
 
-    See: https://github.com/fla-org/flash-linear-attention/issues/766
+    See: https://github.com/fla_rola-org/flash-linear-attention/issues/766
     """
     cache = FLACache()
     batch_size, seq_len, num_heads, head_dim = 1, 1, 4, 16

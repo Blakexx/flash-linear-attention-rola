@@ -2,7 +2,7 @@
 import pytest
 import torch
 
-from fla.models import MLAConfig
+from fla_rola.models import MLAConfig
 
 from .test_modeling_base import run_test_generation, run_test_model_forward_backward
 

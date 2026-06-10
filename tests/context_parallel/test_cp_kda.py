@@ -4,7 +4,7 @@ Test for Context Parallel (CP) KDA (Kimi Delta Attention)
 Implementation Hierarchy and Relationships:
 ==========================================
 
-1. naive_recurrent_kda (fla/ops/kda/naive.py):
+1. naive_recurrent_kda (fla_rola/ops/kda/naive.py):
    - The mathematical gold standard - sequential token-by-token computation
    - Input g is per-token log-space decay (NOT cumulative)
    - Each g_t is used independently as: S_t = S_{t-1} * exp(g_t)
@@ -15,14 +15,14 @@ Implementation Hierarchy and Relationships:
    - No internal gate computation or L2 normalization
    - Used as the reference baseline for correctness verification
 
-2. naive_chunk_kda (fla/ops/kda/naive.py):
+2. naive_chunk_kda (fla_rola/ops/kda/naive.py):
    - Chunk-parallel version mathematically equivalent to naive_recurrent_kda
    - Input g is also per-token (same as naive_recurrent_kda)
    - Performs cumsum on g internally: g = g.cumsum(-2) at line 60
    - Still a PyTorch implementation, but exploits chunk-level parallelism
    - The chunk algorithm uses the "w-y representation" for efficient computation
 
-3. chunk_kda (fla/ops/kda/chunk.py ChunkKDAFunction):
+3. chunk_kda (fla_rola/ops/kda/chunk.py ChunkKDAFunction):
    - Production Triton kernel implementation with optimizations:
      a) Fused L2 normalization (when use_qk_l2norm_in_kernel=True)
      b) Fused gate computation (when use_gate_in_kernel=True)
@@ -41,7 +41,7 @@ Implementation Hierarchy and Relationships:
    - Forward: Non-first ranks receive initial_state from previous rank
    - Backward: Gradient dht flows back across rank boundaries
 
-Gate Functions (fla/ops/kda/gate.py):
+Gate Functions (fla_rola/ops/kda/gate.py):
 =====================================
 
 - naive_kda_gate / naive_kda_lowerbound_gate:
@@ -113,11 +113,11 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch.nn.functional as F
 
-from fla.ops.cp import build_cp_context
-from fla.ops.kda import chunk_kda
-from fla.ops.kda.gate import naive_kda_lowerbound_gate
-from fla.ops.kda.naive import naive_recurrent_kda
-from fla.utils import assert_close
+from fla_rola.ops.cp import build_cp_context
+from fla_rola.ops.kda import chunk_kda
+from fla_rola.ops.kda.gate import naive_kda_lowerbound_gate
+from fla_rola.ops.kda.naive import naive_recurrent_kda
+from fla_rola.utils import assert_close
 
 # Configure logging to see assert_close messages
 logging.basicConfig(level=logging.INFO, format='%(message)s')
@@ -283,7 +283,7 @@ def run_cp_kda_test_worker(
                             lower_bound=lower_bound
                         )
                     else:
-                        from fla.ops.kda.gate import naive_kda_gate
+                        from fla_rola.ops.kda.gate import naive_kda_gate
                         g_processed = naive_kda_gate(
                             g_seq_input.to(torch.float),
                             A_log_global[:H].contiguous(),
@@ -301,7 +301,7 @@ def run_cp_kda_test_worker(
                             lower_bound=lower_bound
                         ).requires_grad_(True)
                     else:
-                        from fla.ops.kda.gate import naive_kda_gate
+                        from fla_rola.ops.kda.gate import naive_kda_gate
                         g_processed = naive_kda_gate(
                             g_seq_input.to(torch.float),
                             A_log_global[:H].contiguous(),

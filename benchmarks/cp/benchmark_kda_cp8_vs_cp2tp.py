@@ -25,8 +25,8 @@ import random
 import torch
 import torch.distributed as dist
 
-from fla.ops.cp import build_cp_context
-from fla.ops.kda import chunk_kda
+from fla_rola.ops.cp import build_cp_context
+from fla_rola.ops.kda import chunk_kda
 
 # Configuration
 DTYPE = torch.bfloat16

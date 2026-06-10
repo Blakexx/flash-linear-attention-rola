@@ -31,7 +31,7 @@ def get_definitions_from_tree(tree) -> set:
 def get_imports_from_tree(tree) -> set:
     """
     Return set of (module_path, symbol_name) tuples.
-    module_path is the import source module (e.g., 'fla.ops.kda.wy_fast').
+    module_path is the import source module (e.g., 'fla_rola.ops.kda.wy_fast').
     symbol_name is the imported name (e.g., 'recompute_w_u_fwd').
     """
     if not tree:
@@ -114,7 +114,7 @@ class DependencyFinder:
             if mod:
                 affected_modules.add(mod)
             # Also add parent modules for relative imports
-            # e.g., fla.ops.gated_oja_rule.wy_fast -> fla.ops.gated_oja_rule
+            # e.g., fla_rola.ops.gated_oja_rule.wy_fast -> fla_rola.ops.gated_oja_rule
             if mod:
                 parts = mod.split('.')
                 for i in range(len(parts), 0, -1):
@@ -264,7 +264,7 @@ if __name__ == "__main__":
     all_args_string = " ".join(sys.argv[1:])
     changed_files = all_args_string.split()
 
-    BLACKLIST = ['fla/utils.py', 'utils/convert_from_llama.py', 'utils/convert_from_rwkv6.py',
+    BLACKLIST = ['fla_rola/utils.py', 'utils/convert_from_llama.py', 'utils/convert_from_rwkv6.py',
                  'utils/convert_from_rwkv7.py', 'tests/conftest.py']
     changed_files = [file for file in changed_files if not any(file.endswith(b) for b in BLACKLIST)]
 
@@ -272,7 +272,7 @@ if __name__ == "__main__":
 
     current_dir = Path(__file__).parent.resolve()
     test_dir = current_dir.parent / "tests"
-    search_dir = current_dir.parent / "fla"
+    search_dir = current_dir.parent / "fla_rola"
     project_root = current_dir.parent
 
     finder = DependencyFinder(search_dirs=[search_dir], test_dir=test_dir, project_root=project_root)

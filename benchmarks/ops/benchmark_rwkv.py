@@ -5,10 +5,10 @@ import torch
 import triton
 from torch.nn import functional as F
 
-from fla.ops.gla import chunk_gla
-from fla.ops.retention import chunk_retention
-from fla.ops.rwkv6 import chunk_rwkv6
-from fla.ops.rwkv7 import chunk_rwkv7
+from fla_rola.ops.gla import chunk_gla
+from fla_rola.ops.retention import chunk_retention
+from fla_rola.ops.rwkv6 import chunk_rwkv6
+from fla_rola.ops.rwkv7 import chunk_rwkv7
 
 try:
     from flash_attn import flash_attn_func
@@ -49,7 +49,7 @@ except BaseException:
     ),
 )
 def benchmark(T, provider):
-    from fla.utils import device
+    from fla_rola.utils import device
     dtype = torch.bfloat16
     requires_grad = True
     # Read B, H, D from environment variables, default to 16, 8, 128 if not set

@@ -3,9 +3,9 @@
 import pytest
 import torch
 
-from fla.ops.deltaformer import deltaformer_attn
-from fla.ops.deltaformer.naive import naive_deltaformer_attn
-from fla.utils import IS_INTEL_ALCHEMIST, assert_close, device
+from fla_rola.ops.deltaformer import deltaformer_attn
+from fla_rola.ops.deltaformer.naive import naive_deltaformer_attn
+from fla_rola.utils import IS_INTEL_ALCHEMIST, assert_close, device
 
 
 @pytest.mark.parametrize(

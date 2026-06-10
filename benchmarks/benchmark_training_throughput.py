@@ -9,9 +9,9 @@ from tqdm import trange
 from transformers import AutoConfig, AutoModelForCausalLM, PretrainedConfig
 from transformers.optimization import get_cosine_schedule_with_warmup
 
-import fla
+import fla_rola
 
-classes = [getattr(fla.models, i) for i in fla.models.__all__]
+classes = [getattr(fla_rola.models, i) for i in fla_rola.models.__all__]
 configs = {i.model_type: i() for i in classes if issubclass(i, PretrainedConfig)}
 
 

@@ -4,9 +4,9 @@ import os
 import pytest
 import torch
 
-from fla.ops.attn.parallel import parallel_attn
-from fla.ops.utils import prepare_lens
-from fla.utils import assert_close, check_shared_mem, device
+from fla_rola.ops.attn.parallel import parallel_attn
+from fla_rola.ops.utils import prepare_lens
+from fla_rola.utils import assert_close, check_shared_mem, device
 
 try:
     from flash_attn import flash_attn_func, flash_attn_varlen_func

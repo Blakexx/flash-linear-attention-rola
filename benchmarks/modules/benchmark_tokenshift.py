@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import triton
 
-from fla.modules.token_shift import token_shift
+from fla_rola.modules.token_shift import token_shift
 
 
 def token_shift_ref(x):
@@ -33,7 +33,7 @@ def token_shift_ref(x):
     ),
 )
 def benchmark(T, provider):
-    from fla.utils import device
+    from fla_rola.utils import device
     dtype = torch.bfloat16
     requires_grad = True
     B, D = 8, 4096

@@ -4,10 +4,10 @@ import os
 import pytest
 import torch
 
-from fla.ops.utils import chunk_global_cumsum, chunk_local_cumsum, mean_pooling
-from fla.ops.utils.index import prepare_lens
-from fla.ops.utils.pack import pack_sequence, unpack_sequence
-from fla.utils import assert_close, device
+from fla_rola.ops.utils import chunk_global_cumsum, chunk_local_cumsum, mean_pooling
+from fla_rola.ops.utils.index import prepare_lens
+from fla_rola.ops.utils.pack import pack_sequence, unpack_sequence
+from fla_rola.utils import assert_close, device
 
 
 def reversed_cumsum(x, dim=-1):

@@ -6,8 +6,8 @@ import torch
 import torch.nn.functional as F
 from einops import rearrange
 
-from fla.ops.gated_oja_rule import chunk_gated_oja_rule, fused_recurrent_gated_oja_rule
-from fla.utils import assert_close, device, is_intel_alchemist
+from fla_rola.ops.gated_oja_rule import chunk_gated_oja_rule, fused_recurrent_gated_oja_rule
+from fla_rola.utils import assert_close, device, is_intel_alchemist
 
 
 def recurrent_oja_ref(

@@ -2,9 +2,9 @@
 import pytest
 import torch
 
-from fla.ops.based import fused_chunk_based, parallel_based
-from fla.ops.based.naive import naive_parallel_based
-from fla.utils import device
+from fla_rola.ops.based import fused_chunk_based, parallel_based
+from fla_rola.ops.based.naive import naive_parallel_based
+from fla_rola.utils import device
 
 
 @pytest.mark.parametrize(

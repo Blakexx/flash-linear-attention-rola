@@ -3,10 +3,10 @@
 import pytest
 import torch
 
-import fla.ops.common.intracard_cp as intracard_cp_mod
-from fla.ops.common.intracard_cp import _intracard_cache
-from fla.ops.kda import chunk_kda
-from fla.utils import device
+import fla_rola.ops.common.intracard_cp as intracard_cp_mod
+from fla_rola.ops.common.intracard_cp import _intracard_cache
+from fla_rola.ops.kda import chunk_kda
+from fla_rola.utils import device
 
 
 @pytest.fixture(autouse=True)

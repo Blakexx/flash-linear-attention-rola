@@ -5,8 +5,8 @@ import torch
 from benchmark import benchmark_backward, benchmark_combined, benchmark_forward
 from torch.nn import functional as F
 
-from fla.ops.delta_rule import chunk_delta_rule
-from fla.utils import device
+from fla_rola.ops.delta_rule import chunk_delta_rule
+from fla_rola.utils import device
 
 
 def time_fwd(func, *args, **kwargs):

@@ -3,9 +3,9 @@
 import pytest
 import torch
 
-from fla.ops.forgetting_attn import naive_forgetting_attn
-from fla.ops.forgetting_attn.parallel import parallel_forgetting_attn
-from fla.utils import IS_INTEL_ALCHEMIST, assert_close, check_shared_mem, device
+from fla_rola.ops.forgetting_attn import naive_forgetting_attn
+from fla_rola.ops.forgetting_attn.parallel import parallel_forgetting_attn
+from fla_rola.utils import IS_INTEL_ALCHEMIST, assert_close, check_shared_mem, device
 
 
 @pytest.mark.parametrize(

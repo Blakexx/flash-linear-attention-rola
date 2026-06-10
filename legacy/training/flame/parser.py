@@ -21,7 +21,7 @@ class TrainingArguments(TrainingArguments):
         },
     )
     tokenizer: str = field(
-        default="fla-hub/gla-1.3B-100B",
+        default="fla_rola-hub/gla-1.3B-100B",
         metadata={"help": "Name of the tokenizer to use."},
     )
     use_fast_tokenizer: bool = field(

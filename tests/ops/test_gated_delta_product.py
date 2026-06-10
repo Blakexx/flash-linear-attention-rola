@@ -6,10 +6,10 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from fla.ops.gated_delta_product import chunk_gated_delta_product
-from fla.ops.gated_delta_product.chunk_ref import chunk_gated_delta_product_ref
-from fla.ops.gated_delta_product.naive import naive_recurrent_gated_delta_product
-from fla.utils import IS_INTEL_ALCHEMIST, assert_close, device
+from fla_rola.ops.gated_delta_product import chunk_gated_delta_product
+from fla_rola.ops.gated_delta_product.chunk_ref import chunk_gated_delta_product_ref
+from fla_rola.ops.gated_delta_product.naive import naive_recurrent_gated_delta_product
+from fla_rola.utils import IS_INTEL_ALCHEMIST, assert_close, device
 
 
 @pytest.mark.parametrize(

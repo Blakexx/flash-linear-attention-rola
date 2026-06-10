@@ -6,9 +6,9 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from fla.ops.path_attn import naive_path_attn
-from fla.ops.path_attn.parallel import parallel_path_attention
-from fla.utils import IS_INTEL_ALCHEMIST, assert_close, device
+from fla_rola.ops.path_attn import naive_path_attn
+from fla_rola.ops.path_attn.parallel import parallel_path_attention
+from fla_rola.utils import IS_INTEL_ALCHEMIST, assert_close, device
 
 
 @pytest.mark.parametrize(

@@ -5,7 +5,7 @@ import torch
 import triton
 from flash_attn import flash_attn_func
 
-from fla.ops.retention import chunk_retention, parallel_retention
+from fla_rola.ops.retention import chunk_retention, parallel_retention
 
 
 @triton.testing.perf_report(
@@ -29,7 +29,7 @@ from fla.ops.retention import chunk_retention, parallel_retention
     ),
 )
 def benchmark(T, provider):
-    from fla.utils import device
+    from fla_rola.utils import device
     dtype = torch.bfloat16
     requires_grad = True
     B, H, D = 4, 8, 256

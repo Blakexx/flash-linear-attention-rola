@@ -3,8 +3,8 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from fla.modules import FusedKLDivLoss
-from fla.utils import assert_close, device, device_platform
+from fla_rola.modules import FusedKLDivLoss
+from fla_rola.utils import assert_close, device, device_platform
 
 
 @pytest.mark.parametrize("B", [2])

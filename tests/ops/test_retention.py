@@ -4,8 +4,8 @@ import os
 import pytest
 import torch
 
-from fla.ops.retention import chunk_retention, fused_chunk_retention, fused_recurrent_retention, parallel_retention
-from fla.utils import assert_close, device
+from fla_rola.ops.retention import chunk_retention, fused_chunk_retention, fused_recurrent_retention, parallel_retention
+from fla_rola.utils import assert_close, device
 
 
 @pytest.mark.parametrize(

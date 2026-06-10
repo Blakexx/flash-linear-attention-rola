@@ -4,8 +4,8 @@ import os
 import pytest
 import torch
 
-from fla.models import LogLinearMamba2Config, LogLinearMamba2ForCausalLM
-from fla.utils import device
+from fla_rola.models import LogLinearMamba2Config, LogLinearMamba2ForCausalLM
+from fla_rola.utils import device
 
 
 # ===================================================================================

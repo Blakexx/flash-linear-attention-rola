@@ -5,11 +5,11 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from fla.ops.kda import chunk_kda, fused_recurrent_kda
-from fla.ops.kda.fused_recurrent import fused_recurrent_kda_fwd
-from fla.ops.kda.gate import fused_kda_gate, naive_kda_gate, naive_kda_lowerbound_gate
-from fla.ops.kda.naive import naive_chunk_kda, naive_recurrent_kda
-from fla.utils import IS_INTEL_ALCHEMIST, assert_close, device
+from fla_rola.ops.kda import chunk_kda, fused_recurrent_kda
+from fla_rola.ops.kda.fused_recurrent import fused_recurrent_kda_fwd
+from fla_rola.ops.kda.gate import fused_kda_gate, naive_kda_gate, naive_kda_lowerbound_gate
+from fla_rola.ops.kda.naive import naive_chunk_kda, naive_recurrent_kda
+from fla_rola.utils import IS_INTEL_ALCHEMIST, assert_close, device
 
 
 @pytest.mark.parametrize(

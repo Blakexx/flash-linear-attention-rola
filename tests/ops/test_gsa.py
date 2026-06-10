@@ -5,9 +5,9 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from fla.ops.gsa import chunk_gsa, fused_recurrent_gsa
-from fla.ops.gsa.naive import naive_recurrent_gsa
-from fla.utils import assert_close, check_shared_mem, device, device_platform
+from fla_rola.ops.gsa import chunk_gsa, fused_recurrent_gsa
+from fla_rola.ops.gsa.naive import naive_recurrent_gsa
+from fla_rola.utils import assert_close, check_shared_mem, device, device_platform
 
 
 @pytest.mark.parametrize(

@@ -1,29 +1,29 @@
 import pytest
 import torch
 
-from fla.layers.abc import ABCAttention
-from fla.layers.comba import Comba
-from fla.layers.delta_net import DeltaNet
-from fla.layers.gated_deltanet import GatedDeltaNet
-from fla.layers.gated_deltaproduct import GatedDeltaProduct
-from fla.layers.gla import GatedLinearAttention
-from fla.layers.gsa import GatedSlotAttention
-from fla.layers.hgrn import HGRNAttention
-from fla.layers.hgrn2 import HGRN2Attention
-from fla.layers.kda import KimiDeltaAttention
-from fla.layers.lightnet import LightNetAttention
-from fla.layers.linear_attn import LinearAttention
-from fla.layers.log_linear_mamba2 import LogLinearMamba2
-from fla.layers.mamba import Mamba
-from fla.layers.mamba2 import Mamba2
-from fla.layers.mesa_net import MesaNet
-from fla.layers.mom import MomAttention
-from fla.layers.multiscale_retention import MultiScaleRetention
-from fla.layers.rodimus import RodimusAttention
-from fla.layers.rwkv6 import RWKV6Attention
-from fla.layers.rwkv7 import RWKV7Attention
-from fla.layers.simple_gla import SimpleGatedLinearAttention
-from fla.utils import device
+from fla_rola.layers.abc import ABCAttention
+from fla_rola.layers.comba import Comba
+from fla_rola.layers.delta_net import DeltaNet
+from fla_rola.layers.gated_deltanet import GatedDeltaNet
+from fla_rola.layers.gated_deltaproduct import GatedDeltaProduct
+from fla_rola.layers.gla import GatedLinearAttention
+from fla_rola.layers.gsa import GatedSlotAttention
+from fla_rola.layers.hgrn import HGRNAttention
+from fla_rola.layers.hgrn2 import HGRN2Attention
+from fla_rola.layers.kda import KimiDeltaAttention
+from fla_rola.layers.lightnet import LightNetAttention
+from fla_rola.layers.linear_attn import LinearAttention
+from fla_rola.layers.log_linear_mamba2 import LogLinearMamba2
+from fla_rola.layers.mamba import Mamba
+from fla_rola.layers.mamba2 import Mamba2
+from fla_rola.layers.mesa_net import MesaNet
+from fla_rola.layers.mom import MomAttention
+from fla_rola.layers.multiscale_retention import MultiScaleRetention
+from fla_rola.layers.rodimus import RodimusAttention
+from fla_rola.layers.rwkv6 import RWKV6Attention
+from fla_rola.layers.rwkv7 import RWKV7Attention
+from fla_rola.layers.simple_gla import SimpleGatedLinearAttention
+from fla_rola.utils import device
 
 
 class DummyCache(list):

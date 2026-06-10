@@ -2,8 +2,8 @@
 import pytest
 import torch
 
-from fla.modules.rotary import RotaryEmbedding, rotary_embedding_ref
-from fla.utils import assert_close, device
+from fla_rola.modules.rotary import RotaryEmbedding, rotary_embedding_ref
+from fla_rola.utils import assert_close, device
 
 
 @pytest.mark.parametrize("B", [2])

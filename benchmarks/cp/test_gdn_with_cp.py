@@ -27,10 +27,10 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from einops import rearrange, repeat
 
-from fla.models.utils import Cache
-from fla.modules.convolution import causal_conv1d
-from fla.ops.gated_delta_rule import chunk_gated_delta_rule, fused_recurrent_gated_delta_rule
-from fla.ops.kda import chunk_kda, fused_recurrent_kda
+from fla_rola.models.utils import Cache
+from fla_rola.modules.convolution import causal_conv1d
+from fla_rola.ops.gated_delta_rule import chunk_gated_delta_rule, fused_recurrent_gated_delta_rule
+from fla_rola.ops.kda import chunk_kda, fused_recurrent_kda
 
 sys.path.append("../../")
 
@@ -662,9 +662,9 @@ def profile_func(fn, path):
 
 
 def test_ops(args):
-    from fla.ops.cp import build_cp_context
-    from fla.ops.gated_delta_rule import chunk_gated_delta_rule
-    from fla.ops.kda import chunk_kda
+    from fla_rola.ops.cp import build_cp_context
+    from fla_rola.ops.gated_delta_rule import chunk_gated_delta_rule
+    from fla_rola.ops.kda import chunk_kda
 
     device = torch.cuda.current_device()
     group = args.group
@@ -782,8 +782,8 @@ def test_ops(args):
 
 
 def test_layer(args):
-    from fla.layers.gated_deltanet import GatedDeltaNet
-    from fla.layers.kda import KimiDeltaAttention
+    from fla_rola.layers.gated_deltanet import GatedDeltaNet
+    from fla_rola.layers.kda import KimiDeltaAttention
 
     device = torch.cuda.current_device()
     group = args.group

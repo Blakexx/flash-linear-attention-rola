@@ -3,7 +3,7 @@ import torch
 import triton
 from flash_attn import flash_attn_func
 
-from fla.ops.nsa import parallel_nsa
+from fla_rola.ops.nsa import parallel_nsa
 
 
 @triton.testing.perf_report(
@@ -28,7 +28,7 @@ from fla.ops.nsa import parallel_nsa
     ),
 )
 def benchmark(T, provider):
-    from fla.utils import device
+    from fla_rola.utils import device
     dtype = torch.bfloat16
     requires_grad = True
     B, H, HQ, D, S = 4, 4, 64, 128, 16

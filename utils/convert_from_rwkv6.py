@@ -1,5 +1,5 @@
 
-# scripts for converting pretrained hf model weights to fla style
+# scripts for converting pretrained hf model weights to fla_rola style
 # calling the code to make conversions for RWKV/rwkv-6-world-7b would achieve the following results:
 # |    Tasks     |Version|Filter|n-shot|    Metric     | Value |   |Stderr|
 # |--------------|------:|------|-----:|---------------|------:|---|------|
@@ -26,8 +26,8 @@ import argparse
 import torch
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
-import fla  # noqa
-from fla.utils import device
+import fla_rola  # noqa
+from fla_rola.utils import device
 
 
 def sizeof_fmt(num, suffix='B'):

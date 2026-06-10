@@ -1,5 +1,5 @@
 
-# scripts for converting pretrained hf model weights to fla style
+# scripts for converting pretrained hf model weights to fla_rola style
 
 import argparse
 import os
@@ -8,8 +8,8 @@ import re
 import torch
 from transformers import AutoModelForCausalLM
 
-import fla  # noqa
-from fla.models.rwkv7 import RWKV7Config
+import fla_rola  # noqa
+from fla_rola.models.rwkv7 import RWKV7Config
 
 
 def convert(

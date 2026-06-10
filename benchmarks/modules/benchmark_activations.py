@@ -2,9 +2,9 @@
 import torch
 import triton
 
-from fla.modules.activations import fast_gelu_impl as gelu
-from fla.modules.activations import logsigmoid, sigmoid, sqrelu, swiglu, swish
-from fla.utils import device
+from fla_rola.modules.activations import fast_gelu_impl as gelu
+from fla_rola.modules.activations import logsigmoid, sigmoid, sqrelu, swiglu, swish
+from fla_rola.utils import device
 
 DTYPE = torch.bfloat16
 

@@ -3,8 +3,8 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from fla.modules.l2norm import l2_norm
-from fla.utils import assert_close, device
+from fla_rola.modules.l2norm import l2_norm
+from fla_rola.utils import assert_close, device
 
 
 @pytest.mark.parametrize(

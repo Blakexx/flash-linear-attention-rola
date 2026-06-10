@@ -10,7 +10,7 @@ import torch
 import triton
 from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined
 
-from fla.ops.simple_gla import chunk_simple_gla
+from fla_rola.ops.simple_gla import chunk_simple_gla
 
 
 @triton.testing.perf_report(
@@ -35,7 +35,7 @@ from fla.ops.simple_gla import chunk_simple_gla
 )
 def benchmark(T, provider):
     # TODO: also add bwd pass benchmark
-    from fla.utils import device
+    from fla_rola.utils import device
     dtype = torch.bfloat16
     B, H, D = 16, 8, 128
     # TODO: test more shapes

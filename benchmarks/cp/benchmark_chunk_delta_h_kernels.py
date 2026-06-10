@@ -24,7 +24,7 @@ import torch
 import triton
 import triton.testing
 
-from fla.ops.cp.chunk_delta_h import (
+from fla_rola.ops.cp.chunk_delta_h import (
     merge_fwd_bwd_kernel,
     pre_process_bwd_kernel_merged,
     pre_process_bwd_kernel_stage1,
@@ -32,7 +32,7 @@ from fla.ops.cp.chunk_delta_h import (
     pre_process_fwd_kernel_merged,
     pre_process_fwd_kernel_stage1,
 )
-from fla.utils import device
+from fla_rola.utils import device
 
 DTYPE = torch.bfloat16
 

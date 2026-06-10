@@ -6,7 +6,7 @@ import pytest
 import torch
 from transformers.configuration_utils import PretrainedConfig
 
-from fla.utils import IS_INTEL_ALCHEMIST, IS_NVIDIA_HOPPER, assert_close, device
+from fla_rola.utils import IS_INTEL_ALCHEMIST, IS_NVIDIA_HOPPER, assert_close, device
 
 from .test_modeling_utils import (
     GENERATION_UNSUPPORTED,

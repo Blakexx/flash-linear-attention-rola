@@ -3,8 +3,8 @@ import pytest
 import torch
 from transformers import AutoModelForCausalLM
 
-from fla.models import GatedDeltaProductConfig
-from fla.utils import device
+from fla_rola.models import GatedDeltaProductConfig
+from fla_rola.utils import device
 
 from .test_modeling_base import run_test_generation, run_test_model_forward_backward
 from .test_modeling_utils import init_weights_recursively

@@ -3,9 +3,9 @@
 import pytest
 import torch
 
-from fla.ops.linear_attn import chunk_linear_attn, fused_chunk_linear_attn, fused_recurrent_linear_attn
-from fla.ops.linear_attn.naive import naive_recurrent_linear_attn
-from fla.utils import assert_close, device
+from fla_rola.ops.linear_attn import chunk_linear_attn, fused_chunk_linear_attn, fused_recurrent_linear_attn
+from fla_rola.ops.linear_attn.naive import naive_recurrent_linear_attn
+from fla_rola.utils import assert_close, device
 
 
 @pytest.mark.parametrize(

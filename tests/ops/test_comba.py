@@ -6,10 +6,10 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from fla.ops.comba import chunk_comba, fused_recurrent_comba
-from fla.ops.comba.naive import naive_chunk_comba
-from fla.ops.comba.utils import chunk_comba_cumsum_scalar_fwd
-from fla.utils import IS_INTEL_ALCHEMIST, assert_close, device
+from fla_rola.ops.comba import chunk_comba, fused_recurrent_comba
+from fla_rola.ops.comba.naive import naive_chunk_comba
+from fla_rola.ops.comba.utils import chunk_comba_cumsum_scalar_fwd
+from fla_rola.utils import IS_INTEL_ALCHEMIST, assert_close, device
 
 
 def cumsum_comba_local_fwd_reference(s, reverse=False, chunk_size=128):

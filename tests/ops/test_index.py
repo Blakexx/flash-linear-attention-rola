@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from fla.ops.utils.index import (
+from fla_rola.ops.utils.index import (
     prepare_chunk_indices,
     prepare_chunk_offsets,
     prepare_position_ids,
@@ -9,7 +9,7 @@ from fla.ops.utils.index import (
     prepare_split_cu_seqlens,
     prepare_token_indices,
 )
-from fla.utils import device
+from fla_rola.utils import device
 
 
 def ref_prepare_sequence_ids(cu_seqlens):
