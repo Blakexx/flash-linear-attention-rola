@@ -91,9 +91,14 @@ def chunk_rola_fwd(q, k, v, r, w, g=None, scale=None, chunk_size=64):
     qf = fold(q, K) * scale
     kf, vf, rf, wf = fold(k, K), fold(v, V), fold(r, nc), fold(w, nc)
     ldf = fold(g, nc) if g is not None else None
-    # Triton fast path on CUDA with feature dim within tl.dot block limits. Falls back to the torch
-    # shared-gram reference otherwise (non-CUDA, large dqk). GLA forces chunk=32 (fp32-safe decay floor).
-    if qf.is_cuda and K <= 64:
+    # Triton fast path on CUDA with feature dim within tl.dot block limits, on GPUs with
+    # ampere-class shared memory. On small-smem devices (sm75/T4, 64KB) the Triton kernels only fit
+    # at chunk=16/stages=1, where they MEASURE ~25% slower than the cuBLAS-backed torch core
+    # (3.51 vs 2.82 it/s on the nc=256 MQAR cell) — so those devices dispatch to the torch core,
+    # which also removes the sm75 d_v<=15 envelope. Device tiering, not a fallback: each hardware
+    # class runs its measured-fastest verified implementation.
+    from fla_rola.ops.simple_gla.rola import _BIG_SMEM
+    if qf.is_cuda and K <= 64 and _BIG_SMEM:
         if ldf is None:
             from fla_rola.ops.simple_gla.rola import rola_rla_triton
             O = rola_rla_triton(qf, kf, vf, rf, wf, chunk=chunk_size)
