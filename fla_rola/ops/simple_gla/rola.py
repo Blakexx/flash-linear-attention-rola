@@ -549,7 +549,9 @@ def _bwd_split_gla(q, k, v, wg, rg, ld, g, chunk=None, BG=16):
     pad = (-L) % chunk; Lp = L + pad
     ld_p = F.pad(ld, (0, 0, 0, pad)) if pad else ld
     Lam_t = ld_p.view(B, NCH, chunk, nc).sum(2)                                   # [B,NCH,nc]
-    t1 = torch.stack([(dSa[:, :, t] * Sb[:, :, t]).view(B, NB, BD, BG, BV).sum(dim=(2, 4))
+    # slice rows to :dqk — Sb/dSa are torch.empty and the kernels only WRITE rows < dqk
+    # (dmask-ed stores); rows dqk..BD-1 are uninitialized garbage that must not enter the sum.
+    t1 = torch.stack([(dSa[:, :, t] * Sb[:, :, t]).view(B, NB, BD, BG, BV)[:, :, :dqk].sum(dim=(2, 4))
                       for t in range(NCH)], dim=2)                                # [B,NB,NCH,BG]
     t1 = t1.permute(0, 2, 1, 3).reshape(B, NCH, NB * BG)[..., :nc] * torch.exp(Lam_t)
     dawend_p = F.pad(dawend, (0, 0, 0, pad)) if pad else dawend
