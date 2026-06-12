@@ -6,7 +6,12 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from fla_rola.ops.mesa_net import chunk_mesa_net, mesa_net_decoding_one_step, naive_mesa_net_decoding_one_step, naive_mesa_net_exact
+from fla_rola.ops.mesa_net import (
+    chunk_mesa_net,
+    mesa_net_decoding_one_step,
+    naive_mesa_net_decoding_one_step,
+    naive_mesa_net_exact,
+)
 from fla_rola.utils import IS_INTEL_ALCHEMIST, assert_close, device, device_platform
 
 

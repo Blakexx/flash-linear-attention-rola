@@ -9,7 +9,14 @@ import triton.language as tl
 from fla_rola.ops.utils.index import prepare_chunk_indices
 from fla_rola.ops.utils.op import exp
 from fla_rola.ops.utils.softplus import softplus
-from fla_rola.utils import IS_AMD, autocast_custom_bwd, autocast_custom_fwd, autotune_cache_kwargs, check_shared_mem, input_guard
+from fla_rola.utils import (
+    IS_AMD,
+    autocast_custom_bwd,
+    autocast_custom_fwd,
+    autotune_cache_kwargs,
+    check_shared_mem,
+    input_guard,
+)
 
 BS_LIST = [32, 64] if check_shared_mem() else [16, 32]
 BT_LIST_AUTOTUNE = [32, 64, 128]

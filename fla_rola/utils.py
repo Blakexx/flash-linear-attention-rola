@@ -10,16 +10,13 @@ import warnings
 from collections.abc import Callable
 from enum import Enum
 from functools import lru_cache
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import torch
 import triton
 from packaging import version
 
 logger = logging.getLogger(__name__)
-
-if TYPE_CHECKING:
-    from fla_rola import __version__
 
 FLA_CI_ENV = os.getenv("FLA_CI_ENV") == "1"
 FLA_CACHE_RESULTS = os.getenv('FLA_CACHE_RESULTS', '1') == '1'
@@ -325,6 +322,7 @@ def deprecate_kwarg(
         ```
 
     """
+    from fla_rola import __version__  # runtime import (deferred: avoids import cycle)
     deprecated_version = version.parse(version)
     current_version = version.parse(__version__)
     is_greater_or_equal_version = current_version >= deprecated_version

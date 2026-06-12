@@ -28,7 +28,7 @@ except ImportError:
         line_names=['retention_parallel_fwdbwd', 'retention_fused_chunk_fwdbwd',
                     'gla_fused_chunk_fwdbwd', 'based_parallel_fwdbwd'] + (['flash_fwdbwd'] if HAS_FLASH else []),
         # line styles
-        styles=[('green', '-'), ('blue', '--'), ('red', '-.'), ('cyan', ':')] + \
+        styles=[('green', '-'), ('blue', '--'), ('red', '-.'), ('cyan', ':')] +
         ([('yellow', 'dotted')] if HAS_FLASH else []),
         ylabel="Execution Time (ms)",  # label name for the y-axis
         # name for the plot. Used also as a file name for saving the plot.

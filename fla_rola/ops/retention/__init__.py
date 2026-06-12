@@ -7,6 +7,6 @@ from .parallel import parallel_retention
 __all__ = [
     'chunk_retention',
     'fused_chunk_retention',
-    'parallel_retention',
     'fused_recurrent_retention',
+    'parallel_retention',
 ]

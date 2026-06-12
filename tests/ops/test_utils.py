@@ -89,7 +89,7 @@ def test_global_cumsum_varlen(
     ref = torch.cat([
         s[:, start:end].float().cumsum(1)
         for start, end in zip(cu_seqlens[:-1], cu_seqlens[1:])
-        ], 1).to(dtype)
+    ], 1).to(dtype)
     tri = chunk_global_cumsum(s, cu_seqlens=cu_seqlens)
     assert_close('global_cumsum', ref, tri, 1e-3)
 

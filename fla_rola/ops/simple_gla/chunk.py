@@ -36,12 +36,19 @@ def _rola_chunk_core(q, k, v, w, r, ld, chunk_size):
         # RLA: vectorized chunk-parallel (mirrors chunked_parallel, no normalization).
         pad = (-T) % chunk_size
         if pad:
-            q = torch.nn.functional.pad(q, (0, 0, 0, pad)); k = torch.nn.functional.pad(k, (0, 0, 0, pad))
+            q = torch.nn.functional.pad(q, (0, 0, 0, pad))
+            k = torch.nn.functional.pad(k, (0, 0, 0, pad))
             v = torch.nn.functional.pad(v, (0, 0, 0, pad))
-            w = torch.nn.functional.pad(w, (0, 0, 0, pad)); r = torch.nn.functional.pad(r, (0, 0, 0, pad))
-        Tp = T + pad; nch = Tp // chunk_size; C = chunk_size
-        qc = q.view(BH, nch, C, K); kc = k.view(BH, nch, C, K); vc = v.view(BH, nch, C, V)
-        rc = r.view(BH, nch, C, nc); wc = w.view(BH, nch, C, nc)
+            w = torch.nn.functional.pad(w, (0, 0, 0, pad))
+            r = torch.nn.functional.pad(r, (0, 0, 0, pad))
+        Tp = T + pad
+        nch = Tp // chunk_size
+        C = chunk_size
+        qc = q.view(BH, nch, C, K)
+        kc = k.view(BH, nch, C, K)
+        vc = v.view(BH, nch, C, V)
+        rc = r.view(BH, nch, C, nc)
+        wc = w.view(BH, nch, C, nc)
         G = torch.einsum('bnid,bnjd->bnij', qc, kc)
         R = torch.einsum('bnic,bnjc->bnij', rc, wc)
         causal = torch.tril(torch.ones(C, C, device=q.device, dtype=q.dtype))
@@ -57,7 +64,8 @@ def _rola_chunk_core(q, k, v, w, r, ld, chunk_size):
     S = q.new_zeros(BH, nc, K, V)
     outs = []
     for c0 in range(0, T, chunk_size):
-        c1 = min(c0 + chunk_size, T); Cc = c1 - c0
+        c1 = min(c0 + chunk_size, T)
+        Cc = c1 - c0
         qcc, kcc, vcc = q[:, c0:c1], k[:, c0:c1], v[:, c0:c1]
         rcc, wcc, ldc = r[:, c0:c1], w[:, c0:c1], ld[:, c0:c1]
         a = torch.cumsum(ldc, dim=1)                                  # chunk-local cumulative log-decay
@@ -87,7 +95,8 @@ def chunk_rola_fwd(q, k, v, r, w, g=None, scale=None, chunk_size=64):
     nc = r.shape[-1]
     if scale is None:
         scale = K ** -0.5
-    fold = lambda t, d: t.permute(0, 2, 1, 3).reshape(B * H, T, d)
+
+    def fold(t, d): return t.permute(0, 2, 1, 3).reshape(B * H, T, d)
     qf = fold(q, K) * scale
     kf, vf, rf, wf = fold(k, K), fold(v, V), fold(r, nc), fold(w, nc)
     ldf = fold(g, nc) if g is not None else None

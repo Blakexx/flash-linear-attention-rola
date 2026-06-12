@@ -30,7 +30,7 @@ _AT_CFGS = [triton.Config({}, num_warps=w, num_stages=s)
 _AT_KEY = ['dqk', 'dv', 'nc']
 _CHUNK_FWD = 64 if _BIG_SMEM else 16     # RLA forward
 _CHUNK = 32 if _BIG_SMEM else 16         # GLA forward + all backwards (GLA needs BT<=32 for the
-                                         # fp32 decay floor; BT=16 keeps sm75 within 64KB)
+# fp32 decay floor; BT=16 keeps sm75 within 64KB)
 
 
 @triton.autotune(configs=_AT_CFGS, key=_AT_KEY, **autotune_cache_kwargs)
@@ -46,12 +46,16 @@ def _rola_fwd_tiled(q_ptr, k_ptr, v_ptr, wg_ptr, rg_ptr, outa_ptr,
     b = tl.program_id(0)
     sb = tl.program_id(1)
     dvp = dv + 1
-    offs_t = tl.arange(0, BT); offs_d = tl.arange(0, BD); offs_v = tl.arange(0, BV)
+    offs_t = tl.arange(0, BT)
+    offs_d = tl.arange(0, BD)
+    offs_v = tl.arange(0, BV)
     offs_c = sb * BG + tl.arange(0, BG)
-    dmask = offs_d < dqk; cmask = offs_c < nc
+    dmask = offs_d < dqk
+    cmask = offs_c < nc
     Sflat = tl.zeros([BD, BG * BV], dtype=tl.float32)
     for t in range(NCH):
-        rows = t * BT + offs_t; rmask = rows < L
+        rows = t * BT + offs_t
+        rmask = rows < L
         qc = tl.load(q_ptr + b * sq_b + rows[:, None] * sq_l + offs_d[None, :] * sq_d,
                      mask=rmask[:, None] & dmask[None, :], other=0.0)
         kc = tl.load(k_ptr + b * sq_b + rows[:, None] * sq_l + offs_d[None, :] * sq_d,
@@ -80,9 +84,13 @@ def _rola_fwd_tiled(q_ptr, k_ptr, v_ptr, wg_ptr, rg_ptr, outa_ptr,
 
 def _fwd_aug(q, k, v, wg, rg, chunk, BG):
     """Triton forward, AUGMENTED [B,L,dv+1] (numerator | denominator), summed over state-blocks."""
-    B, L, dqk = q.shape; dv = v.shape[-1]; nc = wg.shape[-1]
-    BD = max(16, triton.next_power_of_2(dqk)); BV = max(16, triton.next_power_of_2(dv + 1))
-    NB = triton.cdiv(nc, BG); NCH = triton.cdiv(L, chunk)
+    B, L, dqk = q.shape
+    dv = v.shape[-1]
+    nc = wg.shape[-1]
+    BD = max(16, triton.next_power_of_2(dqk))
+    BV = max(16, triton.next_power_of_2(dv + 1))
+    NB = triton.cdiv(nc, BG)
+    NCH = triton.cdiv(L, chunk)
     q, k, v, wg, rg = [x.contiguous() for x in (q, k, v, wg, rg)]
     out_aug = torch.zeros(B, NB, L, BV, device=q.device, dtype=torch.float32)
     _rola_fwd_tiled[(B, NB)](
@@ -112,7 +120,7 @@ class _RoLARLAFn(torch.autograd.Function):
         g = F.pad(dO.float(), (0, 1))                            # zero den-column → [BH,L,dv+1]
         qf, kf, vf, wgf, rgf = (t.float() for t in (q, k, v, wg, rg))
         dq, dk, dvv, dw, dr = _bwd_split_rla(qf, kf, vf, wgf, rgf, g)
-        cast = lambda t: t.to(q.dtype)
+        def cast(t): return t.to(q.dtype)
         return cast(dq), cast(dk), cast(dvv), cast(dw), cast(dr), None, None, None
 
 
@@ -144,13 +152,19 @@ def _rola_gla_fwd_tiled(q_ptr, k_ptr, v_ptr, wg_ptr, rg_ptr, ld_ptr, outa_ptr,
                         soa_b, soa_n, soa_l, soa_v,
                         BT: tl.constexpr, BD: tl.constexpr, BV: tl.constexpr,
                         BG: tl.constexpr, NCH: tl.constexpr):
-    b = tl.program_id(0); sb = tl.program_id(1); dvp = dv + 1
-    offs_t = tl.arange(0, BT); offs_d = tl.arange(0, BD); offs_v = tl.arange(0, BV)
+    b = tl.program_id(0)
+    sb = tl.program_id(1)
+    dvp = dv + 1
+    offs_t = tl.arange(0, BT)
+    offs_d = tl.arange(0, BD)
+    offs_v = tl.arange(0, BV)
     offs_c = sb * BG + tl.arange(0, BG)
-    dmask = offs_d < dqk; cmask = offs_c < nc
+    dmask = offs_d < dqk
+    cmask = offs_c < nc
     Sflat = tl.zeros([BD, BG * BV], dtype=tl.float32)
     for t in range(NCH):
-        rows = t * BT + offs_t; rmask = rows < L
+        rows = t * BT + offs_t
+        rmask = rows < L
         qc = tl.load(q_ptr + b * sq_b + rows[:, None] * sq_l + offs_d[None, :] * sq_d,
                      mask=rmask[:, None] & dmask[None, :], other=0.0)
         kc = tl.load(k_ptr + b * sq_b + rows[:, None] * sq_l + offs_d[None, :] * sq_d,
@@ -165,7 +179,8 @@ def _rola_gla_fwd_tiled(q_ptr, k_ptr, v_ptr, wg_ptr, rg_ptr, ld_ptr, outa_ptr,
         ldc = tl.load(ld_ptr + b * sg_b + rows[:, None] * sg_l + offs_c[None, :] * sg_c,
                       mask=rmask[:, None] & cmask[None, :], other=0.0)
         a = tl.cumsum(ldc, axis=0)
-        rt = rgc * tl.exp(a); wt = wgc * tl.exp(-a)
+        rt = rgc * tl.exp(a)
+        wt = wgc * tl.exp(-a)
         G = tl.dot(qc, tl.trans(kc))
         R = tl.dot(rt, tl.trans(wt))
         causal = (offs_t[:, None] >= offs_t[None, :]) & rmask[:, None] & rmask[None, :]
@@ -186,10 +201,14 @@ def _rola_gla_fwd_tiled(q_ptr, k_ptr, v_ptr, wg_ptr, rg_ptr, ld_ptr, outa_ptr,
 
 def _gla_fwd_aug(q, k, v, wg, rg, ld, chunk, BG):
     """GLA Triton forward, AUGMENTED [BH,L,dv+1] (num | den), summed over state-blocks."""
-    B, L, dqk = q.shape; dv = v.shape[-1]; nc = wg.shape[-1]
+    B, L, dqk = q.shape
+    dv = v.shape[-1]
+    nc = wg.shape[-1]
     ld = ld.clamp(min=_GLA_FLOOR).contiguous()
-    BD = max(16, triton.next_power_of_2(dqk)); BV = max(16, triton.next_power_of_2(dv + 1))
-    NB = triton.cdiv(nc, BG); NCH = triton.cdiv(L, chunk)
+    BD = max(16, triton.next_power_of_2(dqk))
+    BV = max(16, triton.next_power_of_2(dv + 1))
+    NB = triton.cdiv(nc, BG)
+    NCH = triton.cdiv(L, chunk)
     q, k, v, wg, rg = [x.contiguous() for x in (q, k, v, wg, rg)]
     out_aug = torch.zeros(B, NB, L, BV, device=q.device, dtype=torch.float32)
     _rola_gla_fwd_tiled[(B, NB)](
@@ -217,9 +236,9 @@ class _RoLAGLAFn(torch.autograd.Function):
     def backward(ctx, dO):
         q, k, v, wg, rg, ld = ctx.saved_tensors
         g = F.pad(dO.float(), (0, 1))                            # zero den-column → [BH,L,dv+1]
-        fl = lambda t: t.float()
+        def fl(t): return t.float()
         dq, dk, dvv, dwg, drg, dld = _bwd_split_gla(fl(q), fl(k), fl(v), fl(wg), fl(rg), fl(ld), g, chunk=ctx.chunk)
-        cast = lambda t: t.to(q.dtype)
+        def cast(t): return t.to(q.dtype)
         # forward args order: q, k, v, wg, rg, ld, chunk, BG
         return cast(dq), cast(dk), cast(dvv), cast(dwg), cast(drg), cast(dld), None, None
 
@@ -253,21 +272,31 @@ def _scan_S(k_ptr, v_ptr, wg_ptr, ld_ptr, Sb_ptr, L, dqk, dv, nc,
             ssb_b, ssb_n, ssb_t, ssb_d, ssb_e,
             USE_G: tl.constexpr, BT: tl.constexpr, BD: tl.constexpr, BV: tl.constexpr,
             BG: tl.constexpr, NCH: tl.constexpr):
-    b = tl.program_id(0); sb = tl.program_id(1)
-    offs_t = tl.arange(0, BT); offs_d = tl.arange(0, BD); offs_v = tl.arange(0, BV)
-    offs_e = tl.arange(0, BG * BV); offs_c = sb * BG + tl.arange(0, BG)
-    dmask = offs_d < dqk; cmask = offs_c < nc
+    b = tl.program_id(0)
+    sb = tl.program_id(1)
+    offs_t = tl.arange(0, BT)
+    offs_d = tl.arange(0, BD)
+    offs_v = tl.arange(0, BV)
+    offs_e = tl.arange(0, BG * BV)
+    offs_c = sb * BG + tl.arange(0, BG)
+    dmask = offs_d < dqk
+    cmask = offs_c < nc
     Sflat = tl.zeros([BD, BG * BV], dtype=tl.float32)
     for t in range(NCH):
-        rows = t * BT + offs_t; rmask = rows < L
-        kc = tl.load(k_ptr + b*sq_b + rows[:, None]*sq_l + offs_d[None, :]*sq_d, mask=rmask[:, None] & dmask[None, :], other=0.0)
-        vc = tl.load(v_ptr + b*sv_b + rows[:, None]*sv_l + offs_v[None, :]*sv_d, mask=rmask[:, None] & (offs_v[None, :] < dv), other=0.0)
+        rows = t * BT + offs_t
+        rmask = rows < L
+        kc = tl.load(k_ptr + b*sq_b + rows[:, None]*sq_l + offs_d[None, :]
+                     * sq_d, mask=rmask[:, None] & dmask[None, :], other=0.0)
+        vc = tl.load(v_ptr + b*sv_b + rows[:, None]*sv_l + offs_v[None, :]*sv_d,
+                     mask=rmask[:, None] & (offs_v[None, :] < dv), other=0.0)
         vc += tl.where((offs_v[None, :] == dv) & rmask[:, None], 1.0, 0.0)
-        wgc = tl.load(wg_ptr + b*sg_b + rows[:, None]*sg_l + offs_c[None, :]*sg_c, mask=rmask[:, None] & cmask[None, :], other=0.0)
+        wgc = tl.load(wg_ptr + b*sg_b + rows[:, None]*sg_l + offs_c[None, :]
+                      * sg_c, mask=rmask[:, None] & cmask[None, :], other=0.0)
         tl.store(Sb_ptr + b*ssb_b + sb*ssb_n + t*ssb_t + offs_d[:, None]*ssb_d + offs_e[None, :]*ssb_e,
                  Sflat, mask=dmask[:, None])
         if USE_G:
-            ldc = tl.load(ld_ptr + b*sg_b + rows[:, None]*sg_l + offs_c[None, :]*sg_c, mask=rmask[:, None] & cmask[None, :], other=0.0)
+            ldc = tl.load(ld_ptr + b*sg_b + rows[:, None]*sg_l + offs_c[None, :]
+                          * sg_c, mask=rmask[:, None] & cmask[None, :], other=0.0)
             a = tl.cumsum(ldc, axis=0)
             Lam = tl.sum(tl.where(offs_t[:, None] == (BT - 1), a, 0.0), axis=0)
             w_end = wgc * tl.exp(Lam[None, :] - a)
@@ -286,21 +315,32 @@ def _scan_dS(q_ptr, rg_ptr, ld_ptr, g_ptr, dSa_ptr, L, dqk, dv, nc,
              ssb_b, ssb_n, ssb_t, ssb_d, ssb_e,
              USE_G: tl.constexpr, BT: tl.constexpr, BD: tl.constexpr, BV: tl.constexpr,
              BG: tl.constexpr, NCH: tl.constexpr):
-    b = tl.program_id(0); sb = tl.program_id(1)
-    offs_t = tl.arange(0, BT); offs_d = tl.arange(0, BD); offs_v = tl.arange(0, BV)
-    offs_e = tl.arange(0, BG * BV); offs_c = sb * BG + tl.arange(0, BG)
-    dmask = offs_d < dqk; cmask = offs_c < nc; vmask = offs_v < (dv + 1)
+    b = tl.program_id(0)
+    sb = tl.program_id(1)
+    offs_t = tl.arange(0, BT)
+    offs_d = tl.arange(0, BD)
+    offs_v = tl.arange(0, BV)
+    offs_e = tl.arange(0, BG * BV)
+    offs_c = sb * BG + tl.arange(0, BG)
+    dmask = offs_d < dqk
+    cmask = offs_c < nc
+    vmask = offs_v < (dv + 1)
     dS = tl.zeros([BD, BG * BV], dtype=tl.float32)
     for ti in range(NCH):
         t = NCH - 1 - ti
-        rows = t * BT + offs_t; rmask = rows < L
-        qc = tl.load(q_ptr + b*sq_b + rows[:, None]*sq_l + offs_d[None, :]*sq_d, mask=rmask[:, None] & dmask[None, :], other=0.0)
-        rgc = tl.load(rg_ptr + b*sg_b + rows[:, None]*sg_l + offs_c[None, :]*sg_c, mask=rmask[:, None] & cmask[None, :], other=0.0)
-        gc = tl.load(g_ptr + b*sgr_b + rows[:, None]*sgr_l + offs_v[None, :]*sgr_d, mask=rmask[:, None] & vmask[None, :], other=0.0)
+        rows = t * BT + offs_t
+        rmask = rows < L
+        qc = tl.load(q_ptr + b*sq_b + rows[:, None]*sq_l + offs_d[None, :]
+                     * sq_d, mask=rmask[:, None] & dmask[None, :], other=0.0)
+        rgc = tl.load(rg_ptr + b*sg_b + rows[:, None]*sg_l + offs_c[None, :]
+                      * sg_c, mask=rmask[:, None] & cmask[None, :], other=0.0)
+        gc = tl.load(g_ptr + b*sgr_b + rows[:, None]*sgr_l + offs_v[None, :]
+                     * sgr_d, mask=rmask[:, None] & vmask[None, :], other=0.0)
         tl.store(dSa_ptr + b*ssb_b + sb*ssb_n + t*ssb_t + offs_d[:, None]*ssb_d + offs_e[None, :]*ssb_e,
                  dS, mask=dmask[:, None])
         if USE_G:
-            ldc = tl.load(ld_ptr + b*sg_b + rows[:, None]*sg_l + offs_c[None, :]*sg_c, mask=rmask[:, None] & cmask[None, :], other=0.0)
+            ldc = tl.load(ld_ptr + b*sg_b + rows[:, None]*sg_l + offs_c[None, :]
+                          * sg_c, mask=rmask[:, None] & cmask[None, :], other=0.0)
             a = tl.cumsum(ldc, axis=0)
             rt = rgc * tl.exp(a)
             Lam = tl.sum(tl.where(offs_t[:, None] == (BT - 1), a, 0.0), axis=0)
@@ -320,21 +360,34 @@ def _par_grad_rla_qr(q_ptr, k_ptr, v_ptr, wg_ptr, rg_ptr, g_ptr, Sb_ptr, dq_ptr,
                      ssb_b, ssb_n, ssb_t, ssb_d, ssb_e,
                      sdq_b, sdq_n, sdq_l, sdq_d, sdr_b, sdr_l, sdr_c,
                      BT: tl.constexpr, BD: tl.constexpr, BV: tl.constexpr, BG: tl.constexpr, NCH: tl.constexpr):
-    b = tl.program_id(0); sb = tl.program_id(1); t = tl.program_id(2)
-    offs_t = tl.arange(0, BT); offs_d = tl.arange(0, BD); offs_v = tl.arange(0, BV)
-    offs_e = tl.arange(0, BG * BV); offs_c = sb * BG + tl.arange(0, BG)
-    dmask = offs_d < dqk; cmask = offs_c < nc; vmask = offs_v < (dv + 1)
-    rows = t * BT + offs_t; rmask = rows < L
+    b = tl.program_id(0)
+    sb = tl.program_id(1)
+    t = tl.program_id(2)
+    offs_t = tl.arange(0, BT)
+    offs_d = tl.arange(0, BD)
+    offs_v = tl.arange(0, BV)
+    offs_e = tl.arange(0, BG * BV)
+    offs_c = sb * BG + tl.arange(0, BG)
+    dmask = offs_d < dqk
+    cmask = offs_c < nc
+    vmask = offs_v < (dv + 1)
+    rows = t * BT + offs_t
+    rmask = rows < L
     qc = tl.load(q_ptr + b*sq_b + rows[:, None]*sq_l + offs_d[None, :]*sq_d, mask=rmask[:, None] & dmask[None, :], other=0.0)
     kc = tl.load(k_ptr + b*sq_b + rows[:, None]*sq_l + offs_d[None, :]*sq_d, mask=rmask[:, None] & dmask[None, :], other=0.0)
-    v1 = tl.load(v_ptr + b*sv_b + rows[:, None]*sv_l + offs_v[None, :]*sv_d, mask=rmask[:, None] & (offs_v[None, :] < dv), other=0.0)
+    v1 = tl.load(v_ptr + b*sv_b + rows[:, None]*sv_l + offs_v[None, :]*sv_d,
+                 mask=rmask[:, None] & (offs_v[None, :] < dv), other=0.0)
     v1 += tl.where((offs_v[None, :] == dv) & rmask[:, None], 1.0, 0.0)
     rgc = tl.load(rg_ptr + b*sg_b + rows[:, None]*sg_l + offs_c[None, :]*sg_c, mask=rmask[:, None] & cmask[None, :], other=0.0)
     wgc = tl.load(wg_ptr + b*sg_b + rows[:, None]*sg_l + offs_c[None, :]*sg_c, mask=rmask[:, None] & cmask[None, :], other=0.0)
-    gc = tl.load(g_ptr + b*sgr_b + rows[:, None]*sgr_l + offs_v[None, :]*sgr_d, mask=rmask[:, None] & vmask[None, :], other=0.0)
-    Sb = tl.load(Sb_ptr + b*ssb_b + sb*ssb_n + t*ssb_t + offs_d[:, None]*ssb_d + offs_e[None, :]*ssb_e, mask=dmask[:, None], other=0.0)
+    gc = tl.load(g_ptr + b*sgr_b + rows[:, None]*sgr_l + offs_v[None, :]
+                 * sgr_d, mask=rmask[:, None] & vmask[None, :], other=0.0)
+    Sb = tl.load(Sb_ptr + b*ssb_b + sb*ssb_n + t*ssb_t + offs_d[:, None]
+                 * ssb_d + offs_e[None, :]*ssb_e, mask=dmask[:, None], other=0.0)
     causal = (offs_t[:, None] >= offs_t[None, :]) & rmask[:, None] & rmask[None, :]
-    G = tl.dot(qc, tl.trans(kc)); Rg = tl.dot(rgc, tl.trans(wgc)); P = tl.dot(gc, tl.trans(v1))
+    G = tl.dot(qc, tl.trans(kc))
+    Rg = tl.dot(rgc, tl.trans(wgc))
+    P = tl.dot(gc, tl.trans(v1))
     dq_intra = tl.dot((causal * Rg * P).to(kc.dtype), kc)
     dr_intra = tl.dot((causal * G * P).to(wgc.dtype), wgc)
     rg_g = tl.reshape(rgc[:, :, None] * gc[:, None, :], [BT, BG * BV])
@@ -355,28 +408,44 @@ def _par_grad_rla_kwv(q_ptr, k_ptr, v_ptr, wg_ptr, rg_ptr, g_ptr, dSa_ptr, dk_pt
                       ssb_b, ssb_n, ssb_t, ssb_d, ssb_e,
                       sdk_b, sdk_n, sdk_l, sdk_d, sdw_b, sdw_l, sdw_c, sdv_b, sdv_n, sdv_l, sdv_d,
                       BT: tl.constexpr, BD: tl.constexpr, BV: tl.constexpr, BG: tl.constexpr, NCH: tl.constexpr):
-    b = tl.program_id(0); sb = tl.program_id(1); t = tl.program_id(2)
-    offs_t = tl.arange(0, BT); offs_d = tl.arange(0, BD); offs_v = tl.arange(0, BV)
-    offs_e = tl.arange(0, BG * BV); offs_c = sb * BG + tl.arange(0, BG)
-    dmask = offs_d < dqk; cmask = offs_c < nc; vmask = offs_v < (dv + 1)
-    rows = t * BT + offs_t; rmask = rows < L
+    b = tl.program_id(0)
+    sb = tl.program_id(1)
+    t = tl.program_id(2)
+    offs_t = tl.arange(0, BT)
+    offs_d = tl.arange(0, BD)
+    offs_v = tl.arange(0, BV)
+    offs_e = tl.arange(0, BG * BV)
+    offs_c = sb * BG + tl.arange(0, BG)
+    dmask = offs_d < dqk
+    cmask = offs_c < nc
+    vmask = offs_v < (dv + 1)
+    rows = t * BT + offs_t
+    rmask = rows < L
     qc = tl.load(q_ptr + b*sq_b + rows[:, None]*sq_l + offs_d[None, :]*sq_d, mask=rmask[:, None] & dmask[None, :], other=0.0)
     kc = tl.load(k_ptr + b*sq_b + rows[:, None]*sq_l + offs_d[None, :]*sq_d, mask=rmask[:, None] & dmask[None, :], other=0.0)
-    v1 = tl.load(v_ptr + b*sv_b + rows[:, None]*sv_l + offs_v[None, :]*sv_d, mask=rmask[:, None] & (offs_v[None, :] < dv), other=0.0)
+    v1 = tl.load(v_ptr + b*sv_b + rows[:, None]*sv_l + offs_v[None, :]*sv_d,
+                 mask=rmask[:, None] & (offs_v[None, :] < dv), other=0.0)
     v1 += tl.where((offs_v[None, :] == dv) & rmask[:, None], 1.0, 0.0)
     rgc = tl.load(rg_ptr + b*sg_b + rows[:, None]*sg_l + offs_c[None, :]*sg_c, mask=rmask[:, None] & cmask[None, :], other=0.0)
     wgc = tl.load(wg_ptr + b*sg_b + rows[:, None]*sg_l + offs_c[None, :]*sg_c, mask=rmask[:, None] & cmask[None, :], other=0.0)
-    gc = tl.load(g_ptr + b*sgr_b + rows[:, None]*sgr_l + offs_v[None, :]*sgr_d, mask=rmask[:, None] & vmask[None, :], other=0.0)
-    dSa = tl.load(dSa_ptr + b*ssb_b + sb*ssb_n + t*ssb_t + offs_d[:, None]*ssb_d + offs_e[None, :]*ssb_e, mask=dmask[:, None], other=0.0)
+    gc = tl.load(g_ptr + b*sgr_b + rows[:, None]*sgr_l + offs_v[None, :]
+                 * sgr_d, mask=rmask[:, None] & vmask[None, :], other=0.0)
+    dSa = tl.load(dSa_ptr + b*ssb_b + sb*ssb_n + t*ssb_t +
+                  offs_d[:, None]*ssb_d + offs_e[None, :]*ssb_e, mask=dmask[:, None], other=0.0)
     causal = (offs_t[:, None] >= offs_t[None, :]) & rmask[:, None] & rmask[None, :]
-    G = tl.dot(qc, tl.trans(kc)); Rg = tl.dot(rgc, tl.trans(wgc)); P = tl.dot(gc, tl.trans(v1))
-    A = (G * Rg * causal); A2 = (Rg * P * causal); B2 = (G * P * causal)
+    G = tl.dot(qc, tl.trans(kc))
+    Rg = tl.dot(rgc, tl.trans(wgc))
+    P = tl.dot(gc, tl.trans(v1))
+    A = (G * Rg * causal)
+    A2 = (Rg * P * causal)
+    B2 = (G * P * causal)
     dk_intra = tl.dot(tl.trans(A2).to(qc.dtype), qc)
     dw_intra = tl.dot(tl.trans(B2).to(rgc.dtype), rgc)
     dv_intra = tl.dot(tl.trans(A).to(gc.dtype), gc)
     wg_v1 = tl.reshape(wgc[:, :, None] * v1[:, None, :], [BT, BG * BV])
     dk_wr = tl.dot(wg_v1.to(dSa.dtype), tl.trans(dSa))
-    KS = tl.dot(kc, dSa.to(kc.dtype)); KS3 = tl.reshape(KS, [BT, BG, BV])
+    KS = tl.dot(kc, dSa.to(kc.dtype))
+    KS3 = tl.reshape(KS, [BT, BG, BV])
     dw_wr = tl.sum(KS3 * v1[:, None, :], axis=2)
     dv_wr = tl.sum(wgc[:, :, None] * KS3, axis=1)
     tl.store(dk_ptr + b*sdk_b + sb*sdk_n + rows[:, None]*sdk_l + offs_d[None, :]*sdk_d,
@@ -396,26 +465,43 @@ def _par_grad_gla_qr(q_ptr, k_ptr, v_ptr, wg_ptr, rg_ptr, ld_ptr, g_ptr, Sb_ptr,
                      ssb_b, ssb_n, ssb_t, ssb_d, ssb_e,
                      sdq_b, sdq_n, sdq_l, sdq_d, sdr_b, sdr_l, sdr_c, sda_b, sda_l, sda_c,
                      BT: tl.constexpr, BD: tl.constexpr, BV: tl.constexpr, BG: tl.constexpr, NCH: tl.constexpr):
-    b = tl.program_id(0); sb = tl.program_id(1); t = tl.program_id(2)
+    b = tl.program_id(0)
+    sb = tl.program_id(1)
+    t = tl.program_id(2)
     dvp = dv + 1
-    offs_t = tl.arange(0, BT); offs_d = tl.arange(0, BD); offs_v = tl.arange(0, BV)
-    offs_e = tl.arange(0, BG * BV); offs_c = sb * BG + tl.arange(0, BG)
-    dmask = offs_d < dqk; cmask = offs_c < nc
-    rows = t * BT + offs_t; rmask = rows < L
+    offs_t = tl.arange(0, BT)
+    offs_d = tl.arange(0, BD)
+    offs_v = tl.arange(0, BV)
+    offs_e = tl.arange(0, BG * BV)
+    offs_c = sb * BG + tl.arange(0, BG)
+    dmask = offs_d < dqk
+    cmask = offs_c < nc
+    rows = t * BT + offs_t
+    rmask = rows < L
     qc = tl.load(q_ptr + b*sq_b + rows[:, None]*sq_l + offs_d[None, :]*sq_d, mask=rmask[:, None] & dmask[None, :], other=0.0)
     kc = tl.load(k_ptr + b*sq_b + rows[:, None]*sq_l + offs_d[None, :]*sq_d, mask=rmask[:, None] & dmask[None, :], other=0.0)
-    v1 = tl.load(v_ptr + b*sv_b + rows[:, None]*sv_l + offs_v[None, :]*sv_d, mask=rmask[:, None] & (offs_v[None, :] < dv), other=0.0)
+    v1 = tl.load(v_ptr + b*sv_b + rows[:, None]*sv_l + offs_v[None, :]*sv_d,
+                 mask=rmask[:, None] & (offs_v[None, :] < dv), other=0.0)
     v1 += tl.where((offs_v[None, :] == dv) & rmask[:, None], 1.0, 0.0)
     rgc = tl.load(rg_ptr + b*sg_b + rows[:, None]*sg_l + offs_c[None, :]*sg_c, mask=rmask[:, None] & cmask[None, :], other=0.0)
     wgc = tl.load(wg_ptr + b*sg_b + rows[:, None]*sg_l + offs_c[None, :]*sg_c, mask=rmask[:, None] & cmask[None, :], other=0.0)
     ldc = tl.load(ld_ptr + b*sg_b + rows[:, None]*sg_l + offs_c[None, :]*sg_c, mask=rmask[:, None] & cmask[None, :], other=0.0)
-    gc = tl.load(g_ptr + b*sgr_b + rows[:, None]*sgr_l + offs_v[None, :]*sgr_d, mask=rmask[:, None] & (offs_v[None, :] < dvp), other=0.0)
-    Sb = tl.load(Sb_ptr + b*ssb_b + sb*ssb_n + t*ssb_t + offs_d[:, None]*ssb_d + offs_e[None, :]*ssb_e, mask=dmask[:, None], other=0.0)
-    a = tl.cumsum(ldc, axis=0); ea = tl.exp(a); rt = rgc * ea; wt = wgc * tl.exp(-a)
+    gc = tl.load(g_ptr + b*sgr_b + rows[:, None]*sgr_l + offs_v[None, :]*sgr_d,
+                 mask=rmask[:, None] & (offs_v[None, :] < dvp), other=0.0)
+    Sb = tl.load(Sb_ptr + b*ssb_b + sb*ssb_n + t*ssb_t + offs_d[:, None]
+                 * ssb_d + offs_e[None, :]*ssb_e, mask=dmask[:, None], other=0.0)
+    a = tl.cumsum(ldc, axis=0)
+    ea = tl.exp(a)
+    rt = rgc * ea
+    wt = wgc * tl.exp(-a)
     caus = (offs_t[:, None] >= offs_t[None, :]) & rmask[:, None] & rmask[None, :]
-    G = tl.dot(qc, tl.trans(kc)); D = tl.dot(rt, tl.trans(wt)); P = tl.dot(gc, tl.trans(v1))
-    dG = P * D * caus; dD = P * G * caus
-    dq_intra = tl.dot(dG.to(kc.dtype), kc); drt_intra = tl.dot(dD.to(wt.dtype), wt)
+    G = tl.dot(qc, tl.trans(kc))
+    D = tl.dot(rt, tl.trans(wt))
+    P = tl.dot(gc, tl.trans(v1))
+    dG = P * D * caus
+    dD = P * G * caus
+    dq_intra = tl.dot(dG.to(kc.dtype), kc)
+    drt_intra = tl.dot(dD.to(wt.dtype), wt)
     rt_g = tl.reshape(rt[:, :, None] * gc[:, None, :], [BT, BG * BV])
     dq_inter = tl.dot(rt_g.to(Sb.dtype), tl.trans(Sb))
     QS = tl.dot(qc, Sb.to(qc.dtype))
@@ -439,50 +525,76 @@ def _par_grad_gla_kwv(q_ptr, k_ptr, v_ptr, wg_ptr, rg_ptr, ld_ptr, g_ptr, dSa_pt
                       BT: tl.constexpr, BD: tl.constexpr, BV: tl.constexpr, BG: tl.constexpr, NCH: tl.constexpr):
     # dLam's Σ(dSa∘Sb) term is reduced in TORCH from the stored buffers, so this kernel loads only
     # dSa — one state tile, same working set as the RLA kwv (the Sb load caused register spill).
-    b = tl.program_id(0); sb = tl.program_id(1); t = tl.program_id(2)
+    b = tl.program_id(0)
+    sb = tl.program_id(1)
+    t = tl.program_id(2)
     dvp = dv + 1
-    offs_t = tl.arange(0, BT); offs_d = tl.arange(0, BD); offs_v = tl.arange(0, BV)
-    offs_e = tl.arange(0, BG * BV); offs_c = sb * BG + tl.arange(0, BG)
-    dmask = offs_d < dqk; cmask = offs_c < nc
-    rows = t * BT + offs_t; rmask = rows < L
+    offs_t = tl.arange(0, BT)
+    offs_d = tl.arange(0, BD)
+    offs_v = tl.arange(0, BV)
+    offs_e = tl.arange(0, BG * BV)
+    offs_c = sb * BG + tl.arange(0, BG)
+    dmask = offs_d < dqk
+    cmask = offs_c < nc
+    rows = t * BT + offs_t
+    rmask = rows < L
     qc = tl.load(q_ptr + b*sq_b + rows[:, None]*sq_l + offs_d[None, :]*sq_d, mask=rmask[:, None] & dmask[None, :], other=0.0)
     kc = tl.load(k_ptr + b*sq_b + rows[:, None]*sq_l + offs_d[None, :]*sq_d, mask=rmask[:, None] & dmask[None, :], other=0.0)
-    v1 = tl.load(v_ptr + b*sv_b + rows[:, None]*sv_l + offs_v[None, :]*sv_d, mask=rmask[:, None] & (offs_v[None, :] < dv), other=0.0)
+    v1 = tl.load(v_ptr + b*sv_b + rows[:, None]*sv_l + offs_v[None, :]*sv_d,
+                 mask=rmask[:, None] & (offs_v[None, :] < dv), other=0.0)
     v1 += tl.where((offs_v[None, :] == dv) & rmask[:, None], 1.0, 0.0)
     rgc = tl.load(rg_ptr + b*sg_b + rows[:, None]*sg_l + offs_c[None, :]*sg_c, mask=rmask[:, None] & cmask[None, :], other=0.0)
     wgc = tl.load(wg_ptr + b*sg_b + rows[:, None]*sg_l + offs_c[None, :]*sg_c, mask=rmask[:, None] & cmask[None, :], other=0.0)
     ldc = tl.load(ld_ptr + b*sg_b + rows[:, None]*sg_l + offs_c[None, :]*sg_c, mask=rmask[:, None] & cmask[None, :], other=0.0)
-    gc = tl.load(g_ptr + b*sgr_b + rows[:, None]*sgr_l + offs_v[None, :]*sgr_d, mask=rmask[:, None] & (offs_v[None, :] < dvp), other=0.0)
-    dSa = tl.load(dSa_ptr + b*ssb_b + sb*ssb_n + t*ssb_t + offs_d[:, None]*ssb_d + offs_e[None, :]*ssb_e, mask=dmask[:, None], other=0.0)
-    a = tl.cumsum(ldc, axis=0); ena = tl.exp(-a); rt = rgc * tl.exp(a); wt = wgc * ena
+    gc = tl.load(g_ptr + b*sgr_b + rows[:, None]*sgr_l + offs_v[None, :]*sgr_d,
+                 mask=rmask[:, None] & (offs_v[None, :] < dvp), other=0.0)
+    dSa = tl.load(dSa_ptr + b*ssb_b + sb*ssb_n + t*ssb_t +
+                  offs_d[:, None]*ssb_d + offs_e[None, :]*ssb_e, mask=dmask[:, None], other=0.0)
+    a = tl.cumsum(ldc, axis=0)
+    ena = tl.exp(-a)
+    rt = rgc * tl.exp(a)
+    wt = wgc * ena
     Lam = tl.sum(tl.where(offs_t[:, None] == (BT - 1), a, 0.0), axis=0)
     w_end = wgc * tl.exp(Lam[None, :] - a)
     caus = (offs_t[:, None] >= offs_t[None, :]) & rmask[:, None] & rmask[None, :]
-    G = tl.dot(qc, tl.trans(kc)); P = tl.dot(gc, tl.trans(v1)); D = tl.dot(rt, tl.trans(wt))
-    A = G * D * caus; dG = P * D * caus; dD = P * G * caus
+    G = tl.dot(qc, tl.trans(kc))
+    P = tl.dot(gc, tl.trans(v1))
+    D = tl.dot(rt, tl.trans(wt))
+    A = G * D * caus
+    dG = P * D * caus
+    dD = P * G * caus
     dk_intra = tl.dot(tl.trans(dG).to(qc.dtype), qc)
     dwt = tl.dot(tl.trans(dD).to(rt.dtype), rt)
     dv_intra = tl.dot(tl.trans(A).to(gc.dtype), gc)
-    KS = tl.dot(kc, dSa.to(kc.dtype)); KS3 = tl.reshape(KS, [BT, BG, BV])
+    KS = tl.dot(kc, dSa.to(kc.dtype))
+    KS3 = tl.reshape(KS, [BT, BG, BV])
     dw_end = tl.sum(KS3 * v1[:, None, :], axis=2)
     wv1 = tl.reshape(w_end[:, :, None] * v1[:, None, :], [BT, BG * BV])
     dk_KV = tl.dot(wv1.to(dSa.dtype), tl.trans(dSa))
     dv_KV = tl.sum(w_end[:, :, None] * KS3, axis=1)
-    da_wend = -dw_end * w_end; dwg_wend = dw_end * tl.exp(Lam[None, :] - a)
-    dwgc = dwt * ena + dwg_wend; da_wt = -dwt * wt
+    da_wend = -dw_end * w_end
+    dwg_wend = dw_end * tl.exp(Lam[None, :] - a)
+    dwgc = dwt * ena + dwg_wend
+    da_wt = -dwt * wt
     tl.store(dk_ptr + b*sdk_b + sb*sdk_n + rows[:, None]*sdk_l + offs_d[None, :]*sdk_d,
              dk_intra + dk_KV, mask=rmask[:, None] & dmask[None, :])
     tl.store(dwg_ptr + b*sdw_b + rows[:, None]*sdw_l + offs_c[None, :]*sdw_c, dwgc, mask=rmask[:, None] & cmask[None, :])
     tl.store(dv_ptr + b*sdv_b + sb*sdv_n + rows[:, None]*sdv_l + offs_v[None, :]*sdv_d,
              dv_intra + dv_KV, mask=rmask[:, None] & (offs_v[None, :] < dv))
-    tl.store(dakwv_ptr + b*sdaw_b + rows[:, None]*sdaw_l + offs_c[None, :]*sdaw_c, da_wt + da_wend, mask=rmask[:, None] & cmask[None, :])
-    tl.store(dawend_ptr + b*sdwe_b + rows[:, None]*sdwe_l + offs_c[None, :]*sdwe_c, da_wend, mask=rmask[:, None] & cmask[None, :])
+    tl.store(dakwv_ptr + b*sdaw_b + rows[:, None]*sdaw_l + offs_c[None, :]
+             * sdaw_c, da_wt + da_wend, mask=rmask[:, None] & cmask[None, :])
+    tl.store(dawend_ptr + b*sdwe_b + rows[:, None]*sdwe_l + offs_c[None, :]
+             * sdwe_c, da_wend, mask=rmask[:, None] & cmask[None, :])
 
 
 def _alloc_split(q, v, wg, chunk, BG):
-    B, L, dqk = q.shape; dv = v.shape[-1]; nc = wg.shape[-1]
-    BD = max(16, triton.next_power_of_2(dqk)); BV = max(16, triton.next_power_of_2(dv + 1))
-    NB = triton.cdiv(nc, BG); NCH = triton.cdiv(L, chunk)
+    B, L, dqk = q.shape
+    dv = v.shape[-1]
+    nc = wg.shape[-1]
+    BD = max(16, triton.next_power_of_2(dqk))
+    BV = max(16, triton.next_power_of_2(dv + 1))
+    NB = triton.cdiv(nc, BG)
+    NCH = triton.cdiv(L, chunk)
     Sb = torch.empty(B, NB, NCH, BD, BG * BV, device=q.device, dtype=torch.float32)
     dSa = torch.empty_like(Sb)
     dq = torch.empty(B, NB, L, dqk, device=q.device, dtype=torch.float32)
@@ -495,31 +607,39 @@ def _alloc_split(q, v, wg, chunk, BG):
 
 def _bwd_split_rla(q, k, v, wg, rg, g, chunk=None, BG=16):
     chunk = _CHUNK if chunk is None else chunk
-    B, L, dqk = q.shape; dv = v.shape[-1]; nc = wg.shape[-1]
+    B, L, dqk = q.shape
+    dv = v.shape[-1]
+    nc = wg.shape[-1]
     q, k, v, wg, rg, g = [x.contiguous() for x in (q, k, v, wg, rg, g)]
     BD, BV, NB, NCH, Sb, dSa, dq, dk, dvo, dr, dw = _alloc_split(q, v, wg, chunk, BG)
     sS = (Sb.stride(0), Sb.stride(1), Sb.stride(2), Sb.stride(3), Sb.stride(4))
-    sq = (q.stride(0), q.stride(1), q.stride(2)); sv = (v.stride(0), v.stride(1), v.stride(2))
-    sg = (wg.stride(0), wg.stride(1), wg.stride(2)); sgr = (g.stride(0), g.stride(1), g.stride(2))
+    sq = (q.stride(0), q.stride(1), q.stride(2))
+    sv = (v.stride(0), v.stride(1), v.stride(2))
+    sg = (wg.stride(0), wg.stride(1), wg.stride(2))
+    sgr = (g.stride(0), g.stride(1), g.stride(2))
     _scan_S[(B, NB)](k, v, wg, wg, Sb, L, dqk, dv, nc, *sq, *sv, *sg, *sS,
                      USE_G=False, BT=chunk, BD=BD, BV=BV, BG=BG, NCH=NCH)
     _scan_dS[(B, NB)](q, rg, wg, g, dSa, L, dqk, dv, nc, *sq, *sg, *sgr, *sS,
                       USE_G=False, BT=chunk, BD=BD, BV=BV, BG=BG, NCH=NCH)
     _par_grad_rla_qr[(B, NB, NCH)](q, k, v, wg, rg, g, Sb, dq, dr, L, dqk, dv, nc,
-        *sq, *sv, *sg, *sgr, *sS,
-        dq.stride(0), dq.stride(1), dq.stride(2), dq.stride(3), dr.stride(0), dr.stride(1), dr.stride(2),
-        BT=chunk, BD=BD, BV=BV, BG=BG, NCH=NCH)
+                                   *sq, *sv, *sg, *sgr, *sS,
+                                   dq.stride(0), dq.stride(1), dq.stride(2), dq.stride(
+                                       3), dr.stride(0), dr.stride(1), dr.stride(2),
+                                   BT=chunk, BD=BD, BV=BV, BG=BG, NCH=NCH)
     _par_grad_rla_kwv[(B, NB, NCH)](q, k, v, wg, rg, g, dSa, dk, dw, dvo, L, dqk, dv, nc,
-        *sq, *sv, *sg, *sgr, *sS,
-        dk.stride(0), dk.stride(1), dk.stride(2), dk.stride(3), dw.stride(0), dw.stride(1), dw.stride(2),
-        dvo.stride(0), dvo.stride(1), dvo.stride(2), dvo.stride(3),
-        BT=chunk, BD=BD, BV=BV, BG=BG, NCH=NCH)
+                                    *sq, *sv, *sg, *sgr, *sS,
+                                    dk.stride(0), dk.stride(1), dk.stride(2), dk.stride(
+                                        3), dw.stride(0), dw.stride(1), dw.stride(2),
+                                    dvo.stride(0), dvo.stride(1), dvo.stride(2), dvo.stride(3),
+                                    BT=chunk, BD=BD, BV=BV, BG=BG, NCH=NCH)
     return dq.sum(1), dk.sum(1), dvo.sum(1)[..., :dv], dw, dr
 
 
 def _bwd_split_gla(q, k, v, wg, rg, ld, g, chunk=None, BG=16):
     chunk = _CHUNK if chunk is None else chunk
-    B, L, dqk = q.shape; dv = v.shape[-1]; nc = wg.shape[-1]
+    B, L, dqk = q.shape
+    dv = v.shape[-1]
+    nc = wg.shape[-1]
     ld = ld.clamp(min=_GLA_FLOOR)
     q, k, v, wg, rg, ld, g = [x.contiguous() for x in (q, k, v, wg, rg, ld, g)]
     BD, BV, NB, NCH, Sb, dSa, dq, dk, dvo, drg, dwg = _alloc_split(q, v, wg, chunk, BG)
@@ -527,26 +647,32 @@ def _bwd_split_gla(q, k, v, wg, rg, ld, g, chunk=None, BG=16):
     dakwv = torch.empty_like(dart)
     dawend = torch.empty_like(dart)
     sS = (Sb.stride(0), Sb.stride(1), Sb.stride(2), Sb.stride(3), Sb.stride(4))
-    sq = (q.stride(0), q.stride(1), q.stride(2)); sv = (v.stride(0), v.stride(1), v.stride(2))
-    sg = (wg.stride(0), wg.stride(1), wg.stride(2)); sgr = (g.stride(0), g.stride(1), g.stride(2))
+    sq = (q.stride(0), q.stride(1), q.stride(2))
+    sv = (v.stride(0), v.stride(1), v.stride(2))
+    sg = (wg.stride(0), wg.stride(1), wg.stride(2))
+    sgr = (g.stride(0), g.stride(1), g.stride(2))
     _scan_S[(B, NB)](k, v, wg, ld, Sb, L, dqk, dv, nc, *sq, *sv, *sg, *sS,
                      USE_G=True, BT=chunk, BD=BD, BV=BV, BG=BG, NCH=NCH)
     _scan_dS[(B, NB)](q, rg, ld, g, dSa, L, dqk, dv, nc, *sq, *sg, *sgr, *sS,
                       USE_G=True, BT=chunk, BD=BD, BV=BV, BG=BG, NCH=NCH)
     _par_grad_gla_qr[(B, NB, NCH)](q, k, v, wg, rg, ld, g, Sb, dq, drg, dart, L, dqk, dv, nc,
-        *sq, *sv, *sg, *sgr, *sS,
-        dq.stride(0), dq.stride(1), dq.stride(2), dq.stride(3), drg.stride(0), drg.stride(1), drg.stride(2),
-        dart.stride(0), dart.stride(1), dart.stride(2),
-        BT=chunk, BD=BD, BV=BV, BG=BG, NCH=NCH)
+                                   *sq, *sv, *sg, *sgr, *sS,
+                                   dq.stride(0), dq.stride(1), dq.stride(2), dq.stride(
+                                       3), drg.stride(0), drg.stride(1), drg.stride(2),
+                                   dart.stride(0), dart.stride(1), dart.stride(2),
+                                   BT=chunk, BD=BD, BV=BV, BG=BG, NCH=NCH)
     _par_grad_gla_kwv[(B, NB, NCH)](q, k, v, wg, rg, ld, g, dSa, dk, dwg, dvo, dakwv, dawend, L, dqk, dv, nc,
-        *sq, *sv, *sg, *sgr, *sS,
-        dk.stride(0), dk.stride(1), dk.stride(2), dk.stride(3), dwg.stride(0), dwg.stride(1), dwg.stride(2),
-        dvo.stride(0), dvo.stride(1), dvo.stride(2), dvo.stride(3),
-        dakwv.stride(0), dakwv.stride(1), dakwv.stride(2), dawend.stride(0), dawend.stride(1), dawend.stride(2),
-        BT=chunk, BD=BD, BV=BV, BG=BG, NCH=NCH)
+                                    *sq, *sv, *sg, *sgr, *sS,
+                                    dk.stride(0), dk.stride(1), dk.stride(2), dk.stride(
+                                        3), dwg.stride(0), dwg.stride(1), dwg.stride(2),
+                                    dvo.stride(0), dvo.stride(1), dvo.stride(2), dvo.stride(3),
+                                    dakwv.stride(0), dakwv.stride(1), dakwv.stride(
+                                        2), dawend.stride(0), dawend.stride(1), dawend.stride(2),
+                                    BT=chunk, BD=BD, BV=BV, BG=BG, NCH=NCH)
     # dLam in torch from the stored state buffers (keeps the kwv kernel one-state-tile):
     #   dLam[b,t,c] = e^{Λ_t,c} Σ_{d,v} (dSa[t]∘Sb[t])_{d,(c,v)}  −  Σ_{j∈chunk t} da_wend[j,c]
-    pad = (-L) % chunk; Lp = L + pad
+    pad = (-L) % chunk
+    Lp = L + pad
     ld_p = F.pad(ld, (0, 0, 0, pad)) if pad else ld
     Lam_t = ld_p.view(B, NCH, chunk, nc).sum(2)                                   # [B,NCH,nc]
     # slice rows to :dqk — Sb/dSa are torch.empty and the kernels only WRITE rows < dqk
@@ -582,16 +708,24 @@ def _den_fwd(q_ptr, k_ptr, wg_ptr, ld_ptr, d_ptr, Zb_ptr, L, dqk, nc,
              sq_b, sq_l, sq_d, sg_b, sg_l, sg_c, sd_b, sd_l, sd_c,
              szb_b, szb_n, szb_t, szb_d, szb_c,
              USE_G: tl.constexpr, BT: tl.constexpr, BD: tl.constexpr, BG: tl.constexpr, NCH: tl.constexpr):
-    b = tl.program_id(0); sb = tl.program_id(1)
-    offs_t = tl.arange(0, BT); offs_d = tl.arange(0, BD); offs_c = sb * BG + tl.arange(0, BG)
+    b = tl.program_id(0)
+    sb = tl.program_id(1)
+    offs_t = tl.arange(0, BT)
+    offs_d = tl.arange(0, BD)
+    offs_c = sb * BG + tl.arange(0, BG)
     offs_g = tl.arange(0, BG)
-    dmask = offs_d < dqk; cmask = offs_c < nc
+    dmask = offs_d < dqk
+    cmask = offs_c < nc
     Z = tl.zeros([BD, BG], dtype=tl.float32)
     for t in range(NCH):
-        rows = t * BT + offs_t; rmask = rows < L
-        qc = tl.load(q_ptr + b*sq_b + rows[:, None]*sq_l + offs_d[None, :]*sq_d, mask=rmask[:, None] & dmask[None, :], other=0.0)
-        kc = tl.load(k_ptr + b*sq_b + rows[:, None]*sq_l + offs_d[None, :]*sq_d, mask=rmask[:, None] & dmask[None, :], other=0.0)
-        wgc = tl.load(wg_ptr + b*sg_b + rows[:, None]*sg_l + offs_c[None, :]*sg_c, mask=rmask[:, None] & cmask[None, :], other=0.0)
+        rows = t * BT + offs_t
+        rmask = rows < L
+        qc = tl.load(q_ptr + b*sq_b + rows[:, None]*sq_l + offs_d[None, :]
+                     * sq_d, mask=rmask[:, None] & dmask[None, :], other=0.0)
+        kc = tl.load(k_ptr + b*sq_b + rows[:, None]*sq_l + offs_d[None, :]
+                     * sq_d, mask=rmask[:, None] & dmask[None, :], other=0.0)
+        wgc = tl.load(wg_ptr + b*sg_b + rows[:, None]*sg_l + offs_c[None, :]
+                      * sg_c, mask=rmask[:, None] & cmask[None, :], other=0.0)
         tl.store(Zb_ptr + b*szb_b + sb*szb_n + t*szb_t + offs_d[:, None]*szb_d + offs_g[None, :]*szb_c,
                  Z, mask=dmask[:, None])
         G = tl.dot(qc, tl.trans(kc))
@@ -599,7 +733,8 @@ def _den_fwd(q_ptr, k_ptr, wg_ptr, ld_ptr, d_ptr, Zb_ptr, L, dqk, nc,
         if USE_G:
             # per-state log-decay: d[i,c] = e^{a_ic}[ Σ_{j≤i} G_ij (w_jc e^{-a_jc}) + q_i·Z_c ];
             # same decay-on-the-routing-factor trick as _rola_gla_fwd_tiled (a = chunk-local cumsum).
-            ldc = tl.load(ld_ptr + b*sg_b + rows[:, None]*sg_l + offs_c[None, :]*sg_c, mask=rmask[:, None] & cmask[None, :], other=0.0)
+            ldc = tl.load(ld_ptr + b*sg_b + rows[:, None]*sg_l + offs_c[None, :]
+                          * sg_c, mask=rmask[:, None] & cmask[None, :], other=0.0)
             a = tl.cumsum(ldc, axis=0)
             wt = wgc * tl.exp(-a)
             dch = tl.exp(a) * (tl.dot(G * caus, wt) + tl.dot(qc, Z.to(qc.dtype)))
@@ -619,16 +754,23 @@ def _den_bwd_scan(q_ptr, gd_ptr, dZa_ptr, L, dqk, nc,
                   sq_b, sq_l, sq_d, sg_b, sg_l, sg_c,
                   szb_b, szb_n, szb_t, szb_d, szb_c,
                   BT: tl.constexpr, BD: tl.constexpr, BG: tl.constexpr, NCH: tl.constexpr):
-    b = tl.program_id(0); sb = tl.program_id(1)
-    offs_t = tl.arange(0, BT); offs_d = tl.arange(0, BD); offs_c = sb * BG + tl.arange(0, BG)
+    b = tl.program_id(0)
+    sb = tl.program_id(1)
+    offs_t = tl.arange(0, BT)
+    offs_d = tl.arange(0, BD)
+    offs_c = sb * BG + tl.arange(0, BG)
     offs_g = tl.arange(0, BG)
-    dmask = offs_d < dqk; cmask = offs_c < nc
+    dmask = offs_d < dqk
+    cmask = offs_c < nc
     dZ = tl.zeros([BD, BG], dtype=tl.float32)
     for ti in range(NCH):
         t = NCH - 1 - ti
-        rows = t * BT + offs_t; rmask = rows < L
-        qc = tl.load(q_ptr + b*sq_b + rows[:, None]*sq_l + offs_d[None, :]*sq_d, mask=rmask[:, None] & dmask[None, :], other=0.0)
-        gdc = tl.load(gd_ptr + b*sg_b + rows[:, None]*sg_l + offs_c[None, :]*sg_c, mask=rmask[:, None] & cmask[None, :], other=0.0)
+        rows = t * BT + offs_t
+        rmask = rows < L
+        qc = tl.load(q_ptr + b*sq_b + rows[:, None]*sq_l + offs_d[None, :]
+                     * sq_d, mask=rmask[:, None] & dmask[None, :], other=0.0)
+        gdc = tl.load(gd_ptr + b*sg_b + rows[:, None]*sg_l + offs_c[None, :]
+                      * sg_c, mask=rmask[:, None] & cmask[None, :], other=0.0)
         tl.store(dZa_ptr + b*szb_b + sb*szb_n + t*szb_t + offs_d[:, None]*szb_d + offs_g[None, :]*szb_c,
                  dZ, mask=dmask[:, None])
         dZ += tl.dot(tl.trans(qc), gdc)
@@ -642,25 +784,35 @@ def _den_grad(q_ptr, k_ptr, wg_ptr, gd_ptr, Zb_ptr, dZa_ptr, dq_ptr, dk_ptr, dw_
               szb_b, szb_n, szb_t, szb_d, szb_c,
               sdq_b, sdq_n, sdq_l, sdq_d, sdw_b, sdw_l, sdw_c,
               BT: tl.constexpr, BD: tl.constexpr, BG: tl.constexpr, NCH: tl.constexpr):
-    b = tl.program_id(0); sb = tl.program_id(1); t = tl.program_id(2)
-    offs_t = tl.arange(0, BT); offs_d = tl.arange(0, BD); offs_c = sb * BG + tl.arange(0, BG)
+    b = tl.program_id(0)
+    sb = tl.program_id(1)
+    t = tl.program_id(2)
+    offs_t = tl.arange(0, BT)
+    offs_d = tl.arange(0, BD)
+    offs_c = sb * BG + tl.arange(0, BG)
     offs_g = tl.arange(0, BG)
-    dmask = offs_d < dqk; cmask = offs_c < nc
-    rows = t * BT + offs_t; rmask = rows < L
+    dmask = offs_d < dqk
+    cmask = offs_c < nc
+    rows = t * BT + offs_t
+    rmask = rows < L
     qc = tl.load(q_ptr + b*sq_b + rows[:, None]*sq_l + offs_d[None, :]*sq_d, mask=rmask[:, None] & dmask[None, :], other=0.0)
     kc = tl.load(k_ptr + b*sq_b + rows[:, None]*sq_l + offs_d[None, :]*sq_d, mask=rmask[:, None] & dmask[None, :], other=0.0)
     wgc = tl.load(wg_ptr + b*sg_b + rows[:, None]*sg_l + offs_c[None, :]*sg_c, mask=rmask[:, None] & cmask[None, :], other=0.0)
     gdc = tl.load(gd_ptr + b*sg_b + rows[:, None]*sg_l + offs_c[None, :]*sg_c, mask=rmask[:, None] & cmask[None, :], other=0.0)
-    Zb = tl.load(Zb_ptr + b*szb_b + sb*szb_n + t*szb_t + offs_d[:, None]*szb_d + offs_g[None, :]*szb_c, mask=dmask[:, None], other=0.0)
-    dZa = tl.load(dZa_ptr + b*szb_b + sb*szb_n + t*szb_t + offs_d[:, None]*szb_d + offs_g[None, :]*szb_c, mask=dmask[:, None], other=0.0)
+    Zb = tl.load(Zb_ptr + b*szb_b + sb*szb_n + t*szb_t + offs_d[:, None]
+                 * szb_d + offs_g[None, :]*szb_c, mask=dmask[:, None], other=0.0)
+    dZa = tl.load(dZa_ptr + b*szb_b + sb*szb_n + t*szb_t +
+                  offs_d[:, None]*szb_d + offs_g[None, :]*szb_c, mask=dmask[:, None], other=0.0)
     caus = (offs_t[:, None] >= offs_t[None, :]) & rmask[:, None] & rmask[None, :]
     G = tl.dot(qc, tl.trans(kc))
     P = tl.dot(gdc, tl.trans(wgc))                                   # [BT,BT]
     dq = tl.dot((P * caus).to(kc.dtype), kc) + tl.dot(gdc, tl.trans(Zb.to(gdc.dtype)))
     dk = tl.dot(tl.trans(P * caus).to(qc.dtype), qc) + tl.dot(wgc, tl.trans(dZa.to(wgc.dtype)))
     dw = tl.dot(tl.trans(G * caus).to(gdc.dtype), gdc) + tl.dot(kc, dZa.to(kc.dtype))
-    tl.store(dq_ptr + b*sdq_b + sb*sdq_n + rows[:, None]*sdq_l + offs_d[None, :]*sdq_d, dq, mask=rmask[:, None] & dmask[None, :])
-    tl.store(dk_ptr + b*sdq_b + sb*sdq_n + rows[:, None]*sdq_l + offs_d[None, :]*sdq_d, dk, mask=rmask[:, None] & dmask[None, :])
+    tl.store(dq_ptr + b*sdq_b + sb*sdq_n + rows[:, None]*sdq_l +
+             offs_d[None, :]*sdq_d, dq, mask=rmask[:, None] & dmask[None, :])
+    tl.store(dk_ptr + b*sdq_b + sb*sdq_n + rows[:, None]*sdq_l +
+             offs_d[None, :]*sdq_d, dk, mask=rmask[:, None] & dmask[None, :])
     tl.store(dw_ptr + b*sdw_b + rows[:, None]*sdw_l + offs_c[None, :]*sdw_c, dw, mask=rmask[:, None] & cmask[None, :])
 
 
@@ -668,16 +820,19 @@ class _DenFn(torch.autograd.Function):
     """Per-state denominator d[i,c] on folded [BH,L,*] tensors, Triton fwd + chunk-parallel bwd."""
     @staticmethod
     def forward(ctx, q, k, wg, chunk, BG):
-        B, L, dqk = q.shape; nc = wg.shape[-1]
-        BD = max(16, triton.next_power_of_2(dqk)); NB = triton.cdiv(nc, BG); NCH = triton.cdiv(L, chunk)
+        B, L, dqk = q.shape
+        nc = wg.shape[-1]
+        BD = max(16, triton.next_power_of_2(dqk))
+        NB = triton.cdiv(nc, BG)
+        NCH = triton.cdiv(L, chunk)
         q, k, wg = q.contiguous(), k.contiguous(), wg.contiguous()
         d = torch.empty(B, L, nc, device=q.device, dtype=torch.float32)
         Zb = torch.empty(B, NB, NCH, BD, BG, device=q.device, dtype=torch.float32)
         _den_fwd[(B, NB)](q, k, wg, wg, d, Zb, L, dqk, nc,
-            q.stride(0), q.stride(1), q.stride(2), wg.stride(0), wg.stride(1), wg.stride(2),
-            d.stride(0), d.stride(1), d.stride(2),
-            Zb.stride(0), Zb.stride(1), Zb.stride(2), Zb.stride(3), Zb.stride(4),
-            USE_G=False, BT=chunk, BD=BD, BG=BG, NCH=NCH)
+                          q.stride(0), q.stride(1), q.stride(2), wg.stride(0), wg.stride(1), wg.stride(2),
+                          d.stride(0), d.stride(1), d.stride(2),
+                          Zb.stride(0), Zb.stride(1), Zb.stride(2), Zb.stride(3), Zb.stride(4),
+                          USE_G=False, BT=chunk, BD=BD, BG=BG, NCH=NCH)
         ctx.save_for_backward(q, k, wg, Zb)
         ctx.meta = (chunk, BG, BD, NB, NCH)
         return d
@@ -686,22 +841,25 @@ class _DenFn(torch.autograd.Function):
     def backward(ctx, gd):
         q, k, wg, Zb = ctx.saved_tensors
         chunk, BG, BD, NB, NCH = ctx.meta
-        B, L, dqk = q.shape; nc = wg.shape[-1]
+        B, L, dqk = q.shape
+        nc = wg.shape[-1]
         gd = gd.contiguous().to(q.dtype)   # match input dtype (tl.dot requires same-dtype operands; fp32 accum regardless)
         dZa = torch.empty_like(Zb)
         _den_bwd_scan[(B, NB)](q, gd, dZa, L, dqk, nc,
-            q.stride(0), q.stride(1), q.stride(2), gd.stride(0), gd.stride(1), gd.stride(2),
-            dZa.stride(0), dZa.stride(1), dZa.stride(2), dZa.stride(3), dZa.stride(4),
-            BT=chunk, BD=BD, BG=BG, NCH=NCH)
+                               q.stride(0), q.stride(1), q.stride(2), gd.stride(0), gd.stride(1), gd.stride(2),
+                               dZa.stride(0), dZa.stride(1), dZa.stride(2), dZa.stride(3), dZa.stride(4),
+                               BT=chunk, BD=BD, BG=BG, NCH=NCH)
         dq = torch.empty(B, NB, L, dqk, device=q.device, dtype=torch.float32)
         dk = torch.empty_like(dq)
         dw = torch.empty(B, L, nc, device=q.device, dtype=torch.float32)
         _den_grad[(B, NB, NCH)](q, k, wg, gd, Zb, dZa, dq, dk, dw, L, dqk, nc,
-            q.stride(0), q.stride(1), q.stride(2), gd.stride(0), gd.stride(1), gd.stride(2),
-            Zb.stride(0), Zb.stride(1), Zb.stride(2), Zb.stride(3), Zb.stride(4),
-            dq.stride(0), dq.stride(1), dq.stride(2), dq.stride(3), dw.stride(0), dw.stride(1), dw.stride(2),
-            BT=chunk, BD=BD, BG=BG, NCH=NCH)
-        cast = lambda t: t.to(q.dtype)
+                                q.stride(0), q.stride(1), q.stride(2), gd.stride(0), gd.stride(1), gd.stride(2),
+                                Zb.stride(0), Zb.stride(1), Zb.stride(2), Zb.stride(3), Zb.stride(4),
+                                dq.stride(0), dq.stride(1), dq.stride(2), dq.stride(
+                                    3), dw.stride(0), dw.stride(1), dw.stride(2),
+                                BT=chunk, BD=BD, BG=BG, NCH=NCH)
+
+        def cast(t): return t.to(q.dtype)
         return cast(dq.sum(1)), cast(dk.sum(1)), cast(dw), None, None
 
 
@@ -719,17 +877,25 @@ def _den_gla_bwd_scan(q_ptr, gd_ptr, ld_ptr, dZa_ptr, L, dqk, nc,
                       BT: tl.constexpr, BD: tl.constexpr, BG: tl.constexpr, NCH: tl.constexpr):
     """Reverse scan for the DECAYED den: dZa[t] = adjoint of chunk t's carry increment
     (sum over later chunks, decayed). dZ_t = e^{Lam_t} dZ_{t+1} + q^T (e^a ∘ gd)."""
-    b = tl.program_id(0); sb = tl.program_id(1)
-    offs_t = tl.arange(0, BT); offs_d = tl.arange(0, BD); offs_c = sb * BG + tl.arange(0, BG)
+    b = tl.program_id(0)
+    sb = tl.program_id(1)
+    offs_t = tl.arange(0, BT)
+    offs_d = tl.arange(0, BD)
+    offs_c = sb * BG + tl.arange(0, BG)
     offs_g = tl.arange(0, BG)
-    dmask = offs_d < dqk; cmask = offs_c < nc
+    dmask = offs_d < dqk
+    cmask = offs_c < nc
     dZ = tl.zeros([BD, BG], dtype=tl.float32)
     for ti in range(NCH):
         t = NCH - 1 - ti
-        rows = t * BT + offs_t; rmask = rows < L
-        qc = tl.load(q_ptr + b*sq_b + rows[:, None]*sq_l + offs_d[None, :]*sq_d, mask=rmask[:, None] & dmask[None, :], other=0.0)
-        gdc = tl.load(gd_ptr + b*sg_b + rows[:, None]*sg_l + offs_c[None, :]*sg_c, mask=rmask[:, None] & cmask[None, :], other=0.0)
-        ldc = tl.load(ld_ptr + b*sg_b + rows[:, None]*sg_l + offs_c[None, :]*sg_c, mask=rmask[:, None] & cmask[None, :], other=0.0)
+        rows = t * BT + offs_t
+        rmask = rows < L
+        qc = tl.load(q_ptr + b*sq_b + rows[:, None]*sq_l + offs_d[None, :]
+                     * sq_d, mask=rmask[:, None] & dmask[None, :], other=0.0)
+        gdc = tl.load(gd_ptr + b*sg_b + rows[:, None]*sg_l + offs_c[None, :]
+                      * sg_c, mask=rmask[:, None] & cmask[None, :], other=0.0)
+        ldc = tl.load(ld_ptr + b*sg_b + rows[:, None]*sg_l + offs_c[None, :]
+                      * sg_c, mask=rmask[:, None] & cmask[None, :], other=0.0)
         a = tl.cumsum(ldc, axis=0)
         tl.store(dZa_ptr + b*szb_b + sb*szb_n + t*szb_t + offs_d[:, None]*szb_d + offs_g[None, :]*szb_c,
                  dZ, mask=dmask[:, None])
@@ -750,21 +916,31 @@ def _den_gla_grad(q_ptr, k_ptr, wg_ptr, ld_ptr, gd_ptr, Zb_ptr, dZa_ptr,
     da from the three appearances of a (output scale e^a, intra w·e^{-a}, carry w·e^{Lam-a}),
     dLam from the carry decay (e^{Lam}·Σ Zb∘dZa, the main kernel's dLam trick) + the carry
     writes, folded into da's last row; dld = reverse cumsum of da (tot − cumsum + da)."""
-    b = tl.program_id(0); sb = tl.program_id(1); t = tl.program_id(2)
-    offs_t = tl.arange(0, BT); offs_d = tl.arange(0, BD); offs_c = sb * BG + tl.arange(0, BG)
+    b = tl.program_id(0)
+    sb = tl.program_id(1)
+    t = tl.program_id(2)
+    offs_t = tl.arange(0, BT)
+    offs_d = tl.arange(0, BD)
+    offs_c = sb * BG + tl.arange(0, BG)
     offs_g = tl.arange(0, BG)
-    dmask = offs_d < dqk; cmask = offs_c < nc
-    rows = t * BT + offs_t; rmask = rows < L
+    dmask = offs_d < dqk
+    cmask = offs_c < nc
+    rows = t * BT + offs_t
+    rmask = rows < L
     qc = tl.load(q_ptr + b*sq_b + rows[:, None]*sq_l + offs_d[None, :]*sq_d, mask=rmask[:, None] & dmask[None, :], other=0.0)
     kc = tl.load(k_ptr + b*sq_b + rows[:, None]*sq_l + offs_d[None, :]*sq_d, mask=rmask[:, None] & dmask[None, :], other=0.0)
     wgc = tl.load(wg_ptr + b*sg_b + rows[:, None]*sg_l + offs_c[None, :]*sg_c, mask=rmask[:, None] & cmask[None, :], other=0.0)
     ldc = tl.load(ld_ptr + b*sg_b + rows[:, None]*sg_l + offs_c[None, :]*sg_c, mask=rmask[:, None] & cmask[None, :], other=0.0)
     gdc = tl.load(gd_ptr + b*sg_b + rows[:, None]*sg_l + offs_c[None, :]*sg_c, mask=rmask[:, None] & cmask[None, :], other=0.0)
-    Zb = tl.load(Zb_ptr + b*szb_b + sb*szb_n + t*szb_t + offs_d[:, None]*szb_d + offs_g[None, :]*szb_c, mask=dmask[:, None], other=0.0)
-    dZa = tl.load(dZa_ptr + b*szb_b + sb*szb_n + t*szb_t + offs_d[:, None]*szb_d + offs_g[None, :]*szb_c, mask=dmask[:, None], other=0.0)
+    Zb = tl.load(Zb_ptr + b*szb_b + sb*szb_n + t*szb_t + offs_d[:, None]
+                 * szb_d + offs_g[None, :]*szb_c, mask=dmask[:, None], other=0.0)
+    dZa = tl.load(dZa_ptr + b*szb_b + sb*szb_n + t*szb_t +
+                  offs_d[:, None]*szb_d + offs_g[None, :]*szb_c, mask=dmask[:, None], other=0.0)
     a = tl.cumsum(ldc, axis=0)
     Lam = tl.sum(tl.where(offs_t[:, None] == (BT - 1), a, 0.0), axis=0)
-    ea = tl.exp(a); wt = wgc * tl.exp(-a); w_end = wgc * tl.exp(Lam[None, :] - a)
+    ea = tl.exp(a)
+    wt = wgc * tl.exp(-a)
+    w_end = wgc * tl.exp(Lam[None, :] - a)
     caus = (offs_t[:, None] >= offs_t[None, :]) & rmask[:, None] & rmask[None, :]
     G = tl.dot(qc, tl.trans(kc))
     gt = gdc * ea
@@ -780,8 +956,10 @@ def _den_gla_grad(q_ptr, k_ptr, wg_ptr, ld_ptr, gd_ptr, Zb_ptr, dZa_ptr,
     da += tl.where(offs_t[:, None] == (BT - 1), dLam[None, :], 0.0)
     s = tl.cumsum(da, axis=0)
     dld = tl.sum(da, axis=0)[None, :] - s + da                       # reverse cumsum
-    tl.store(dq_ptr + b*sdq_b + sb*sdq_n + rows[:, None]*sdq_l + offs_d[None, :]*sdq_d, dq, mask=rmask[:, None] & dmask[None, :])
-    tl.store(dk_ptr + b*sdq_b + sb*sdq_n + rows[:, None]*sdq_l + offs_d[None, :]*sdq_d, dk, mask=rmask[:, None] & dmask[None, :])
+    tl.store(dq_ptr + b*sdq_b + sb*sdq_n + rows[:, None]*sdq_l +
+             offs_d[None, :]*sdq_d, dq, mask=rmask[:, None] & dmask[None, :])
+    tl.store(dk_ptr + b*sdq_b + sb*sdq_n + rows[:, None]*sdq_l +
+             offs_d[None, :]*sdq_d, dk, mask=rmask[:, None] & dmask[None, :])
     tl.store(dw_ptr + b*sdw_b + rows[:, None]*sdw_l + offs_c[None, :]*sdw_c, dw, mask=rmask[:, None] & cmask[None, :])
     tl.store(dld_ptr + b*sdw_b + rows[:, None]*sdw_l + offs_c[None, :]*sdw_c, dld, mask=rmask[:, None] & cmask[None, :])
 
@@ -793,17 +971,20 @@ class _DenGLAFn(torch.autograd.Function):
     same cost class as the additive den, not a second full GLA backward."""
     @staticmethod
     def forward(ctx, q, k, wg, ld, chunk, BG):
-        B, L, dqk = q.shape; nc = wg.shape[-1]
-        BD = max(16, triton.next_power_of_2(dqk)); NB = triton.cdiv(nc, BG); NCH = triton.cdiv(L, chunk)
+        B, L, dqk = q.shape
+        nc = wg.shape[-1]
+        BD = max(16, triton.next_power_of_2(dqk))
+        NB = triton.cdiv(nc, BG)
+        NCH = triton.cdiv(L, chunk)
         ld = ld.clamp(min=_GLA_FLOOR)
         q, k, wg, ld = q.contiguous(), k.contiguous(), wg.contiguous(), ld.contiguous()
         d = torch.empty(B, L, nc, device=q.device, dtype=torch.float32)
         Zb = torch.empty(B, NB, NCH, BD, BG, device=q.device, dtype=torch.float32)
         _den_fwd[(B, NB)](q, k, wg, ld, d, Zb, L, dqk, nc,
-            q.stride(0), q.stride(1), q.stride(2), wg.stride(0), wg.stride(1), wg.stride(2),
-            d.stride(0), d.stride(1), d.stride(2),
-            Zb.stride(0), Zb.stride(1), Zb.stride(2), Zb.stride(3), Zb.stride(4),
-            USE_G=True, BT=chunk, BD=BD, BG=BG, NCH=NCH)
+                          q.stride(0), q.stride(1), q.stride(2), wg.stride(0), wg.stride(1), wg.stride(2),
+                          d.stride(0), d.stride(1), d.stride(2),
+                          Zb.stride(0), Zb.stride(1), Zb.stride(2), Zb.stride(3), Zb.stride(4),
+                          USE_G=True, BT=chunk, BD=BD, BG=BG, NCH=NCH)
         ctx.save_for_backward(q, k, wg, ld, Zb)
         ctx.meta = (chunk, BG, BD, NB, NCH)
         return d
@@ -812,23 +993,26 @@ class _DenGLAFn(torch.autograd.Function):
     def backward(ctx, gd):
         q, k, wg, ld, Zb = ctx.saved_tensors
         chunk, BG, BD, NB, NCH = ctx.meta
-        B, L, dqk = q.shape; nc = wg.shape[-1]
+        B, L, dqk = q.shape
+        nc = wg.shape[-1]
         gd = gd.contiguous().to(q.dtype)
         dZa = torch.empty_like(Zb)
         _den_gla_bwd_scan[(B, NB)](q, gd, ld, dZa, L, dqk, nc,
-            q.stride(0), q.stride(1), q.stride(2), gd.stride(0), gd.stride(1), gd.stride(2),
-            dZa.stride(0), dZa.stride(1), dZa.stride(2), dZa.stride(3), dZa.stride(4),
-            BT=chunk, BD=BD, BG=BG, NCH=NCH)
+                                   q.stride(0), q.stride(1), q.stride(2), gd.stride(0), gd.stride(1), gd.stride(2),
+                                   dZa.stride(0), dZa.stride(1), dZa.stride(2), dZa.stride(3), dZa.stride(4),
+                                   BT=chunk, BD=BD, BG=BG, NCH=NCH)
         dq = torch.empty(B, NB, L, dqk, device=q.device, dtype=torch.float32)
         dk = torch.empty_like(dq)
         dw = torch.empty(B, L, nc, device=q.device, dtype=torch.float32)
         dld = torch.empty_like(dw)
         _den_gla_grad[(B, NB, NCH)](q, k, wg, ld, gd, Zb, dZa, dq, dk, dw, dld, L, dqk, nc,
-            q.stride(0), q.stride(1), q.stride(2), gd.stride(0), gd.stride(1), gd.stride(2),
-            Zb.stride(0), Zb.stride(1), Zb.stride(2), Zb.stride(3), Zb.stride(4),
-            dq.stride(0), dq.stride(1), dq.stride(2), dq.stride(3), dw.stride(0), dw.stride(1), dw.stride(2),
-            BT=chunk, BD=BD, BG=BG, NCH=NCH)
-        cast = lambda t: t.to(q.dtype)
+                                    q.stride(0), q.stride(1), q.stride(2), gd.stride(0), gd.stride(1), gd.stride(2),
+                                    Zb.stride(0), Zb.stride(1), Zb.stride(2), Zb.stride(3), Zb.stride(4),
+                                    dq.stride(0), dq.stride(1), dq.stride(2), dq.stride(
+                                        3), dw.stride(0), dw.stride(1), dw.stride(2),
+                                    BT=chunk, BD=BD, BG=BG, NCH=NCH)
+
+        def cast(t): return t.to(q.dtype)
         return cast(dq.sum(1)), cast(dk.sum(1)), cast(dw), dld.to(ld.dtype), None, None
 
 
