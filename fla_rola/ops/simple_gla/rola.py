@@ -711,11 +711,86 @@ def rola_perstate_den_triton(q, k, w, chunk=None, BG=16):
     return _DenFn.apply(q, k, w, chunk, BG)
 
 
+@triton.autotune(configs=_AT_CFGS, key=_DEN_KEY, **autotune_cache_kwargs)
+@triton.jit
+def _den_gla_bwd_scan(q_ptr, gd_ptr, ld_ptr, dZa_ptr, L, dqk, nc,
+                      sq_b, sq_l, sq_d, sg_b, sg_l, sg_c,
+                      szb_b, szb_n, szb_t, szb_d, szb_c,
+                      BT: tl.constexpr, BD: tl.constexpr, BG: tl.constexpr, NCH: tl.constexpr):
+    """Reverse scan for the DECAYED den: dZa[t] = adjoint of chunk t's carry increment
+    (sum over later chunks, decayed). dZ_t = e^{Lam_t} dZ_{t+1} + q^T (e^a ∘ gd)."""
+    b = tl.program_id(0); sb = tl.program_id(1)
+    offs_t = tl.arange(0, BT); offs_d = tl.arange(0, BD); offs_c = sb * BG + tl.arange(0, BG)
+    offs_g = tl.arange(0, BG)
+    dmask = offs_d < dqk; cmask = offs_c < nc
+    dZ = tl.zeros([BD, BG], dtype=tl.float32)
+    for ti in range(NCH):
+        t = NCH - 1 - ti
+        rows = t * BT + offs_t; rmask = rows < L
+        qc = tl.load(q_ptr + b*sq_b + rows[:, None]*sq_l + offs_d[None, :]*sq_d, mask=rmask[:, None] & dmask[None, :], other=0.0)
+        gdc = tl.load(gd_ptr + b*sg_b + rows[:, None]*sg_l + offs_c[None, :]*sg_c, mask=rmask[:, None] & cmask[None, :], other=0.0)
+        ldc = tl.load(ld_ptr + b*sg_b + rows[:, None]*sg_l + offs_c[None, :]*sg_c, mask=rmask[:, None] & cmask[None, :], other=0.0)
+        a = tl.cumsum(ldc, axis=0)
+        tl.store(dZa_ptr + b*szb_b + sb*szb_n + t*szb_t + offs_d[:, None]*szb_d + offs_g[None, :]*szb_c,
+                 dZ, mask=dmask[:, None])
+        Lam = tl.sum(tl.where(offs_t[:, None] == (BT - 1), a, 0.0), axis=0)
+        gt = gdc * tl.exp(a)
+        dZ = tl.exp(Lam)[None, :] * dZ + tl.dot(tl.trans(qc), gt.to(qc.dtype))
+
+
+@triton.autotune(configs=_AT_CFGS, key=_DEN_KEY, **autotune_cache_kwargs)
+@triton.jit
+def _den_gla_grad(q_ptr, k_ptr, wg_ptr, ld_ptr, gd_ptr, Zb_ptr, dZa_ptr,
+                  dq_ptr, dk_ptr, dw_ptr, dld_ptr, L, dqk, nc,
+                  sq_b, sq_l, sq_d, sg_b, sg_l, sg_c,
+                  szb_b, szb_n, szb_t, szb_d, szb_c,
+                  sdq_b, sdq_n, sdq_l, sdq_d, sdw_b, sdw_l, sdw_c,
+                  BT: tl.constexpr, BD: tl.constexpr, BG: tl.constexpr, NCH: tl.constexpr):
+    """Parallel per-chunk grads for the decayed den, incl. dld assembled IN-KERNEL:
+    da from the three appearances of a (output scale e^a, intra w·e^{-a}, carry w·e^{Lam-a}),
+    dLam from the carry decay (e^{Lam}·Σ Zb∘dZa, the main kernel's dLam trick) + the carry
+    writes, folded into da's last row; dld = reverse cumsum of da (tot − cumsum + da)."""
+    b = tl.program_id(0); sb = tl.program_id(1); t = tl.program_id(2)
+    offs_t = tl.arange(0, BT); offs_d = tl.arange(0, BD); offs_c = sb * BG + tl.arange(0, BG)
+    offs_g = tl.arange(0, BG)
+    dmask = offs_d < dqk; cmask = offs_c < nc
+    rows = t * BT + offs_t; rmask = rows < L
+    qc = tl.load(q_ptr + b*sq_b + rows[:, None]*sq_l + offs_d[None, :]*sq_d, mask=rmask[:, None] & dmask[None, :], other=0.0)
+    kc = tl.load(k_ptr + b*sq_b + rows[:, None]*sq_l + offs_d[None, :]*sq_d, mask=rmask[:, None] & dmask[None, :], other=0.0)
+    wgc = tl.load(wg_ptr + b*sg_b + rows[:, None]*sg_l + offs_c[None, :]*sg_c, mask=rmask[:, None] & cmask[None, :], other=0.0)
+    ldc = tl.load(ld_ptr + b*sg_b + rows[:, None]*sg_l + offs_c[None, :]*sg_c, mask=rmask[:, None] & cmask[None, :], other=0.0)
+    gdc = tl.load(gd_ptr + b*sg_b + rows[:, None]*sg_l + offs_c[None, :]*sg_c, mask=rmask[:, None] & cmask[None, :], other=0.0)
+    Zb = tl.load(Zb_ptr + b*szb_b + sb*szb_n + t*szb_t + offs_d[:, None]*szb_d + offs_g[None, :]*szb_c, mask=dmask[:, None], other=0.0)
+    dZa = tl.load(dZa_ptr + b*szb_b + sb*szb_n + t*szb_t + offs_d[:, None]*szb_d + offs_g[None, :]*szb_c, mask=dmask[:, None], other=0.0)
+    a = tl.cumsum(ldc, axis=0)
+    Lam = tl.sum(tl.where(offs_t[:, None] == (BT - 1), a, 0.0), axis=0)
+    ea = tl.exp(a); wt = wgc * tl.exp(-a); w_end = wgc * tl.exp(Lam[None, :] - a)
+    caus = (offs_t[:, None] >= offs_t[None, :]) & rmask[:, None] & rmask[None, :]
+    G = tl.dot(qc, tl.trans(kc))
+    gt = gdc * ea
+    P = tl.dot(gt, tl.trans(wt))                                     # [BT,BT]
+    dq = tl.dot((P * caus).to(kc.dtype), kc) + tl.dot(gt, tl.trans(Zb))
+    dk = tl.dot(tl.trans(P * caus).to(qc.dtype), qc) + tl.dot(w_end, tl.trans(dZa))
+    GTg = tl.dot(tl.trans(G * caus), gt)                             # [BT(j),BG]
+    KdZ = tl.dot(kc, dZa.to(kc.dtype))                               # [BT,BG]
+    dw = tl.exp(-a) * GTg + tl.exp(Lam[None, :] - a) * KdZ
+    dch = ea * (tl.dot(G * caus, wt) + tl.dot(qc, Zb.to(qc.dtype)))  # recomputed chunk output
+    da = gdc * dch - wt * GTg - w_end * KdZ
+    dLam = tl.sum(w_end * KdZ, axis=0) + tl.exp(Lam) * tl.sum(Zb * dZa, axis=0)
+    da += tl.where(offs_t[:, None] == (BT - 1), dLam[None, :], 0.0)
+    s = tl.cumsum(da, axis=0)
+    dld = tl.sum(da, axis=0)[None, :] - s + da                       # reverse cumsum
+    tl.store(dq_ptr + b*sdq_b + sb*sdq_n + rows[:, None]*sdq_l + offs_d[None, :]*sdq_d, dq, mask=rmask[:, None] & dmask[None, :])
+    tl.store(dk_ptr + b*sdq_b + sb*sdq_n + rows[:, None]*sdq_l + offs_d[None, :]*sdq_d, dk, mask=rmask[:, None] & dmask[None, :])
+    tl.store(dw_ptr + b*sdw_b + rows[:, None]*sdw_l + offs_c[None, :]*sdw_c, dw, mask=rmask[:, None] & cmask[None, :])
+    tl.store(dld_ptr + b*sdw_b + rows[:, None]*sdw_l + offs_c[None, :]*sdw_c, dld, mask=rmask[:, None] & cmask[None, :])
+
+
 class _DenGLAFn(torch.autograd.Function):
     """Per-state denominator under per-state log-decay: d[i,c] = Σ_{j≤i} (φq_i·φk_j) w_j^c e^{Λ_ic−Λ_jc}.
-    Forward: _den_fwd USE_G=True. Backward: the den IS the augmented-GLA numerator with rg:=gd,
-    v:=1, dO:=[1|0] — Σ_c gd_ic d_ic = num_i under that substitution — so the verified
-    _bwd_split_gla yields (dq, dk, dwg, dld) with no new kernel surface."""
+    Forward: _den_fwd USE_G=True. Backward: dedicated decayed den kernels at [BD,BG] state
+    scale, value-free (_den_gla_bwd_scan + _den_gla_grad with in-kernel dld assembly) — the
+    same cost class as the additive den, not a second full GLA backward."""
     @staticmethod
     def forward(ctx, q, k, wg, ld, chunk, BG):
         B, L, dqk = q.shape; nc = wg.shape[-1]
@@ -729,23 +804,32 @@ class _DenGLAFn(torch.autograd.Function):
             d.stride(0), d.stride(1), d.stride(2),
             Zb.stride(0), Zb.stride(1), Zb.stride(2), Zb.stride(3), Zb.stride(4),
             USE_G=True, BT=chunk, BD=BD, BG=BG, NCH=NCH)
-        ctx.save_for_backward(q, k, wg, ld)
-        ctx.meta = (chunk, BG)
+        ctx.save_for_backward(q, k, wg, ld, Zb)
+        ctx.meta = (chunk, BG, BD, NB, NCH)
         return d
 
     @staticmethod
     def backward(ctx, gd):
-        q, k, wg, ld = ctx.saved_tensors
-        chunk, BG = ctx.meta
-        B, L, _ = q.shape
-        ones1 = torch.ones(B, L, 1, device=q.device, dtype=torch.float32)
-        g = torch.zeros(B, L, 2, device=q.device, dtype=torch.float32)
-        g[..., 0] = 1.0
-        fl = lambda t: t.float()
-        dq, dk, _dv, dwg, _dgd, dld = _bwd_split_gla(
-            fl(q), fl(k), ones1, fl(wg), gd.float().contiguous(), fl(ld), g, chunk=chunk, BG=BG)
+        q, k, wg, ld, Zb = ctx.saved_tensors
+        chunk, BG, BD, NB, NCH = ctx.meta
+        B, L, dqk = q.shape; nc = wg.shape[-1]
+        gd = gd.contiguous().to(q.dtype)
+        dZa = torch.empty_like(Zb)
+        _den_gla_bwd_scan[(B, NB)](q, gd, ld, dZa, L, dqk, nc,
+            q.stride(0), q.stride(1), q.stride(2), gd.stride(0), gd.stride(1), gd.stride(2),
+            dZa.stride(0), dZa.stride(1), dZa.stride(2), dZa.stride(3), dZa.stride(4),
+            BT=chunk, BD=BD, BG=BG, NCH=NCH)
+        dq = torch.empty(B, NB, L, dqk, device=q.device, dtype=torch.float32)
+        dk = torch.empty_like(dq)
+        dw = torch.empty(B, L, nc, device=q.device, dtype=torch.float32)
+        dld = torch.empty_like(dw)
+        _den_gla_grad[(B, NB, NCH)](q, k, wg, ld, gd, Zb, dZa, dq, dk, dw, dld, L, dqk, nc,
+            q.stride(0), q.stride(1), q.stride(2), gd.stride(0), gd.stride(1), gd.stride(2),
+            Zb.stride(0), Zb.stride(1), Zb.stride(2), Zb.stride(3), Zb.stride(4),
+            dq.stride(0), dq.stride(1), dq.stride(2), dq.stride(3), dw.stride(0), dw.stride(1), dw.stride(2),
+            BT=chunk, BD=BD, BG=BG, NCH=NCH)
         cast = lambda t: t.to(q.dtype)
-        return cast(dq), cast(dk), cast(dwg), dld.to(ld.dtype), None, None
+        return cast(dq.sum(1)), cast(dk.sum(1)), cast(dw), dld.to(ld.dtype), None, None
 
 
 def rola_perstate_den_gla_triton(q, k, w, ld, chunk=None, BG=16):
