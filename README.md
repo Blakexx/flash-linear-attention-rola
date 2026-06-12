@@ -1,3 +1,16 @@
+# flash-linear-attention-rola
+
+Fork of [flash-linear-attention](https://github.com/fla-org/flash-linear-attention) carrying the
+**RoLA (Routed Linear Attention)** kernels: routed reads/writes over multiple shared-projection
+recurrent states as additive `r`/`w`/`g` parameters on `chunk_simple_gla`, with shared-gram fused
+Triton forward and chunk-parallel backward kernels (RLA and scalar-gated GLA variants), and the
+per-state denominator kernels for the learned kappa normalization (additive and decayed, with
+in-kernel dld assembly). The routed entry points live in `fla_rola/ops/simple_gla/` (`rola.py`,
+`chunk.py`); the unrouted path is verified bit-identical to upstream. Part of the RoLA paper
+project (Blake Bottum, 2026): see [rola-paper](https://github.com/Blakexx/rola-paper).
+
+---
+
 <div align="center">
 
 # 💥 Flash Linear Attention
