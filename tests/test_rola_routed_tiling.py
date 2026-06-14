@@ -19,8 +19,9 @@ numerator — so we fold + apply the ones-column denominator trick (exactly as r
 import sys
 import torch
 
-from rola import _rola_global_ref, _rola_gla_ref
-from fla_rola.ops.simple_gla.rola import rola_rla_triton, rola_gla_triton
+from rola import _rola_global_ref, _rola_gla_ref, _rola_perstate_den, _rola_gla_perstate_den
+from fla_rola.ops.simple_gla.rola import (rola_rla_triton, rola_gla_triton,
+                                          rola_perstate_den_triton, rola_perstate_den_gla_triton)
 
 DEV = "cuda"
 EPS = 1e-5
@@ -168,18 +169,150 @@ def check_backward_gla(Ks):
     return res
 
 
+# ########## DEN — per-state denominator (kappa normalization) ##########
+# The den entry points take folded [BH,L,*]; the oracles take [B,L,H,*]. WRITE gate only (no read
+# gate, no v). fold/unfold are differentiable (permute+reshape) so grads flow to the [B,L,H,*] leaf.
+# K spans 96 (non-pow2) to exercise the padded-tail dmask in the feature-tiled kernels.
+
+def check_forward_den(Ks):
+    P("=== (4) den forward: kernel(fp32) vs oracle(fp64), across K ===")
+    res = {}
+    for K in Ks:
+        try:
+            q, k, v, rg, wg = _mk(2, 64, 2, K, nc=4, dv=16, dtype=torch.float64)
+            ref = _rola_perstate_den(q, k, wg)
+            out = _unfold(rola_perstate_den_triton(_fold(q.float()), _fold(k.float()),
+                                                   _fold(wg.float())), 2, 2).double()
+            rel = (out - ref).abs().max().item() / (ref.abs().max().item() + 1e-9)
+            res[K] = rel < 2e-2
+            P(f"  K={K:4d}  {'PASS' if res[K] else 'FAIL'}  rel={rel:.2e}")
+        except Exception as e:
+            res[K] = False
+            P(f"  K={K:4d}  FAIL  {type(e).__name__}: {str(e)[:90]}")
+    return res
+
+
+def check_backward_den(Ks):
+    P("=== (5) den backward: kernel analytic grads vs oracle analytic grads, across K ===")
+    res = {}
+    for K in Ks:
+        try:
+            q, k, v, rg, wg = _mk(2, 48, 2, K, nc=4, dv=16, dtype=torch.float32)
+            ik = [t.clone().requires_grad_(True) for t in (q, k, wg)]
+            _unfold(rola_perstate_den_triton(_fold(ik[0]), _fold(ik[1]), _fold(ik[2])), 2, 2).sum().backward()
+            io = [t.double().detach().requires_grad_(True) for t in (q, k, wg)]
+            _rola_perstate_den(io[0], io[1], io[2]).sum().backward()
+            rels = [("qkw"[i], (ik[i].grad.double() - io[i].grad).abs().max().item()
+                     / (io[i].grad.abs().max().item() + 1e-9)) for i in range(3)]
+            worst = max(r for _, r in rels)
+            res[K] = worst < 3e-2
+            P(f"  K={K:4d}  {'PASS' if res[K] else 'FAIL'}  worst={worst:.2e}  "
+              f"({', '.join(f'{n}:{r:.1e}' for n, r in rels)})")
+        except Exception as e:
+            res[K] = False
+            P(f"  K={K:4d}  FAIL  {type(e).__name__}: {str(e)[:90]}")
+    return res
+
+
+def check_forward_den_gla(Ks):
+    P("=== (4-GLA) den forward: GLA kernel(fp32) vs oracle(fp64), across K ===")
+    res = {}
+    for K in Ks:
+        try:
+            q, k, v, rg, wg, ld = _mk(2, 64, 2, K, nc=4, dv=16, dtype=torch.float64, with_ld=True)
+            ref = _rola_gla_perstate_den(q, k, wg, ld)
+            out = _unfold(rola_perstate_den_gla_triton(_fold(q.float()), _fold(k.float()),
+                                                       _fold(wg.float()), _fold(ld.float())), 2, 2).double()
+            rel = (out - ref).abs().max().item() / (ref.abs().max().item() + 1e-9)
+            res[K] = rel < 2e-2
+            P(f"  K={K:4d}  {'PASS' if res[K] else 'FAIL'}  rel={rel:.2e}")
+        except Exception as e:
+            res[K] = False
+            P(f"  K={K:4d}  FAIL  {type(e).__name__}: {str(e)[:90]}")
+    return res
+
+
+def check_backward_den_gla(Ks):
+    P("=== (5-GLA) den backward: GLA kernel analytic grads vs oracle, across K (l: the dld column) ===")
+    res = {}
+    for K in Ks:
+        try:
+            q, k, v, rg, wg, ld = _mk(2, 48, 2, K, nc=4, dv=16, dtype=torch.float32, with_ld=True)
+            ik = [t.clone().requires_grad_(True) for t in (q, k, wg, ld)]
+            _unfold(rola_perstate_den_gla_triton(_fold(ik[0]), _fold(ik[1]), _fold(ik[2]),
+                                                 _fold(ik[3])), 2, 2).sum().backward()
+            io = [t.double().detach().requires_grad_(True) for t in (q, k, wg, ld)]
+            _rola_gla_perstate_den(io[0], io[1], io[2], io[3]).sum().backward()
+            rels = [("qkwl"[i], (ik[i].grad.double() - io[i].grad).abs().max().item()
+                     / (io[i].grad.abs().max().item() + 1e-9)) for i in range(4)]
+            worst = max(r for _, r in rels)
+            res[K] = worst < 3e-2
+            P(f"  K={K:4d}  {'PASS' if res[K] else 'FAIL'}  worst={worst:.2e}  "
+              f"({', '.join(f'{n}:{r:.1e}' for n, r in rels)})")
+        except Exception as e:
+            res[K] = False
+            P(f"  K={K:4d}  FAIL  {type(e).__name__}: {str(e)[:90]}")
+    return res
+
+
+def check_den_caller_e2e():
+    """(6) E2E: the exact path the deleted CLA dqk<=64 den gates now enable. At dqk=128 fold a real
+    (q,k,wg[,ld]) with the model's foldd pattern and confirm the Triton den entry points match the
+    eager oracle (fwd + grads), RLA and GLA. Proves the gate-free model path is correct at dqk>64."""
+    P("=== (6) den caller E2E at dqk=128 (the now-ungated model path) ===")
+    K = 128
+    ok = {}
+    # RLA
+    q, k, v, rg, wg = _mk(2, 48, 2, K, nc=4, dv=16, dtype=torch.float32)
+    ik = [t.clone().requires_grad_(True) for t in (q, k, wg)]
+    _unfold(rola_perstate_den_triton(_fold(ik[0]), _fold(ik[1]), _fold(ik[2])), 2, 2).sum().backward()
+    io = [t.double().detach().requires_grad_(True) for t in (q, k, wg)]
+    _rola_perstate_den(io[0], io[1], io[2]).sum().backward()
+    fwd = (_unfold(rola_perstate_den_triton(_fold(q), _fold(k), _fold(wg)), 2, 2).double()
+           - _rola_perstate_den(io[0], io[1], io[2])).abs().max().item() / (
+        _rola_perstate_den(io[0], io[1], io[2]).abs().max().item() + 1e-9)
+    gw = max((ik[i].grad.double() - io[i].grad).abs().max().item()
+             / (io[i].grad.abs().max().item() + 1e-9) for i in range(3))
+    ok['RLA'] = fwd < 2e-2 and gw < 3e-2
+    P(f"  RLA  {'PASS' if ok['RLA'] else 'FAIL'}  fwd={fwd:.2e} grad={gw:.2e}")
+    # GLA
+    q, k, v, rg, wg, ld = _mk(2, 48, 2, K, nc=4, dv=16, dtype=torch.float32, with_ld=True)
+    ik = [t.clone().requires_grad_(True) for t in (q, k, wg, ld)]
+    _unfold(rola_perstate_den_gla_triton(_fold(ik[0]), _fold(ik[1]), _fold(ik[2]), _fold(ik[3])), 2, 2).sum().backward()
+    io = [t.double().detach().requires_grad_(True) for t in (q, k, wg, ld)]
+    _rola_gla_perstate_den(io[0], io[1], io[2], io[3]).sum().backward()
+    refg = _rola_gla_perstate_den(io[0], io[1], io[2], io[3])
+    fwd = (_unfold(rola_perstate_den_gla_triton(_fold(q), _fold(k), _fold(wg), _fold(ld)), 2, 2).double()
+           - refg).abs().max().item() / (refg.abs().max().item() + 1e-9)
+    gw = max((ik[i].grad.double() - io[i].grad).abs().max().item()
+             / (io[i].grad.abs().max().item() + 1e-9) for i in range(4))
+    ok['GLA'] = fwd < 2e-2 and gw < 3e-2
+    P(f"  GLA  {'PASS' if ok['GLA'] else 'FAIL'}  fwd={fwd:.2e} grad={gw:.2e}")
+    return ok
+
+
 if __name__ == "__main__":
     if not torch.cuda.is_available():
         P("SKIP: needs CUDA"); sys.exit(0)
     P("device: " + torch.cuda.get_device_name(0))
     Ks = [16, 64, 128, 256, 512]                # <=64 regime + well beyond (based/rebased + headroom)
+    Ks_den = [16, 64, 96, 128, 256, 512]        # +96 (non-pow2) exercises the padded-tail dmask
     P("########## RLA ##########")
     o = check_oracle_grads(); f = check_forward(Ks); b = check_backward(Ks)
     P("########## GLA (scalar per-state decay) ##########")
     og = check_oracle_grads_gla(); fg = check_forward_gla(Ks); bg = check_backward_gla(Ks)
+    P("########## DEN ##########")
+    fd = check_forward_den(Ks_den); bd = check_backward_den(Ks_den)
+    fdg = check_forward_den_gla(Ks_den); bdg = check_backward_den_gla(Ks_den)
+    e2e = check_den_caller_e2e()
     allok = (o and all(f.values()) and all(b.values())
-             and og and all(fg.values()) and all(bg.values()))
+             and og and all(fg.values()) and all(bg.values())
+             and all(fd.values()) and all(bd.values())
+             and all(fdg.values()) and all(bdg.values()) and all(e2e.values()))
     P(f"\nSUMMARY RLA: oracle={o} forward={f} backward={b}")
     P(f"SUMMARY GLA: oracle={og} forward={fg} backward={bg}")
+    P(f"SUMMARY DEN: fwd={fd} bwd={bd}")
+    P(f"SUMMARY DEN-GLA: fwd={fdg} bwd={bdg}")
+    P(f"SUMMARY DEN-E2E: {e2e}")
     P(f"-> {'ALL GREEN' if allok else 'NOT GREEN'}")
     sys.exit(0 if allok else 1)

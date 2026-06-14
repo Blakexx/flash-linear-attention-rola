@@ -18,6 +18,12 @@ def fused_recurrent_linear_attn(
     normalize: bool = False,
     cu_seqlens: torch.LongTensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    if scale is None:
+        # Mirror chunk_linear_attn (which defaults scale before use); upstream fused_recurrent omitted
+        # this, so normalize_output(q * scale) below crashes on `Tensor * None` when normalize=True
+        # (do_feature_map_norm). scale cancels in the normalized ratio; defaulting keeps the
+        # fused_recurrent (L<=64) and chunk (L>64) paths consistent. Upstreamable one-liner.
+        scale = k.shape[-1] ** -0.5
     o, final_state = fused_recurrent_simple_gla(
         q=q,
         k=k,
