@@ -19,7 +19,7 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
-from fla_rola.utils import autotune_cache_kwargs, check_shared_mem
+from fla_rola.utils import autotune_cache_kwargs, check_shared_mem, get_all_max_shared_mem
 
 # Device-aware sizing (same mechanism as FLA's own kernels): the [BT, BG*BV] intermediates are
 # 64KB each at BT=32 — fine on >=ampere-class smem (~100-160KB), over the 64KB limit of sm75 (T4).
@@ -31,6 +31,33 @@ _AT_KEY = ['dqk', 'dv', 'nc']
 _CHUNK_FWD = 64 if _BIG_SMEM else 16     # RLA forward
 _CHUNK = 32 if _BIG_SMEM else 16         # GLA forward + all backwards (GLA needs BT<=32 for the
 # fp32 decay floor; BT=16 keeps sm75 within 64KB)
+
+# --- Backward feature tiling: BD as an autotune knob ----------------------------------------------
+# The backward grad kernels load a [BD, BG*BV] slice of the Kronecker state per feature-block into
+# SRAM. Rather than model that footprint with a byte budget (fragile — it misses Triton's tl.dot
+# operand staging), we expose the feature tile BD itself as an autotune knob and let the autotuner
+# EMPIRICALLY pick the largest that fits: Triton's autotuner compiles each config and scores any
+# OutOfResources as inf, so over-SRAM tiles are dropped against the real hardware. BD=16 always fits
+# and floors the set, so a config always survives. This is how FLA's own kernels handle SRAM limits —
+# no magic constant, no headroom factor; an A100/H100 lands on a big BD + deep pipeline, a 3080 Ti on
+# BD=16. BG is pinned at the dot minimum (tl.dot dims must be >=16). NB: BD here tiles the GRAD
+# kernels only; the scans take their own (independent) feature block — Sb is indexed by absolute
+# feature row, so the two blockings need not match.
+_BWD_BK = (16, 32, 64, 128)               # feature-tile candidates; autotuner keeps the largest fitting
+_BWD_CFGS = [triton.Config({'BD': bk}, num_warps=w, num_stages=s)
+             for bk in _BWD_BK for w in (2, 4, 8) for s in ((1, 2, 3) if _BIG_SMEM else (1,))]
+
+
+def _prune_bwd_bd(configs, named_args, **kwargs):
+    """Exact (not heuristic) prune: drop feature tiles larger than the padded feature dim — pure
+    waste, never a fit question. SRAM-too-big tiles are pruned empirically by the autotuner
+    (OutOfResources -> inf). Keeps BD<=16 as the floor so the set is never empty."""
+    try:
+        cap = max(16, triton.next_power_of_2(named_args['dqk']))
+    except Exception:
+        return configs
+    keep = [c for c in configs if c.kwargs['BD'] <= cap]
+    return keep or [c for c in configs if c.kwargs['BD'] == 16] or configs
 
 
 @triton.autotune(configs=_AT_CFGS, key=_AT_KEY, **autotune_cache_kwargs)
@@ -367,8 +394,9 @@ def _scan_S(k_ptr, v_ptr, wg_ptr, ld_ptr, Sb_ptr, L, dqk, dv, nc,
             BG: tl.constexpr, NCH: tl.constexpr):
     b = tl.program_id(0)
     sb = tl.program_id(1)
+    d0 = tl.program_id(2)                       # feature-block: this program owns Sflat rows [d0*BD:]
     offs_t = tl.arange(0, BT)
-    offs_d = tl.arange(0, BD)
+    offs_d = d0 * BD + tl.arange(0, BD)
     offs_v = tl.arange(0, BV)
     offs_e = tl.arange(0, BG * BV)
     offs_c = sb * BG + tl.arange(0, BG)
@@ -410,8 +438,9 @@ def _scan_dS(q_ptr, rg_ptr, ld_ptr, g_ptr, dSa_ptr, L, dqk, dv, nc,
              BG: tl.constexpr, NCH: tl.constexpr):
     b = tl.program_id(0)
     sb = tl.program_id(1)
+    d0 = tl.program_id(2)                       # feature-block: this program owns dS rows [d0*BD:]
     offs_t = tl.arange(0, BT)
-    offs_d = tl.arange(0, BD)
+    offs_d = d0 * BD + tl.arange(0, BD)
     offs_v = tl.arange(0, BV)
     offs_e = tl.arange(0, BG * BV)
     offs_c = sb * BG + tl.arange(0, BG)
@@ -445,29 +474,31 @@ def _scan_dS(q_ptr, rg_ptr, ld_ptr, g_ptr, dSa_ptr, L, dqk, dv, nc,
             dS += tl.dot(tl.trans(qc), rg_g.to(qc.dtype))
 
 
-@triton.autotune(configs=_AT_CFGS, key=_AT_KEY, **autotune_cache_kwargs)
+@triton.autotune(configs=_BWD_CFGS, key=_AT_KEY,
+                 prune_configs_by={'early_config_prune': _prune_bwd_bd}, **autotune_cache_kwargs)
 @triton.jit
 def _par_grad_rla_qr(q_ptr, k_ptr, v_ptr, wg_ptr, rg_ptr, g_ptr, Sb_ptr, dq_ptr, dr_ptr,
                      L, dqk, dv, nc,
                      sq_b, sq_l, sq_d, sv_b, sv_l, sv_d, sg_b, sg_l, sg_c, sgr_b, sgr_l, sgr_d,
                      ssb_b, ssb_n, ssb_t, ssb_d, ssb_e,
                      sdq_b, sdq_n, sdq_l, sdq_d, sdr_b, sdr_l, sdr_c,
-                     BT: tl.constexpr, BD: tl.constexpr, BV: tl.constexpr, BG: tl.constexpr, NCH: tl.constexpr):
+                     BT: tl.constexpr, BD: tl.constexpr, BV: tl.constexpr, BG: tl.constexpr,
+                     NCH: tl.constexpr):
+    # D-tiled: dq is feature-indexed (written per BD-block); dr needs the full content gram G + QS,
+    # accumulated over the BD-block loop ([BT,BT] and [BT,BG*BV] — bounded, independent of dqk).
+    # BD is an autotune knob; the number of feature-blocks follows from it (dqk is runtime).
+    ND = tl.cdiv(dqk, BD)
     b = tl.program_id(0)
     sb = tl.program_id(1)
     t = tl.program_id(2)
     offs_t = tl.arange(0, BT)
-    offs_d = tl.arange(0, BD)
     offs_v = tl.arange(0, BV)
     offs_e = tl.arange(0, BG * BV)
     offs_c = sb * BG + tl.arange(0, BG)
-    dmask = offs_d < dqk
     cmask = offs_c < nc
     vmask = offs_v < (dv + 1)
     rows = t * BT + offs_t
     rmask = rows < L
-    qc = tl.load(q_ptr + b*sq_b + rows[:, None]*sq_l + offs_d[None, :]*sq_d, mask=rmask[:, None] & dmask[None, :], other=0.0)
-    kc = tl.load(k_ptr + b*sq_b + rows[:, None]*sq_l + offs_d[None, :]*sq_d, mask=rmask[:, None] & dmask[None, :], other=0.0)
     v1 = tl.load(v_ptr + b*sv_b + rows[:, None]*sv_l + offs_v[None, :]*sv_d,
                  mask=rmask[:, None] & (offs_v[None, :] < dv), other=0.0)
     v1 += tl.where((offs_v[None, :] == dv) & rmask[:, None], 1.0, 0.0)
@@ -475,47 +506,56 @@ def _par_grad_rla_qr(q_ptr, k_ptr, v_ptr, wg_ptr, rg_ptr, g_ptr, Sb_ptr, dq_ptr,
     wgc = tl.load(wg_ptr + b*sg_b + rows[:, None]*sg_l + offs_c[None, :]*sg_c, mask=rmask[:, None] & cmask[None, :], other=0.0)
     gc = tl.load(g_ptr + b*sgr_b + rows[:, None]*sgr_l + offs_v[None, :]
                  * sgr_d, mask=rmask[:, None] & vmask[None, :], other=0.0)
-    Sb = tl.load(Sb_ptr + b*ssb_b + sb*ssb_n + t*ssb_t + offs_d[:, None]
-                 * ssb_d + offs_e[None, :]*ssb_e, mask=dmask[:, None], other=0.0)
     causal = (offs_t[:, None] >= offs_t[None, :]) & rmask[:, None] & rmask[None, :]
-    G = tl.dot(qc, tl.trans(kc))
     Rg = tl.dot(rgc, tl.trans(wgc))
     P = tl.dot(gc, tl.trans(v1))
-    dq_intra = tl.dot((causal * Rg * P).to(kc.dtype), kc)
-    dr_intra = tl.dot((causal * G * P).to(wgc.dtype), wgc)
+    coef = causal * Rg * P                                          # dq_intra coefficient [BT,BT]
     rg_g = tl.reshape(rgc[:, :, None] * gc[:, None, :], [BT, BG * BV])
-    dq_inter = tl.dot(rg_g.to(Sb.dtype), tl.trans(Sb))
-    QS = tl.dot(qc, Sb.to(qc.dtype))
+    G = tl.zeros([BT, BT], dtype=tl.float32)
+    QS = tl.zeros([BT, BG * BV], dtype=tl.float32)
+    for d0b in range(ND):
+        offs_d = d0b * BD + tl.arange(0, BD)
+        dmask = offs_d < dqk
+        qc = tl.load(q_ptr + b*sq_b + rows[:, None]*sq_l + offs_d[None, :]*sq_d, mask=rmask[:, None] & dmask[None, :], other=0.0)
+        kc = tl.load(k_ptr + b*sq_b + rows[:, None]*sq_l + offs_d[None, :]*sq_d, mask=rmask[:, None] & dmask[None, :], other=0.0)
+        Sb = tl.load(Sb_ptr + b*ssb_b + sb*ssb_n + t*ssb_t + offs_d[:, None]
+                     * ssb_d + offs_e[None, :]*ssb_e, mask=dmask[:, None], other=0.0)
+        dq_d = tl.dot(coef.to(kc.dtype), kc) + tl.dot(rg_g.to(Sb.dtype), tl.trans(Sb))
+        tl.store(dq_ptr + b*sdq_b + sb*sdq_n + rows[:, None]*sdq_l + offs_d[None, :]*sdq_d,
+                 dq_d, mask=rmask[:, None] & dmask[None, :])
+        G += tl.dot(qc, tl.trans(kc))
+        QS += tl.dot(qc, Sb.to(qc.dtype))
+    dr_intra = tl.dot((causal * G * P).to(wgc.dtype), wgc)
     dr_inter = tl.sum(tl.reshape(QS, [BT, BG, BV]) * gc[:, None, :], axis=2)
-    tl.store(dq_ptr + b*sdq_b + sb*sdq_n + rows[:, None]*sdq_l + offs_d[None, :]*sdq_d,
-             dq_intra + dq_inter, mask=rmask[:, None] & dmask[None, :])
     tl.store(dr_ptr + b*sdr_b + rows[:, None]*sdr_l + offs_c[None, :]*sdr_c,
              dr_intra + dr_inter, mask=rmask[:, None] & cmask[None, :])
 
 
-@triton.autotune(configs=_AT_CFGS, key=_AT_KEY, **autotune_cache_kwargs)
+@triton.autotune(configs=_BWD_CFGS, key=_AT_KEY,
+                 prune_configs_by={'early_config_prune': _prune_bwd_bd}, **autotune_cache_kwargs)
 @triton.jit
 def _par_grad_rla_kwv(q_ptr, k_ptr, v_ptr, wg_ptr, rg_ptr, g_ptr, dSa_ptr, dk_ptr, dw_ptr, dv_ptr,
                       L, dqk, dv, nc,
                       sq_b, sq_l, sq_d, sv_b, sv_l, sv_d, sg_b, sg_l, sg_c, sgr_b, sgr_l, sgr_d,
                       ssb_b, ssb_n, ssb_t, ssb_d, ssb_e,
                       sdk_b, sdk_n, sdk_l, sdk_d, sdw_b, sdw_l, sdw_c, sdv_b, sdv_n, sdv_l, sdv_d,
-                      BT: tl.constexpr, BD: tl.constexpr, BV: tl.constexpr, BG: tl.constexpr, NCH: tl.constexpr):
+                      BT: tl.constexpr, BD: tl.constexpr, BV: tl.constexpr, BG: tl.constexpr,
+                      NCH: tl.constexpr):
+    # D-tiled: dk is feature-indexed (written per BD-block); dw/dv need the full content gram G + KS,
+    # accumulated over the BD-block loop ([BT,BT] and [BT,BG*BV] — bounded, independent of dqk).
+    # BD is an autotune knob; the number of feature-blocks follows from it (dqk is runtime).
+    ND = tl.cdiv(dqk, BD)
     b = tl.program_id(0)
     sb = tl.program_id(1)
     t = tl.program_id(2)
     offs_t = tl.arange(0, BT)
-    offs_d = tl.arange(0, BD)
     offs_v = tl.arange(0, BV)
     offs_e = tl.arange(0, BG * BV)
     offs_c = sb * BG + tl.arange(0, BG)
-    dmask = offs_d < dqk
     cmask = offs_c < nc
     vmask = offs_v < (dv + 1)
     rows = t * BT + offs_t
     rmask = rows < L
-    qc = tl.load(q_ptr + b*sq_b + rows[:, None]*sq_l + offs_d[None, :]*sq_d, mask=rmask[:, None] & dmask[None, :], other=0.0)
-    kc = tl.load(k_ptr + b*sq_b + rows[:, None]*sq_l + offs_d[None, :]*sq_d, mask=rmask[:, None] & dmask[None, :], other=0.0)
     v1 = tl.load(v_ptr + b*sv_b + rows[:, None]*sv_l + offs_v[None, :]*sv_d,
                  mask=rmask[:, None] & (offs_v[None, :] < dv), other=0.0)
     v1 += tl.where((offs_v[None, :] == dv) & rmask[:, None], 1.0, 0.0)
@@ -523,26 +563,32 @@ def _par_grad_rla_kwv(q_ptr, k_ptr, v_ptr, wg_ptr, rg_ptr, g_ptr, dSa_ptr, dk_pt
     wgc = tl.load(wg_ptr + b*sg_b + rows[:, None]*sg_l + offs_c[None, :]*sg_c, mask=rmask[:, None] & cmask[None, :], other=0.0)
     gc = tl.load(g_ptr + b*sgr_b + rows[:, None]*sgr_l + offs_v[None, :]
                  * sgr_d, mask=rmask[:, None] & vmask[None, :], other=0.0)
-    dSa = tl.load(dSa_ptr + b*ssb_b + sb*ssb_n + t*ssb_t +
-                  offs_d[:, None]*ssb_d + offs_e[None, :]*ssb_e, mask=dmask[:, None], other=0.0)
     causal = (offs_t[:, None] >= offs_t[None, :]) & rmask[:, None] & rmask[None, :]
-    G = tl.dot(qc, tl.trans(kc))
     Rg = tl.dot(rgc, tl.trans(wgc))
     P = tl.dot(gc, tl.trans(v1))
-    A = (G * Rg * causal)
-    A2 = (Rg * P * causal)
-    B2 = (G * P * causal)
-    dk_intra = tl.dot(tl.trans(A2).to(qc.dtype), qc)
+    A2 = Rg * P * causal                                            # dk_intra coef [BT,BT]
+    wg_v1 = tl.reshape(wgc[:, :, None] * v1[:, None, :], [BT, BG * BV])
+    G = tl.zeros([BT, BT], dtype=tl.float32)
+    KS = tl.zeros([BT, BG * BV], dtype=tl.float32)
+    for d0b in range(ND):
+        offs_d = d0b * BD + tl.arange(0, BD)
+        dmask = offs_d < dqk
+        qc = tl.load(q_ptr + b*sq_b + rows[:, None]*sq_l + offs_d[None, :]*sq_d, mask=rmask[:, None] & dmask[None, :], other=0.0)
+        kc = tl.load(k_ptr + b*sq_b + rows[:, None]*sq_l + offs_d[None, :]*sq_d, mask=rmask[:, None] & dmask[None, :], other=0.0)
+        dSa = tl.load(dSa_ptr + b*ssb_b + sb*ssb_n + t*ssb_t +
+                      offs_d[:, None]*ssb_d + offs_e[None, :]*ssb_e, mask=dmask[:, None], other=0.0)
+        dk_d = tl.dot(tl.trans(A2).to(qc.dtype), qc) + tl.dot(wg_v1.to(dSa.dtype), tl.trans(dSa))
+        tl.store(dk_ptr + b*sdk_b + sb*sdk_n + rows[:, None]*sdk_l + offs_d[None, :]*sdk_d,
+                 dk_d, mask=rmask[:, None] & dmask[None, :])
+        G += tl.dot(qc, tl.trans(kc))
+        KS += tl.dot(kc, dSa.to(kc.dtype))
+    A = G * Rg * causal
+    B2 = G * P * causal
     dw_intra = tl.dot(tl.trans(B2).to(rgc.dtype), rgc)
     dv_intra = tl.dot(tl.trans(A).to(gc.dtype), gc)
-    wg_v1 = tl.reshape(wgc[:, :, None] * v1[:, None, :], [BT, BG * BV])
-    dk_wr = tl.dot(wg_v1.to(dSa.dtype), tl.trans(dSa))
-    KS = tl.dot(kc, dSa.to(kc.dtype))
     KS3 = tl.reshape(KS, [BT, BG, BV])
     dw_wr = tl.sum(KS3 * v1[:, None, :], axis=2)
     dv_wr = tl.sum(wgc[:, :, None] * KS3, axis=1)
-    tl.store(dk_ptr + b*sdk_b + sb*sdk_n + rows[:, None]*sdk_l + offs_d[None, :]*sdk_d,
-             dk_intra + dk_wr, mask=rmask[:, None] & dmask[None, :])
     tl.store(dw_ptr + b*sdw_b + rows[:, None]*sdw_l + offs_c[None, :]*sdw_c,
              dw_intra + dw_wr, mask=rmask[:, None] & cmask[None, :])
     tl.store(dv_ptr + b*sdv_b + sb*sdv_n + rows[:, None]*sdv_l + offs_v[None, :]*sdv_d,
@@ -705,26 +751,31 @@ def _bwd_split_rla(q, k, v, wg, rg, g, chunk=None, BG=16):
     nc = wg.shape[-1]
     q, k, v, wg, rg, g = [x.contiguous() for x in (q, k, v, wg, rg, g)]
     BD, BV, NB, NCH, Sb, dSa, dq, dk, dvo, dr, dw = _alloc_split(q, v, wg, chunk, BG)
+    # The scans build Sb/dSa with their OWN feature block (Sflat is a register accumulator, not a
+    # loaded SRAM tile, so a fixed block is fine and independent of the grad kernels' autotuned BD —
+    # Sb is indexed by absolute feature row). The grad kernels pick BD by autotune (SRAM-fit empirical).
+    BK_scan = min(64, BD)
+    ND_scan = triton.cdiv(dqk, BK_scan)
     sS = (Sb.stride(0), Sb.stride(1), Sb.stride(2), Sb.stride(3), Sb.stride(4))
     sq = (q.stride(0), q.stride(1), q.stride(2))
     sv = (v.stride(0), v.stride(1), v.stride(2))
     sg = (wg.stride(0), wg.stride(1), wg.stride(2))
     sgr = (g.stride(0), g.stride(1), g.stride(2))
-    _scan_S[(B, NB)](k, v, wg, wg, Sb, L, dqk, dv, nc, *sq, *sv, *sg, *sS,
-                     USE_G=False, BT=chunk, BD=BD, BV=BV, BG=BG, NCH=NCH)
-    _scan_dS[(B, NB)](q, rg, wg, g, dSa, L, dqk, dv, nc, *sq, *sg, *sgr, *sS,
-                      USE_G=False, BT=chunk, BD=BD, BV=BV, BG=BG, NCH=NCH)
+    _scan_S[(B, NB, ND_scan)](k, v, wg, wg, Sb, L, dqk, dv, nc, *sq, *sv, *sg, *sS,
+                              USE_G=False, BT=chunk, BD=BK_scan, BV=BV, BG=BG, NCH=NCH)
+    _scan_dS[(B, NB, ND_scan)](q, rg, wg, g, dSa, L, dqk, dv, nc, *sq, *sg, *sgr, *sS,
+                               USE_G=False, BT=chunk, BD=BK_scan, BV=BV, BG=BG, NCH=NCH)
     _par_grad_rla_qr[(B, NB, NCH)](q, k, v, wg, rg, g, Sb, dq, dr, L, dqk, dv, nc,
                                    *sq, *sv, *sg, *sgr, *sS,
                                    dq.stride(0), dq.stride(1), dq.stride(2), dq.stride(
                                        3), dr.stride(0), dr.stride(1), dr.stride(2),
-                                   BT=chunk, BD=BD, BV=BV, BG=BG, NCH=NCH)
+                                   BT=chunk, BV=BV, BG=BG, NCH=NCH)
     _par_grad_rla_kwv[(B, NB, NCH)](q, k, v, wg, rg, g, dSa, dk, dw, dvo, L, dqk, dv, nc,
                                     *sq, *sv, *sg, *sgr, *sS,
                                     dk.stride(0), dk.stride(1), dk.stride(2), dk.stride(
                                         3), dw.stride(0), dw.stride(1), dw.stride(2),
                                     dvo.stride(0), dvo.stride(1), dvo.stride(2), dvo.stride(3),
-                                    BT=chunk, BD=BD, BV=BV, BG=BG, NCH=NCH)
+                                    BT=chunk, BV=BV, BG=BG, NCH=NCH)
     return dq.sum(1), dk.sum(1), dvo.sum(1)[..., :dv], dw, dr
 
 
