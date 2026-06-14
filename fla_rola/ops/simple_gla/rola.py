@@ -209,6 +209,7 @@ def _fwd_aug_tiled(q, k, v, wg, rg, chunk, BG, BK=64):
     [B,L,dv+1] output (numerator|den) summed over state-blocks as _fwd_aug."""
     B, L, dqk = q.shape; dv = v.shape[-1]; nc = wg.shape[-1]
     BV = max(16, triton.next_power_of_2(dv + 1))
+    BK = min(BK, max(16, triton.next_power_of_2(dqk)))   # exact-width blocks for dqk<=64; tile beyond
     ND = triton.cdiv(dqk, BK); NB = triton.cdiv(nc, BG); NCH = triton.cdiv(L, chunk)
     q, k, v, wg, rg = [x.contiguous() for x in (q, k, v, wg, rg)]
     out_aug = torch.zeros(B, NB, L, BV, device=q.device, dtype=torch.float32)
@@ -360,6 +361,7 @@ def _gla_fwd_aug(q, k, v, wg, rg, ld, chunk, BG, BK=64):
     nc = wg.shape[-1]
     ld = ld.clamp(min=_GLA_FLOOR).contiguous()
     BV = max(16, triton.next_power_of_2(dv + 1))
+    BK = min(BK, max(16, triton.next_power_of_2(dqk)))   # exact-width blocks for dqk<=64; tile beyond
     ND = triton.cdiv(dqk, BK)
     NB = triton.cdiv(nc, BG)
     NCH = triton.cdiv(L, chunk)
