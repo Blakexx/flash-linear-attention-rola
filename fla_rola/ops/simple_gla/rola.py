@@ -102,6 +102,99 @@ def _fwd_aug(q, k, v, wg, rg, chunk, BG):
     return out_aug[..., :dv + 1].sum(1)
 
 
+@triton.jit
+def _rola_fwd_intra(q_ptr, k_ptr, v_ptr, wg_ptr, rg_ptr, outa_ptr,
+                    L, dqk, dv, nc,
+                    sq_b, sq_l, sq_d, sv_b, sv_l, sv_d, sg_b, sg_l, sg_c,
+                    soa_b, soa_n, soa_l, soa_v,
+                    BT: tl.constexpr, BK: tl.constexpr, BV: tl.constexpr,
+                    BG: tl.constexpr, ND: tl.constexpr):
+    """Intra-chunk routed readout for one (batch, state-block, chunk). The [BT,BT] content gram is
+    built by looping BK-blocks of the feature dim, so SRAM is bounded by [BT,BK]+[BT,BT] — NOT dqk.
+    atomic_adds o_intra into the augmented output (v carries a ones-column for the denominator)."""
+    b = tl.program_id(0); sb = tl.program_id(1); t = tl.program_id(2)
+    offs_t = tl.arange(0, BT); offs_v = tl.arange(0, BV)
+    offs_c = sb * BG + tl.arange(0, BG); cmask = offs_c < nc
+    rows = t * BT + offs_t; rmask = rows < L
+    G = tl.zeros([BT, BT], dtype=tl.float32)
+    for d0 in range(ND):
+        offs_d = d0 * BK + tl.arange(0, BK); dmask = offs_d < dqk
+        qc = tl.load(q_ptr + b*sq_b + rows[:, None]*sq_l + offs_d[None, :]*sq_d,
+                     mask=rmask[:, None] & dmask[None, :], other=0.0)
+        kc = tl.load(k_ptr + b*sq_b + rows[:, None]*sq_l + offs_d[None, :]*sq_d,
+                     mask=rmask[:, None] & dmask[None, :], other=0.0)
+        G += tl.dot(qc, tl.trans(kc))
+    rgc = tl.load(rg_ptr + b*sg_b + rows[:, None]*sg_l + offs_c[None, :]*sg_c,
+                  mask=rmask[:, None] & cmask[None, :], other=0.0)
+    wgc = tl.load(wg_ptr + b*sg_b + rows[:, None]*sg_l + offs_c[None, :]*sg_c,
+                  mask=rmask[:, None] & cmask[None, :], other=0.0)
+    vc = tl.load(v_ptr + b*sv_b + rows[:, None]*sv_l + offs_v[None, :]*sv_d,
+                 mask=rmask[:, None] & (offs_v[None, :] < dv), other=0.0)
+    vc += tl.where((offs_v[None, :] == dv) & rmask[:, None], 1.0, 0.0)
+    R = tl.dot(rgc, tl.trans(wgc))
+    causal = (offs_t[:, None] >= offs_t[None, :]) & rmask[:, None] & rmask[None, :]
+    A = G * R * causal
+    o = tl.dot(A.to(vc.dtype), vc)
+    tl.atomic_add(outa_ptr + b*soa_b + sb*soa_n + rows[:, None]*soa_l + offs_v[None, :]*soa_v,
+                  o, mask=rmask[:, None] & (offs_v[None, :] < dv + 1))
+
+
+@triton.jit
+def _rola_fwd_inter(q_ptr, k_ptr, v_ptr, wg_ptr, rg_ptr, outa_ptr,
+                    L, dqk, dv, nc,
+                    sq_b, sq_l, sq_d, sv_b, sv_l, sv_d, sg_b, sg_l, sg_c,
+                    soa_b, soa_n, soa_l, soa_v,
+                    BT: tl.constexpr, BK: tl.constexpr, BV: tl.constexpr,
+                    BG: tl.constexpr, NCH: tl.constexpr):
+    """Inter-chunk (state) contribution for one (batch, state-block, FEATURE-block d0). Carries this
+    feature-block's slice Sd[BK, BG*BV] of the Kronecker state across chunks → SRAM bounded by BK,
+    not dqk. o_inter uses the state BEFORE this chunk's update (causal); partials over feature-blocks
+    sum via atomic_add."""
+    b = tl.program_id(0); sb = tl.program_id(1); d0 = tl.program_id(2)
+    offs_t = tl.arange(0, BT); offs_v = tl.arange(0, BV)
+    offs_d = d0 * BK + tl.arange(0, BK); dmask = offs_d < dqk
+    offs_c = sb * BG + tl.arange(0, BG); cmask = offs_c < nc
+    Sd = tl.zeros([BK, BG * BV], dtype=tl.float32)
+    for t in range(NCH):
+        rows = t * BT + offs_t; rmask = rows < L
+        qc = tl.load(q_ptr + b*sq_b + rows[:, None]*sq_l + offs_d[None, :]*sq_d,
+                     mask=rmask[:, None] & dmask[None, :], other=0.0)
+        rgc = tl.load(rg_ptr + b*sg_b + rows[:, None]*sg_l + offs_c[None, :]*sg_c,
+                      mask=rmask[:, None] & cmask[None, :], other=0.0)
+        P = tl.dot(qc, Sd.to(qc.dtype))
+        P3 = tl.reshape(P, [BT, BG, BV])
+        o_inter = tl.sum(P3 * rgc[:, :, None], axis=1)
+        tl.atomic_add(outa_ptr + b*soa_b + sb*soa_n + rows[:, None]*soa_l + offs_v[None, :]*soa_v,
+                      o_inter, mask=rmask[:, None] & (offs_v[None, :] < dv + 1))
+        kc = tl.load(k_ptr + b*sq_b + rows[:, None]*sq_l + offs_d[None, :]*sq_d,
+                     mask=rmask[:, None] & dmask[None, :], other=0.0)
+        vc = tl.load(v_ptr + b*sv_b + rows[:, None]*sv_l + offs_v[None, :]*sv_d,
+                     mask=rmask[:, None] & (offs_v[None, :] < dv), other=0.0)
+        vc += tl.where((offs_v[None, :] == dv) & rmask[:, None], 1.0, 0.0)
+        wgc = tl.load(wg_ptr + b*sg_b + rows[:, None]*sg_l + offs_c[None, :]*sg_c,
+                      mask=rmask[:, None] & cmask[None, :], other=0.0)
+        WV = tl.reshape(wgc[:, :, None] * vc[:, None, :], [BT, BG * BV])
+        Sd += tl.dot(tl.trans(kc), WV.to(kc.dtype))
+
+
+def _fwd_aug_tiled(q, k, v, wg, rg, chunk, BG, BK=64):
+    """D-tiled forward: smem bounded by BK (feature-block), so ANY dqk fits. Same augmented
+    [B,L,dv+1] output (numerator|den) summed over state-blocks as _fwd_aug."""
+    B, L, dqk = q.shape; dv = v.shape[-1]; nc = wg.shape[-1]
+    BV = max(16, triton.next_power_of_2(dv + 1))
+    ND = triton.cdiv(dqk, BK); NB = triton.cdiv(nc, BG); NCH = triton.cdiv(L, chunk)
+    q, k, v, wg, rg = [x.contiguous() for x in (q, k, v, wg, rg)]
+    out_aug = torch.zeros(B, NB, L, BV, device=q.device, dtype=torch.float32)
+    strides = (q.stride(0), q.stride(1), q.stride(2), v.stride(0), v.stride(1), v.stride(2),
+               wg.stride(0), wg.stride(1), wg.stride(2),
+               out_aug.stride(0), out_aug.stride(1), out_aug.stride(2), out_aug.stride(3))
+    _rola_fwd_intra[(B, NB, NCH)](q, k, v, wg, rg, out_aug, L, dqk, dv, nc, *strides,
+                                  BT=chunk, BK=BK, BV=BV, BG=BG, ND=ND)
+    _rola_fwd_inter[(B, NB, ND)](q, k, v, wg, rg, out_aug, L, dqk, dv, nc, *strides,
+                                 BT=chunk, BK=BK, BV=BV, BG=BG, NCH=NCH)
+    return out_aug[..., :dv + 1].sum(1)
+
+
 class _RoLARLAFn(torch.autograd.Function):
     """RoLA-RLA (no decay) un-normalized routed readout O = (G∘R∘causal)@v, on folded [BH,L,*] tensors.
     Forward returns the numerator only ([..,:dv]); backward pads the incoming grad with a zero
@@ -109,7 +202,7 @@ class _RoLARLAFn(torch.autograd.Function):
     @staticmethod
     def forward(ctx, q, k, v, wg, rg, chunk, bwd_chunk, BG):
         dv = v.shape[-1]
-        Oa = _fwd_aug(q, k, v, wg, rg, chunk=chunk, BG=BG)        # [BH,L,dv+1]
+        Oa = _fwd_aug_tiled(q, k, v, wg, rg, chunk=chunk, BG=BG)  # [BH,L,dv+1] — D-tiled, any dqk
         ctx.save_for_backward(q, k, v, wg, rg)
         ctx.bwd_chunk, ctx.BG = bwd_chunk, BG
         return Oa[..., :dv].to(q.dtype)

@@ -108,7 +108,7 @@ if __name__ == "__main__":
     if not torch.cuda.is_available():
         P("SKIP: needs CUDA"); sys.exit(0)
     P("device: " + torch.cuda.get_device_name(0))
-    Ks = [16, 64, 128]                          # <=64 regime + beyond; small set for fast iteration
+    Ks = [16, 64, 128, 256, 512]                # <=64 regime + well beyond (based/rebased + headroom)
     o = check_oracle_grads()
     f = check_forward(Ks)
     b = check_backward(Ks)
