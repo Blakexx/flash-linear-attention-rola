@@ -107,7 +107,10 @@ def chunk_rola_fwd(q, k, v, r, w, g=None, scale=None, chunk_size=64):
     # which also removes the sm75 d_v<=15 envelope. Device tiering, not a fallback: each hardware
     # class runs its measured-fastest verified implementation.
     from fla_rola.ops.simple_gla.rola import _BIG_SMEM
-    if qf.is_cuda and K <= 64 and _BIG_SMEM:
+    # Feature-tiled kernels (BD autotune knob, SRAM-fit empirically) handle ANY K — no K<=64 gate.
+    # _BIG_SMEM stays: small-smem devices (sm75/T4) dispatch to the cuBLAS-backed torch core, which
+    # MEASURES faster there (device tiering, not a fallback).
+    if qf.is_cuda and _BIG_SMEM:
         if ldf is None:
             from fla_rola.ops.simple_gla.rola import rola_rla_triton
             O = rola_rla_triton(qf, kf, vf, rf, wf, chunk=chunk_size)
