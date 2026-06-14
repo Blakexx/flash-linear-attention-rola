@@ -264,79 +264,114 @@ def rola_rla_triton(q, k, v, r, w, chunk=None, bwd_chunk=16, BG=16):
 _GLA_FLOOR = -2.5   # per-token log-decay floor (retention ≥ 8.2%/tok); fp32-safe for BT≤32
 
 
-@triton.autotune(configs=_AT_CFGS, key=_AT_KEY, **autotune_cache_kwargs)
 @triton.jit
-def _rola_gla_fwd_tiled(q_ptr, k_ptr, v_ptr, wg_ptr, rg_ptr, ld_ptr, outa_ptr,
+def _rola_gla_fwd_intra(q_ptr, k_ptr, v_ptr, wg_ptr, rg_ptr, ld_ptr, outa_ptr,
                         L, dqk, dv, nc,
                         sq_b, sq_l, sq_d, sv_b, sv_l, sv_d, sg_b, sg_l, sg_c,
                         soa_b, soa_n, soa_l, soa_v,
-                        BT: tl.constexpr, BD: tl.constexpr, BV: tl.constexpr,
+                        BT: tl.constexpr, BK: tl.constexpr, BV: tl.constexpr,
+                        BG: tl.constexpr, ND: tl.constexpr):
+    """GLA intra-chunk routed readout for one (batch, state-block, chunk). Same as the RLA intra but
+    the routing gram uses the decayed gates rt=rg·e^a, wt=wg·e^-a (a = intra-chunk cumsum of ld). The
+    [BT,BT] content gram is built by looping BK-blocks of the feature dim → SRAM bounded by BK."""
+    b = tl.program_id(0); sb = tl.program_id(1); t = tl.program_id(2)
+    offs_t = tl.arange(0, BT); offs_v = tl.arange(0, BV)
+    offs_c = sb * BG + tl.arange(0, BG); cmask = offs_c < nc
+    rows = t * BT + offs_t; rmask = rows < L
+    G = tl.zeros([BT, BT], dtype=tl.float32)
+    for d0 in range(ND):
+        offs_d = d0 * BK + tl.arange(0, BK); dmask = offs_d < dqk
+        qc = tl.load(q_ptr + b*sq_b + rows[:, None]*sq_l + offs_d[None, :]*sq_d,
+                     mask=rmask[:, None] & dmask[None, :], other=0.0)
+        kc = tl.load(k_ptr + b*sq_b + rows[:, None]*sq_l + offs_d[None, :]*sq_d,
+                     mask=rmask[:, None] & dmask[None, :], other=0.0)
+        G += tl.dot(qc, tl.trans(kc))
+    rgc = tl.load(rg_ptr + b*sg_b + rows[:, None]*sg_l + offs_c[None, :]*sg_c,
+                  mask=rmask[:, None] & cmask[None, :], other=0.0)
+    wgc = tl.load(wg_ptr + b*sg_b + rows[:, None]*sg_l + offs_c[None, :]*sg_c,
+                  mask=rmask[:, None] & cmask[None, :], other=0.0)
+    ldc = tl.load(ld_ptr + b*sg_b + rows[:, None]*sg_l + offs_c[None, :]*sg_c,
+                  mask=rmask[:, None] & cmask[None, :], other=0.0)
+    vc = tl.load(v_ptr + b*sv_b + rows[:, None]*sv_l + offs_v[None, :]*sv_d,
+                 mask=rmask[:, None] & (offs_v[None, :] < dv), other=0.0)
+    vc += tl.where((offs_v[None, :] == dv) & rmask[:, None], 1.0, 0.0)
+    a = tl.cumsum(ldc, axis=0)
+    rt = rgc * tl.exp(a)
+    wt = wgc * tl.exp(-a)
+    R = tl.dot(rt, tl.trans(wt))
+    causal = (offs_t[:, None] >= offs_t[None, :]) & rmask[:, None] & rmask[None, :]
+    A = G * R * causal
+    o = tl.dot(A.to(vc.dtype), vc)
+    tl.atomic_add(outa_ptr + b*soa_b + sb*soa_n + rows[:, None]*soa_l + offs_v[None, :]*soa_v,
+                  o, mask=rmask[:, None] & (offs_v[None, :] < dv + 1))
+
+
+@triton.jit
+def _rola_gla_fwd_inter(q_ptr, k_ptr, v_ptr, wg_ptr, rg_ptr, ld_ptr, outa_ptr,
+                        L, dqk, dv, nc,
+                        sq_b, sq_l, sq_d, sv_b, sv_l, sv_d, sg_b, sg_l, sg_c,
+                        soa_b, soa_n, soa_l, soa_v,
+                        BT: tl.constexpr, BK: tl.constexpr, BV: tl.constexpr,
                         BG: tl.constexpr, NCH: tl.constexpr):
-    b = tl.program_id(0)
-    sb = tl.program_id(1)
-    dvp = dv + 1
-    offs_t = tl.arange(0, BT)
-    offs_d = tl.arange(0, BD)
-    offs_v = tl.arange(0, BV)
-    offs_c = sb * BG + tl.arange(0, BG)
-    dmask = offs_d < dqk
-    cmask = offs_c < nc
-    Sflat = tl.zeros([BD, BG * BV], dtype=tl.float32)
+    """GLA inter-chunk (state) contribution for one (batch, state-block, FEATURE-block d0). Carries
+    this feature-block's slice Sd[BK, BG*BV] across chunks → SRAM bounded by BK, not dqk. The state
+    decays by decvec = e^Λ (Λ = chunk-total ld) each chunk; the read uses rt = rg·e^a. The decay is
+    d-independent, so each feature-block applies the same decvec; partials sum via atomic_add."""
+    b = tl.program_id(0); sb = tl.program_id(1); d0 = tl.program_id(2)
+    offs_t = tl.arange(0, BT); offs_v = tl.arange(0, BV)
+    offs_d = d0 * BK + tl.arange(0, BK); dmask = offs_d < dqk
+    offs_c = sb * BG + tl.arange(0, BG); cmask = offs_c < nc
+    Sd = tl.zeros([BK, BG * BV], dtype=tl.float32)
     for t in range(NCH):
-        rows = t * BT + offs_t
-        rmask = rows < L
-        qc = tl.load(q_ptr + b * sq_b + rows[:, None] * sq_l + offs_d[None, :] * sq_d,
+        rows = t * BT + offs_t; rmask = rows < L
+        qc = tl.load(q_ptr + b*sq_b + rows[:, None]*sq_l + offs_d[None, :]*sq_d,
                      mask=rmask[:, None] & dmask[None, :], other=0.0)
-        kc = tl.load(k_ptr + b * sq_b + rows[:, None] * sq_l + offs_d[None, :] * sq_d,
-                     mask=rmask[:, None] & dmask[None, :], other=0.0)
-        vc = tl.load(v_ptr + b * sv_b + rows[:, None] * sv_l + offs_v[None, :] * sv_d,
-                     mask=rmask[:, None] & (offs_v[None, :] < dv), other=0.0)
-        vc += tl.where((offs_v[None, :] == dv) & rmask[:, None], 1.0, 0.0)
-        rgc = tl.load(rg_ptr + b * sg_b + rows[:, None] * sg_l + offs_c[None, :] * sg_c,
+        rgc = tl.load(rg_ptr + b*sg_b + rows[:, None]*sg_l + offs_c[None, :]*sg_c,
                       mask=rmask[:, None] & cmask[None, :], other=0.0)
-        wgc = tl.load(wg_ptr + b * sg_b + rows[:, None] * sg_l + offs_c[None, :] * sg_c,
-                      mask=rmask[:, None] & cmask[None, :], other=0.0)
-        ldc = tl.load(ld_ptr + b * sg_b + rows[:, None] * sg_l + offs_c[None, :] * sg_c,
+        ldc = tl.load(ld_ptr + b*sg_b + rows[:, None]*sg_l + offs_c[None, :]*sg_c,
                       mask=rmask[:, None] & cmask[None, :], other=0.0)
         a = tl.cumsum(ldc, axis=0)
         rt = rgc * tl.exp(a)
-        wt = wgc * tl.exp(-a)
-        G = tl.dot(qc, tl.trans(kc))
-        R = tl.dot(rt, tl.trans(wt))
-        causal = (offs_t[:, None] >= offs_t[None, :]) & rmask[:, None] & rmask[None, :]
-        A = G * R * causal
-        o_intra = tl.dot(A.to(vc.dtype), vc)
-        P = tl.dot(qc, Sflat.to(qc.dtype))
+        P = tl.dot(qc, Sd.to(qc.dtype))
         P3 = tl.reshape(P, [BT, BG, BV])
         o_inter = tl.sum(P3 * rt[:, :, None], axis=1)
-        o = o_intra + o_inter
-        tl.store(outa_ptr + b * soa_b + sb * soa_n + rows[:, None] * soa_l + offs_v[None, :] * soa_v,
-                 o, mask=rmask[:, None] & (offs_v[None, :] < dvp))
+        tl.atomic_add(outa_ptr + b*soa_b + sb*soa_n + rows[:, None]*soa_l + offs_v[None, :]*soa_v,
+                      o_inter, mask=rmask[:, None] & (offs_v[None, :] < dv + 1))
+        kc = tl.load(k_ptr + b*sq_b + rows[:, None]*sq_l + offs_d[None, :]*sq_d,
+                     mask=rmask[:, None] & dmask[None, :], other=0.0)
+        vc = tl.load(v_ptr + b*sv_b + rows[:, None]*sv_l + offs_v[None, :]*sv_d,
+                     mask=rmask[:, None] & (offs_v[None, :] < dv), other=0.0)
+        vc += tl.where((offs_v[None, :] == dv) & rmask[:, None], 1.0, 0.0)
+        wgc = tl.load(wg_ptr + b*sg_b + rows[:, None]*sg_l + offs_c[None, :]*sg_c,
+                      mask=rmask[:, None] & cmask[None, :], other=0.0)
         Lam = tl.sum(tl.where(offs_t[:, None] == (BT - 1), a, 0.0), axis=0)
         w_end = wgc * tl.exp(Lam[None, :] - a)
         WV = tl.reshape(w_end[:, :, None] * vc[:, None, :], [BT, BG * BV])
         decvec = tl.reshape(tl.exp(Lam)[:, None] * tl.full([BG, BV], 1.0, tl.float32), [BG * BV])
-        Sflat = decvec[None, :] * Sflat + tl.dot(tl.trans(kc), WV.to(kc.dtype))
+        Sd = decvec[None, :] * Sd + tl.dot(tl.trans(kc), WV.to(kc.dtype))
 
 
-def _gla_fwd_aug(q, k, v, wg, rg, ld, chunk, BG):
-    """GLA Triton forward, AUGMENTED [BH,L,dv+1] (num | den), summed over state-blocks."""
+def _gla_fwd_aug(q, k, v, wg, rg, ld, chunk, BG, BK=64):
+    """GLA Triton forward, AUGMENTED [BH,L,dv+1] (num | den), summed over state-blocks. D-tiled
+    (intra d-loops the gram; inter carries an Sd[BK,*] slice per feature-block) so SRAM is bounded by
+    BK and ANY dqk fits — mirrors the RLA _fwd_aug_tiled, with the GLA decay."""
     B, L, dqk = q.shape
     dv = v.shape[-1]
     nc = wg.shape[-1]
     ld = ld.clamp(min=_GLA_FLOOR).contiguous()
-    BD = max(16, triton.next_power_of_2(dqk))
     BV = max(16, triton.next_power_of_2(dv + 1))
+    ND = triton.cdiv(dqk, BK)
     NB = triton.cdiv(nc, BG)
     NCH = triton.cdiv(L, chunk)
     q, k, v, wg, rg = [x.contiguous() for x in (q, k, v, wg, rg)]
     out_aug = torch.zeros(B, NB, L, BV, device=q.device, dtype=torch.float32)
-    _rola_gla_fwd_tiled[(B, NB)](
-        q, k, v, wg, rg, ld, out_aug, L, dqk, dv, nc,
-        q.stride(0), q.stride(1), q.stride(2), v.stride(0), v.stride(1), v.stride(2),
-        wg.stride(0), wg.stride(1), wg.stride(2),
-        out_aug.stride(0), out_aug.stride(1), out_aug.stride(2), out_aug.stride(3),
-        BT=chunk, BD=BD, BV=BV, BG=BG, NCH=NCH)
+    strides = (q.stride(0), q.stride(1), q.stride(2), v.stride(0), v.stride(1), v.stride(2),
+               wg.stride(0), wg.stride(1), wg.stride(2),
+               out_aug.stride(0), out_aug.stride(1), out_aug.stride(2), out_aug.stride(3))
+    _rola_gla_fwd_intra[(B, NB, NCH)](q, k, v, wg, rg, ld, out_aug, L, dqk, dv, nc, *strides,
+                                      BT=chunk, BK=BK, BV=BV, BG=BG, ND=ND)
+    _rola_gla_fwd_inter[(B, NB, ND)](q, k, v, wg, rg, ld, out_aug, L, dqk, dv, nc, *strides,
+                                     BT=chunk, BK=BK, BV=BV, BG=BG, NCH=NCH)
     return out_aug[..., :dv + 1].sum(1)
 
 
@@ -595,7 +630,8 @@ def _par_grad_rla_kwv(q_ptr, k_ptr, v_ptr, wg_ptr, rg_ptr, g_ptr, dSa_ptr, dk_pt
              dv_intra + dv_wr, mask=rmask[:, None] & (offs_v[None, :] < dv))
 
 
-@triton.autotune(configs=_AT_CFGS, key=_AT_KEY, **autotune_cache_kwargs)
+@triton.autotune(configs=_BWD_CFGS, key=_AT_KEY,
+                 prune_configs_by={'early_config_prune': _prune_bwd_bd}, **autotune_cache_kwargs)
 @triton.jit
 def _par_grad_gla_qr(q_ptr, k_ptr, v_ptr, wg_ptr, rg_ptr, ld_ptr, g_ptr, Sb_ptr,
                      dq_ptr, drg_ptr, dart_ptr,
@@ -604,21 +640,21 @@ def _par_grad_gla_qr(q_ptr, k_ptr, v_ptr, wg_ptr, rg_ptr, ld_ptr, g_ptr, Sb_ptr,
                      ssb_b, ssb_n, ssb_t, ssb_d, ssb_e,
                      sdq_b, sdq_n, sdq_l, sdq_d, sdr_b, sdr_l, sdr_c, sda_b, sda_l, sda_c,
                      BT: tl.constexpr, BD: tl.constexpr, BV: tl.constexpr, BG: tl.constexpr, NCH: tl.constexpr):
+    # D-tiled: dq is feature-indexed (per BD-block); drg/dart need the full content gram G + QS,
+    # accumulated over the BD-block loop. dG = P*D*caus is d-independent so it stays before the loop;
+    # dD needs the full G so it follows. BD is an autotune knob; ND follows from dqk (runtime).
+    ND = tl.cdiv(dqk, BD)
     b = tl.program_id(0)
     sb = tl.program_id(1)
     t = tl.program_id(2)
     dvp = dv + 1
     offs_t = tl.arange(0, BT)
-    offs_d = tl.arange(0, BD)
     offs_v = tl.arange(0, BV)
     offs_e = tl.arange(0, BG * BV)
     offs_c = sb * BG + tl.arange(0, BG)
-    dmask = offs_d < dqk
     cmask = offs_c < nc
     rows = t * BT + offs_t
     rmask = rows < L
-    qc = tl.load(q_ptr + b*sq_b + rows[:, None]*sq_l + offs_d[None, :]*sq_d, mask=rmask[:, None] & dmask[None, :], other=0.0)
-    kc = tl.load(k_ptr + b*sq_b + rows[:, None]*sq_l + offs_d[None, :]*sq_d, mask=rmask[:, None] & dmask[None, :], other=0.0)
     v1 = tl.load(v_ptr + b*sv_b + rows[:, None]*sv_l + offs_v[None, :]*sv_d,
                  mask=rmask[:, None] & (offs_v[None, :] < dv), other=0.0)
     v1 += tl.where((offs_v[None, :] == dv) & rmask[:, None], 1.0, 0.0)
@@ -627,32 +663,40 @@ def _par_grad_gla_qr(q_ptr, k_ptr, v_ptr, wg_ptr, rg_ptr, ld_ptr, g_ptr, Sb_ptr,
     ldc = tl.load(ld_ptr + b*sg_b + rows[:, None]*sg_l + offs_c[None, :]*sg_c, mask=rmask[:, None] & cmask[None, :], other=0.0)
     gc = tl.load(g_ptr + b*sgr_b + rows[:, None]*sgr_l + offs_v[None, :]*sgr_d,
                  mask=rmask[:, None] & (offs_v[None, :] < dvp), other=0.0)
-    Sb = tl.load(Sb_ptr + b*ssb_b + sb*ssb_n + t*ssb_t + offs_d[:, None]
-                 * ssb_d + offs_e[None, :]*ssb_e, mask=dmask[:, None], other=0.0)
     a = tl.cumsum(ldc, axis=0)
     ea = tl.exp(a)
     rt = rgc * ea
     wt = wgc * tl.exp(-a)
     caus = (offs_t[:, None] >= offs_t[None, :]) & rmask[:, None] & rmask[None, :]
-    G = tl.dot(qc, tl.trans(kc))
     D = tl.dot(rt, tl.trans(wt))
     P = tl.dot(gc, tl.trans(v1))
     dG = P * D * caus
-    dD = P * G * caus
-    dq_intra = tl.dot(dG.to(kc.dtype), kc)
-    drt_intra = tl.dot(dD.to(wt.dtype), wt)
     rt_g = tl.reshape(rt[:, :, None] * gc[:, None, :], [BT, BG * BV])
-    dq_inter = tl.dot(rt_g.to(Sb.dtype), tl.trans(Sb))
-    QS = tl.dot(qc, Sb.to(qc.dtype))
+    G = tl.zeros([BT, BT], dtype=tl.float32)
+    QS = tl.zeros([BT, BG * BV], dtype=tl.float32)
+    for d0b in range(ND):
+        offs_d = d0b * BD + tl.arange(0, BD)
+        dmask = offs_d < dqk
+        qc = tl.load(q_ptr + b*sq_b + rows[:, None]*sq_l + offs_d[None, :]*sq_d, mask=rmask[:, None] & dmask[None, :], other=0.0)
+        kc = tl.load(k_ptr + b*sq_b + rows[:, None]*sq_l + offs_d[None, :]*sq_d, mask=rmask[:, None] & dmask[None, :], other=0.0)
+        Sb = tl.load(Sb_ptr + b*ssb_b + sb*ssb_n + t*ssb_t + offs_d[:, None]
+                     * ssb_d + offs_e[None, :]*ssb_e, mask=dmask[:, None], other=0.0)
+        dq_intra = tl.dot(dG.to(kc.dtype), kc)
+        dq_inter = tl.dot(rt_g.to(Sb.dtype), tl.trans(Sb))
+        tl.store(dq_ptr + b*sdq_b + sb*sdq_n + rows[:, None]*sdq_l + offs_d[None, :]*sdq_d,
+                 dq_intra + dq_inter, mask=rmask[:, None] & dmask[None, :])
+        G += tl.dot(qc, tl.trans(kc))
+        QS += tl.dot(qc, Sb.to(qc.dtype))
+    dD = P * G * caus
+    drt_intra = tl.dot(dD.to(wt.dtype), wt)
     drt_inter = tl.sum(tl.reshape(QS, [BT, BG, BV]) * gc[:, None, :], axis=2)
     drt = drt_intra + drt_inter
-    tl.store(dq_ptr + b*sdq_b + sb*sdq_n + rows[:, None]*sdq_l + offs_d[None, :]*sdq_d,
-             dq_intra + dq_inter, mask=rmask[:, None] & dmask[None, :])
     tl.store(drg_ptr + b*sdr_b + rows[:, None]*sdr_l + offs_c[None, :]*sdr_c, drt * ea, mask=rmask[:, None] & cmask[None, :])
     tl.store(dart_ptr + b*sda_b + rows[:, None]*sda_l + offs_c[None, :]*sda_c, drt * rt, mask=rmask[:, None] & cmask[None, :])
 
 
-@triton.autotune(configs=_AT_CFGS, key=_AT_KEY, **autotune_cache_kwargs)
+@triton.autotune(configs=_BWD_CFGS, key=_AT_KEY,
+                 prune_configs_by={'early_config_prune': _prune_bwd_bd}, **autotune_cache_kwargs)
 @triton.jit
 def _par_grad_gla_kwv(q_ptr, k_ptr, v_ptr, wg_ptr, rg_ptr, ld_ptr, g_ptr, dSa_ptr,
                       dk_ptr, dwg_ptr, dv_ptr, dakwv_ptr, dawend_ptr,
@@ -662,23 +706,22 @@ def _par_grad_gla_kwv(q_ptr, k_ptr, v_ptr, wg_ptr, rg_ptr, ld_ptr, g_ptr, dSa_pt
                       sdk_b, sdk_n, sdk_l, sdk_d, sdw_b, sdw_l, sdw_c, sdv_b, sdv_n, sdv_l, sdv_d,
                       sdaw_b, sdaw_l, sdaw_c, sdwe_b, sdwe_l, sdwe_c,
                       BT: tl.constexpr, BD: tl.constexpr, BV: tl.constexpr, BG: tl.constexpr, NCH: tl.constexpr):
-    # dLam's Σ(dSa∘Sb) term is reduced in TORCH from the stored buffers, so this kernel loads only
-    # dSa — one state tile, same working set as the RLA kwv (the Sb load caused register spill).
+    # D-tiled: dk is feature-indexed (per BD-block); dwg/dv/da* need the full G + KS, accumulated over
+    # the BD-block loop. dG = P*D*caus is d-independent (used for dk_intra in the loop); A and dD need
+    # the full G so they follow. dLam's Σ(dSa∘Sb) term is still reduced in TORCH from the buffers.
+    # BD is an autotune knob; ND follows from dqk (runtime).
+    ND = tl.cdiv(dqk, BD)
     b = tl.program_id(0)
     sb = tl.program_id(1)
     t = tl.program_id(2)
     dvp = dv + 1
     offs_t = tl.arange(0, BT)
-    offs_d = tl.arange(0, BD)
     offs_v = tl.arange(0, BV)
     offs_e = tl.arange(0, BG * BV)
     offs_c = sb * BG + tl.arange(0, BG)
-    dmask = offs_d < dqk
     cmask = offs_c < nc
     rows = t * BT + offs_t
     rmask = rows < L
-    qc = tl.load(q_ptr + b*sq_b + rows[:, None]*sq_l + offs_d[None, :]*sq_d, mask=rmask[:, None] & dmask[None, :], other=0.0)
-    kc = tl.load(k_ptr + b*sq_b + rows[:, None]*sq_l + offs_d[None, :]*sq_d, mask=rmask[:, None] & dmask[None, :], other=0.0)
     v1 = tl.load(v_ptr + b*sv_b + rows[:, None]*sv_l + offs_v[None, :]*sv_d,
                  mask=rmask[:, None] & (offs_v[None, :] < dv), other=0.0)
     v1 += tl.where((offs_v[None, :] == dv) & rmask[:, None], 1.0, 0.0)
@@ -687,8 +730,6 @@ def _par_grad_gla_kwv(q_ptr, k_ptr, v_ptr, wg_ptr, rg_ptr, ld_ptr, g_ptr, dSa_pt
     ldc = tl.load(ld_ptr + b*sg_b + rows[:, None]*sg_l + offs_c[None, :]*sg_c, mask=rmask[:, None] & cmask[None, :], other=0.0)
     gc = tl.load(g_ptr + b*sgr_b + rows[:, None]*sgr_l + offs_v[None, :]*sgr_d,
                  mask=rmask[:, None] & (offs_v[None, :] < dvp), other=0.0)
-    dSa = tl.load(dSa_ptr + b*ssb_b + sb*ssb_n + t*ssb_t +
-                  offs_d[:, None]*ssb_d + offs_e[None, :]*ssb_e, mask=dmask[:, None], other=0.0)
     a = tl.cumsum(ldc, axis=0)
     ena = tl.exp(-a)
     rt = rgc * tl.exp(a)
@@ -696,27 +737,36 @@ def _par_grad_gla_kwv(q_ptr, k_ptr, v_ptr, wg_ptr, rg_ptr, ld_ptr, g_ptr, dSa_pt
     Lam = tl.sum(tl.where(offs_t[:, None] == (BT - 1), a, 0.0), axis=0)
     w_end = wgc * tl.exp(Lam[None, :] - a)
     caus = (offs_t[:, None] >= offs_t[None, :]) & rmask[:, None] & rmask[None, :]
-    G = tl.dot(qc, tl.trans(kc))
-    P = tl.dot(gc, tl.trans(v1))
     D = tl.dot(rt, tl.trans(wt))
-    A = G * D * caus
+    P = tl.dot(gc, tl.trans(v1))
     dG = P * D * caus
+    wv1 = tl.reshape(w_end[:, :, None] * v1[:, None, :], [BT, BG * BV])
+    G = tl.zeros([BT, BT], dtype=tl.float32)
+    KS = tl.zeros([BT, BG * BV], dtype=tl.float32)
+    for d0b in range(ND):
+        offs_d = d0b * BD + tl.arange(0, BD)
+        dmask = offs_d < dqk
+        qc = tl.load(q_ptr + b*sq_b + rows[:, None]*sq_l + offs_d[None, :]*sq_d, mask=rmask[:, None] & dmask[None, :], other=0.0)
+        kc = tl.load(k_ptr + b*sq_b + rows[:, None]*sq_l + offs_d[None, :]*sq_d, mask=rmask[:, None] & dmask[None, :], other=0.0)
+        dSa = tl.load(dSa_ptr + b*ssb_b + sb*ssb_n + t*ssb_t +
+                      offs_d[:, None]*ssb_d + offs_e[None, :]*ssb_e, mask=dmask[:, None], other=0.0)
+        dk_intra = tl.dot(tl.trans(dG).to(qc.dtype), qc)
+        dk_KV = tl.dot(wv1.to(dSa.dtype), tl.trans(dSa))
+        tl.store(dk_ptr + b*sdk_b + sb*sdk_n + rows[:, None]*sdk_l + offs_d[None, :]*sdk_d,
+                 dk_intra + dk_KV, mask=rmask[:, None] & dmask[None, :])
+        G += tl.dot(qc, tl.trans(kc))
+        KS += tl.dot(kc, dSa.to(kc.dtype))
+    A = G * D * caus
     dD = P * G * caus
-    dk_intra = tl.dot(tl.trans(dG).to(qc.dtype), qc)
-    dwt = tl.dot(tl.trans(dD).to(rt.dtype), rt)
     dv_intra = tl.dot(tl.trans(A).to(gc.dtype), gc)
-    KS = tl.dot(kc, dSa.to(kc.dtype))
+    dwt = tl.dot(tl.trans(dD).to(rt.dtype), rt)
     KS3 = tl.reshape(KS, [BT, BG, BV])
     dw_end = tl.sum(KS3 * v1[:, None, :], axis=2)
-    wv1 = tl.reshape(w_end[:, :, None] * v1[:, None, :], [BT, BG * BV])
-    dk_KV = tl.dot(wv1.to(dSa.dtype), tl.trans(dSa))
     dv_KV = tl.sum(w_end[:, :, None] * KS3, axis=1)
     da_wend = -dw_end * w_end
     dwg_wend = dw_end * tl.exp(Lam[None, :] - a)
     dwgc = dwt * ena + dwg_wend
     da_wt = -dwt * wt
-    tl.store(dk_ptr + b*sdk_b + sb*sdk_n + rows[:, None]*sdk_l + offs_d[None, :]*sdk_d,
-             dk_intra + dk_KV, mask=rmask[:, None] & dmask[None, :])
     tl.store(dwg_ptr + b*sdw_b + rows[:, None]*sdw_l + offs_c[None, :]*sdw_c, dwgc, mask=rmask[:, None] & cmask[None, :])
     tl.store(dv_ptr + b*sdv_b + sb*sdv_n + rows[:, None]*sdv_l + offs_v[None, :]*sdv_d,
              dv_intra + dv_KV, mask=rmask[:, None] & (offs_v[None, :] < dv))
@@ -790,21 +840,26 @@ def _bwd_split_gla(q, k, v, wg, rg, ld, g, chunk=None, BG=16):
     dart = torch.empty(B, L, nc, device=q.device, dtype=torch.float32)
     dakwv = torch.empty_like(dart)
     dawend = torch.empty_like(dart)
+    # Scans build Sb/dSa with their own fixed feature block (register accumulator, independent of the
+    # grad kernels' autotuned BD; Sb indexed by absolute feature row). BD (alloc, = next_pow2(dqk)) is
+    # the Sb tensor's real D-dim — kept for the torch dLam reduction below.
+    BK_scan = min(64, BD)
+    ND_scan = triton.cdiv(dqk, BK_scan)
     sS = (Sb.stride(0), Sb.stride(1), Sb.stride(2), Sb.stride(3), Sb.stride(4))
     sq = (q.stride(0), q.stride(1), q.stride(2))
     sv = (v.stride(0), v.stride(1), v.stride(2))
     sg = (wg.stride(0), wg.stride(1), wg.stride(2))
     sgr = (g.stride(0), g.stride(1), g.stride(2))
-    _scan_S[(B, NB)](k, v, wg, ld, Sb, L, dqk, dv, nc, *sq, *sv, *sg, *sS,
-                     USE_G=True, BT=chunk, BD=BD, BV=BV, BG=BG, NCH=NCH)
-    _scan_dS[(B, NB)](q, rg, ld, g, dSa, L, dqk, dv, nc, *sq, *sg, *sgr, *sS,
-                      USE_G=True, BT=chunk, BD=BD, BV=BV, BG=BG, NCH=NCH)
+    _scan_S[(B, NB, ND_scan)](k, v, wg, ld, Sb, L, dqk, dv, nc, *sq, *sv, *sg, *sS,
+                              USE_G=True, BT=chunk, BD=BK_scan, BV=BV, BG=BG, NCH=NCH)
+    _scan_dS[(B, NB, ND_scan)](q, rg, ld, g, dSa, L, dqk, dv, nc, *sq, *sg, *sgr, *sS,
+                               USE_G=True, BT=chunk, BD=BK_scan, BV=BV, BG=BG, NCH=NCH)
     _par_grad_gla_qr[(B, NB, NCH)](q, k, v, wg, rg, ld, g, Sb, dq, drg, dart, L, dqk, dv, nc,
                                    *sq, *sv, *sg, *sgr, *sS,
                                    dq.stride(0), dq.stride(1), dq.stride(2), dq.stride(
                                        3), drg.stride(0), drg.stride(1), drg.stride(2),
                                    dart.stride(0), dart.stride(1), dart.stride(2),
-                                   BT=chunk, BD=BD, BV=BV, BG=BG, NCH=NCH)
+                                   BT=chunk, BV=BV, BG=BG, NCH=NCH)
     _par_grad_gla_kwv[(B, NB, NCH)](q, k, v, wg, rg, ld, g, dSa, dk, dwg, dvo, dakwv, dawend, L, dqk, dv, nc,
                                     *sq, *sv, *sg, *sgr, *sS,
                                     dk.stride(0), dk.stride(1), dk.stride(2), dk.stride(
@@ -812,7 +867,7 @@ def _bwd_split_gla(q, k, v, wg, rg, ld, g, chunk=None, BG=16):
                                     dvo.stride(0), dvo.stride(1), dvo.stride(2), dvo.stride(3),
                                     dakwv.stride(0), dakwv.stride(1), dakwv.stride(
                                         2), dawend.stride(0), dawend.stride(1), dawend.stride(2),
-                                    BT=chunk, BD=BD, BV=BV, BG=BG, NCH=NCH)
+                                    BT=chunk, BV=BV, BG=BG, NCH=NCH)
     # dLam in torch from the stored state buffers (keeps the kwv kernel one-state-tile):
     #   dLam[b,t,c] = e^{Λ_t,c} Σ_{d,v} (dSa[t]∘Sb[t])_{d,(c,v)}  −  Σ_{j∈chunk t} da_wend[j,c]
     pad = (-L) % chunk
