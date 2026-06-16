@@ -11,116 +11,6 @@ from fla_rola.ops.utils import chunk_local_cumsum, prepare_chunk_indices
 from fla_rola.utils import autocast_custom_bwd, autocast_custom_fwd, input_guard
 
 
-# ----------------------------------------------------------------------------
-# RoLA routing (additive extension of simple_gla).
-#
-# Routed linear attention shares the content gram G=qkᵀ across `nc` states and
-# modulates it by a routing gram R=Σ_c r_i^c w_j^c (+ optional per-state scalar
-# decay). This is the *un-normalized* readout O = (G∘R∘causal) @ v — the FLA
-# convention; the global denominator (ones-column) is the caller's job, exactly
-# as rola.py already does it. Torch reference mirrors the verified shared-gram
-# algorithms (rola_kernels.chunked_parallel / chunked_gla): the content gram is
-# formed ONCE per chunk (the FLOP win), never materializing the L×nc product nor
-# replicating q/k. Autograd gives exact grads for all of q,k,v,r,w,g. The Triton
-# kernelization (chunk_fwd_h/chunk_fwd_o surgery) mirrors this and is gated against
-# it via rola_fla_dev/check.py.
-# ----------------------------------------------------------------------------
-def _rola_chunk_core(q, k, v, w, r, ld, chunk_size):
-    """Shared-gram routed readout on folded [BH, T, *] tensors. ld=None ⇒ RLA
-    (additive, chunk-parallel cumsum scan); ld given ⇒ scalar-gated GLA (per-state
-    decayed scan over chunks). Returns un-normalized O [BH, T, V]."""
-    BH, T, K = q.shape
-    V = v.shape[-1]
-    nc = w.shape[-1]
-    if ld is None:
-        # RLA: vectorized chunk-parallel (mirrors chunked_parallel, no normalization).
-        pad = (-T) % chunk_size
-        if pad:
-            q = torch.nn.functional.pad(q, (0, 0, 0, pad))
-            k = torch.nn.functional.pad(k, (0, 0, 0, pad))
-            v = torch.nn.functional.pad(v, (0, 0, 0, pad))
-            w = torch.nn.functional.pad(w, (0, 0, 0, pad))
-            r = torch.nn.functional.pad(r, (0, 0, 0, pad))
-        Tp = T + pad
-        nch = Tp // chunk_size
-        C = chunk_size
-        qc = q.view(BH, nch, C, K)
-        kc = k.view(BH, nch, C, K)
-        vc = v.view(BH, nch, C, V)
-        rc = r.view(BH, nch, C, nc)
-        wc = w.view(BH, nch, C, nc)
-        G = torch.einsum('bnid,bnjd->bnij', qc, kc)
-        R = torch.einsum('bnic,bnjc->bnij', rc, wc)
-        causal = torch.tril(torch.ones(C, C, device=q.device, dtype=q.dtype))
-        A = G * R * causal
-        o_intra = torch.einsum('bnij,bnjv->bniv', A, vc)
-        KV = torch.einsum('bnjc,bnjd,bnjv->bncdv', wc, kc, vc)        # [BH,nch,nc,K,V]
-        S_before = torch.cumsum(KV, dim=1) - KV                       # exclusive prefix over chunks
-        M = torch.einsum('bnic,bncdv->bnidv', rc, S_before)
-        o_inter = torch.einsum('bnid,bnidv->bniv', qc, M)
-        O = (o_intra + o_inter).reshape(BH, Tp, V)[:, :T]
-        return O
-    # GLA: per-state scalar decay, sequential decayed scan over chunks (mirrors chunked_gla).
-    S = q.new_zeros(BH, nc, K, V)
-    outs = []
-    for c0 in range(0, T, chunk_size):
-        c1 = min(c0 + chunk_size, T)
-        Cc = c1 - c0
-        qcc, kcc, vcc = q[:, c0:c1], k[:, c0:c1], v[:, c0:c1]
-        rcc, wcc, ldc = r[:, c0:c1], w[:, c0:c1], ld[:, c0:c1]
-        a = torch.cumsum(ldc, dim=1)                                  # chunk-local cumulative log-decay
-        rt = rcc * torch.exp(a)                                       # r~ = r e^{a}
-        wt = wcc * torch.exp(-a)                                      # w~ = w e^{-a}
-        G = torch.einsum('bid,bjd->bij', qcc, kcc)
-        D = torch.einsum('bic,bjc->bij', rt, wt)
-        causal = torch.tril(torch.ones(Cc, Cc, device=q.device, dtype=q.dtype))
-        Aw = G * D * causal
-        o_intra = torch.einsum('bij,bjv->biv', Aw, vcc)
-        M = torch.einsum('bic,bcdv->bidv', rt, S)                     # rt carries e^{a_i}
-        o_inter = torch.einsum('bid,bidv->biv', qcc, M)
-        outs.append(o_intra + o_inter)
-        Lam = a[:, -1, :]                                             # chunk-total log-decay [BH,nc]
-        w_end = wcc * torch.exp(Lam[:, None, :] - a)
-        KV = torch.einsum('bjc,bjd,bjv->bcdv', w_end, kcc, vcc)
-        S = torch.exp(Lam)[:, :, None, None] * S + KV
-    return torch.cat(outs, dim=1)
-
-
-def chunk_rola_fwd(q, k, v, r, w, g=None, scale=None, chunk_size=64):
-    """RoLA routed forward. q,k:[B,T,H,K] v:[B,T,H,V] r,w:[B,T,H,nc] read/write
-    gates; g:[B,T,H,nc] per-state log-decay (GLA) or None (RLA). Returns the
-    un-normalized routed readout [B,T,H,V]."""
-    B, T, H, K = q.shape
-    V = v.shape[-1]
-    nc = r.shape[-1]
-    if scale is None:
-        scale = K ** -0.5
-
-    def fold(t, d): return t.permute(0, 2, 1, 3).reshape(B * H, T, d)
-    qf = fold(q, K) * scale
-    kf, vf, rf, wf = fold(k, K), fold(v, V), fold(r, nc), fold(w, nc)
-    ldf = fold(g, nc) if g is not None else None
-    # Triton fast path on CUDA with feature dim within tl.dot block limits, on GPUs with
-    # ampere-class shared memory. On small-smem devices (sm75/T4, 64KB) the Triton kernels only fit
-    # at chunk=16/stages=1, where they MEASURE ~25% slower than the cuBLAS-backed torch core
-    # (3.51 vs 2.82 it/s on the nc=256 MQAR cell) — so those devices dispatch to the torch core,
-    # which also removes the sm75 d_v<=15 envelope. Device tiering, not a fallback: each hardware
-    # class runs its measured-fastest verified implementation.
-    from fla_rola.ops.simple_gla.rola import _BIG_SMEM
-    # Feature-tiled kernels (BD autotune knob, SRAM-fit empirically) handle ANY K — no K<=64 gate.
-    # _BIG_SMEM stays: small-smem devices (sm75/T4) dispatch to the cuBLAS-backed torch core, which
-    # MEASURES faster there (device tiering, not a fallback).
-    if qf.is_cuda and _BIG_SMEM:
-        if ldf is None:
-            from fla_rola.ops.simple_gla.rola import rola_rla_triton
-            O = rola_rla_triton(qf, kf, vf, rf, wf, chunk=chunk_size)
-        else:
-            from fla_rola.ops.simple_gla.rola import rola_gla_triton
-            O = rola_gla_triton(qf, kf, vf, rf, wf, ldf)
-    else:
-        O = _rola_chunk_core(qf, kf, vf, wf, rf, ldf, chunk_size)
-    return O.reshape(B, H, T, V).permute(0, 2, 1, 3).contiguous()
-
 
 def chunk_simple_gla_fwd(
     q: torch.Tensor,
@@ -322,8 +212,6 @@ def chunk_simple_gla(
     cu_seqlens: torch.LongTensor | None = None,
     cu_seqlens_cpu: torch.LongTensor | None = None,
     head_first: bool = False,
-    r: torch.Tensor | None = None,
-    w: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     r"""
     Args:
@@ -414,21 +302,6 @@ def chunk_simple_gla(
             )
     if scale is None:
         scale = k.shape[-1] ** -0.5
-    if r is not None:
-        # RoLA routed path: additive extension. r=read gate, w=write gate ([B,T,H,nc]);
-        # g (if given) is the per-state log-decay ([B,T,H,nc]) for the scalar-gated (GLA)
-        # variant, else None ⇒ RLA. Un-normalized readout; caller handles normalization.
-        if w is None:
-            raise ValueError("RoLA routed path requires both `r` (read) and `w` (write) gates.")
-        if cu_seqlens is not None or initial_state is not None or output_final_state or g_gamma is not None:
-            raise NotImplementedError(
-                "RoLA routed path does not support cu_seqlens/initial_state/output_final_state/g_gamma yet.")
-        if g is not None and g.shape != r.shape:
-            raise ValueError(f"routed `g` must be per-state [B,T,H,nc] like r/w; got {tuple(g.shape)} vs {tuple(r.shape)}")
-        T = q.shape[1]
-        chunk_size = min(64, max(16, triton.next_power_of_2(T)))
-        o = chunk_rola_fwd(q, k, v, r, w, g=g, scale=scale, chunk_size=chunk_size)
-        return o, None
     o, final_state = ChunkSimpleGLAFunction.apply(
         q,
         k,

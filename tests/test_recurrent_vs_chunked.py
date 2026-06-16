@@ -88,6 +88,16 @@ def _naive(q, k, v, r, w, ld, gla):
     return _rola_global_ref(q, k, v, w, r)
 
 
+def _routed(q, k, v, r, w, ld, nc, norm):
+    """The first-class chunk_rola operator — the third leg of vh == routed-kernel == naive. It owns
+    the whole recipe (den pre-pass, read-gate rescale, numerator-only readout, divide); norm selects
+    global/kappa/per_state. Directly exercises the public method the LM layer calls."""
+    from fla_rola.ops.rola import chunk_rola
+    kap = (torch.full((q.shape[0], q.shape[1], H, 1), KAPPA, device=q.device, dtype=q.dtype)
+           if norm == 'kappa' else None)
+    return chunk_rola(q, k, v, r=r, w=w, g=ld, norm=norm, kappa=kap, scale=1.0)
+
+
 def _relmax(a, b):
     return (a - b).abs().max().item() / (b.abs().max().item() + 1e-9)
 
@@ -105,26 +115,30 @@ def main():
     for gla in (False, True):
         for nc in NCS:
             for norm in ('global', 'kappa', 'per_state'):
-                w_rc, w_cn, w_rn = 0.0, 0.0, 0.0   # rec-vs-chunk, chunk-vs-naive, rec-vs-naive
+                w_rc, w_cn, w_rn, w_kc = 0.0, 0.0, 0.0, 0.0   # rec-chunk, chunk-naive, rec-naive, routed-chunk
+                w_kn = 0.0                                     # routed-naive (global only)
                 for seed in SEEDS:
                     q, k, v, r, w, ld = _mk(64, nc, gla, seed)
                     o_chunk = _chunked(q, k, v, r, w, ld, nc, norm)
                     o_rec = _recurrent(q, k, v, r, w, ld, nc, norm)
+                    o_routed = _routed(q, k, v, r, w, ld, nc, norm)        # the routed (split) kernel
                     w_rc = max(w_rc, _relmax(o_rec, o_chunk))
+                    w_kc = max(w_kc, _relmax(o_routed, o_chunk))           # vh == routed-kernel
                     # naive direct oracle exists for the GLOBAL norm (no vh glue) — the 3-way anchor
                     # that catches a shared vh-expand/combine bug recurrent==chunked alone would miss.
                     if norm == 'global':
                         o_naive = _naive(q, k, v, r, w, ld, gla)
                         w_cn = max(w_cn, _relmax(o_chunk, o_naive))
                         w_rn = max(w_rn, _relmax(o_rec, o_naive))
+                        w_kn = max(w_kn, _relmax(o_routed, o_naive))
                 tag = f"{'GLA' if gla else 'RLA'} nc={nc:<3d} norm={norm}"
                 if norm == 'global':
-                    ok = max(w_rc, w_cn, w_rn) < TOL
+                    ok = max(w_rc, w_cn, w_rn, w_kc, w_kn) < TOL
                     P(f"  {tag:24s} rec==chunk={w_rc:.1e} chunk==naive={w_cn:.1e} rec==naive={w_rn:.1e}"
-                      f"  {'PASS' if ok else 'FAIL'}")
+                      f" routed==chunk={w_kc:.1e} routed==naive={w_kn:.1e}  {'PASS' if ok else 'FAIL'}")
                 else:
-                    ok = w_rc < TOL
-                    P(f"  {tag:24s} rec==chunk={w_rc:.1e} (norm-rescale; naive=global only)"
+                    ok = max(w_rc, w_kc) < TOL
+                    P(f"  {tag:24s} rec==chunk={w_rc:.1e} routed==chunk={w_kc:.1e} (norm-rescale; naive=global only)"
                       f"  {'PASS' if ok else 'FAIL'}")
                 res[tag] = ok
     allok = all(res.values())

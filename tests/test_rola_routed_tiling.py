@@ -20,8 +20,8 @@ import sys
 import torch
 
 from rola import _rola_global_ref, _rola_gla_ref, _rola_perstate_den, _rola_gla_perstate_den
-from fla_rola.ops.simple_gla.rola import (rola_rla_triton, rola_gla_triton,
-                                          rola_perstate_den_triton, rola_perstate_den_gla_triton)
+from fla_rola.ops.rola import (rola_rla_triton, rola_gla_triton,
+                               rola_perstate_den_triton, rola_perstate_den_gla_triton)
 
 DEV = "cuda"
 EPS = 1e-5
@@ -39,12 +39,15 @@ def _unfold(t, B, H):                          # [B*H, L, D] -> [B, L, H, D]
 
 
 def rla_triton_normalized(q, k, v, rg, wg):
-    """[B,L,H,*] -> normalized [B,L,H,dv] via the kernel + ones-column denominator (rola.py's trick)."""
+    """[B,L,H,*] -> normalized [B,L,H,dv] via the SPLIT path (production kappa/global): numerator-only
+    kernel (den=False, BV=next_pow2(dv)) + global denominator reconstructed as Σ_c rgᶜ·dᶜ from the
+    per-state den pre-pass — the ones-column is redundant (= Σ_c rgᶜ·dᶜ). Half the tile width."""
     B, L, H, dv = v.shape
-    v1 = torch.cat([v, torch.ones_like(v[..., :1])], dim=-1)
-    oa = rola_rla_triton(_fold(q), _fold(k), _fold(v1), _fold(rg), _fold(wg))   # [BH,L,dv+1]
-    oa = _unfold(oa, B, H)
-    return oa[..., :dv] / (oa[..., dv:dv + 1] + EPS)
+    qf, kf, rgf, wgf = _fold(q), _fold(k), _fold(rg), _fold(wg)
+    numf = rola_rla_triton(qf, kf, _fold(v), rgf, wgf, den=False)         # [BH,L,dv]
+    d = rola_perstate_den_triton(qf, kf, wgf)                            # [BH,L,nc]
+    denf = (rgf * d).sum(-1, keepdim=True)
+    return _unfold(numf / (denf + EPS), B, H)
 
 
 def _mk(B, L, H, K, nc, dv, dtype, seed=0, with_ld=False):
@@ -62,13 +65,14 @@ def _mk(B, L, H, K, nc, dv, dtype, seed=0, with_ld=False):
 
 
 def gla_triton_normalized(q, k, v, rg, wg, ld):
-    """[B,L,H,*] -> normalized [B,L,H,dv] via the GLA kernel + ones-column denominator (mirrors RLA)."""
+    """[B,L,H,*] -> normalized [B,L,H,dv] via the SPLIT path (mirrors RLA): numerator-only GLA kernel
+    + global den Σ_c rgᶜ·dᶜ from the decayed per-state den pre-pass. r=read=rg, w=write=wg."""
     B, L, H, dv = v.shape
-    v1 = torch.cat([v, torch.ones_like(v[..., :1])], dim=-1)
-    # rola_gla_triton(q,k,v,r,w,ld): r=read=rg, w=write=wg
-    oa = rola_gla_triton(_fold(q), _fold(k), _fold(v1), _fold(rg), _fold(wg), _fold(ld))
-    oa = _unfold(oa, B, H)
-    return oa[..., :dv] / (oa[..., dv:dv + 1] + EPS)
+    qf, kf, rgf, wgf, ldf = _fold(q), _fold(k), _fold(rg), _fold(wg), _fold(ld)
+    numf = rola_gla_triton(qf, kf, _fold(v), rgf, wgf, ldf, den=False)   # [BH,L,dv]
+    d = rola_perstate_den_gla_triton(qf, kf, wgf, ldf)                   # [BH,L,nc]
+    denf = (rgf * d).sum(-1, keepdim=True)
+    return _unfold(numf / (denf + EPS), B, H)
 
 
 def check_oracle_grads():
