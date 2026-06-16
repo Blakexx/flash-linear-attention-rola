@@ -732,19 +732,20 @@ def _par_grad_gla_qr(q_ptr, k_ptr, v_ptr, wg_ptr, rg_ptr, ld_ptr, g_ptr, Sb_ptr,
 @triton.autotune(configs=_BWD_CFGS, key=_AT_KEY,
                  prune_configs_by={'early_config_prune': _prune_bwd_bd}, **autotune_cache_kwargs)
 @triton.jit
-def _par_grad_gla_kwv(q_ptr, k_ptr, v_ptr, wg_ptr, rg_ptr, ld_ptr, g_ptr, dSa_ptr,
-                      dk_ptr, dwg_ptr, dv_ptr, dakwv_ptr, dawend_ptr,
+def _par_grad_gla_kwv(q_ptr, k_ptr, v_ptr, wg_ptr, rg_ptr, ld_ptr, g_ptr, Sb_ptr, dSa_ptr, dart_ptr,
+                      dk_ptr, dwg_ptr, dv_ptr, dld_ptr,
                       L, dqk: tl.constexpr, dv, nc,
                       sq_b, sq_l, sq_d, sv_b, sv_l, sv_d, sg_b, sg_l, sg_c, sgr_b, sgr_l, sgr_d,
                       ssb_b, ssb_n, ssb_t, ssb_d, ssb_e,
                       sdk_b, sdk_n, sdk_l, sdk_d, sdw_b, sdw_l, sdw_c, sdv_b, sdv_n, sdv_l, sdv_d,
-                      sdaw_b, sdaw_l, sdaw_c, sdwe_b, sdwe_l, sdwe_c,
+                      sda_b, sda_l, sda_c,
                       BT: tl.constexpr, BD: tl.constexpr, BV: tl.constexpr, BG: tl.constexpr, NCH: tl.constexpr,
                       DEN: tl.constexpr):
-    # D-tiled: dk is feature-indexed (per BD-block); dwg/dv/da* need the full G + KS, accumulated over
+    # D-tiled: dk is feature-indexed (per BD-block); dwg/dv/dld need the full G + KS, accumulated over
     # the BD-block loop. dG = P*D*caus is d-independent (used for dk_intra in the loop); A and dD need
-    # the full G so they follow. dLam's Σ(dSa∘Sb) term is still reduced in TORCH from the buffers.
-    # BD is an autotune knob; ND follows from dqk (runtime).
+    # the full G so they follow. dLam is now assembled IN-KERNEL (the den-kernel trick): the BD-loop
+    # also accumulates ZdZ = Σ_{d,v}(Sb∘dSa) (the carry-decay adjoint), then da = da_rt+da_wt+da_wend
+    # gets dLam folded into its last row and a reverse-cumsum yields dld — no torch host-side loop.
     ND = tl.cdiv(dqk, BD)
     b = tl.program_id(0)
     sb = tl.program_id(1)
@@ -779,11 +780,14 @@ def _par_grad_gla_kwv(q_ptr, k_ptr, v_ptr, wg_ptr, rg_ptr, ld_ptr, g_ptr, dSa_pt
     wv1 = tl.reshape(w_end[:, :, None] * v1[:, None, :], [BT, BG * BV])
     G = tl.zeros([BT, BT], dtype=tl.float32)
     KS = tl.zeros([BT, BG * BV], dtype=tl.float32)
+    ZdZ = tl.zeros([BG], dtype=tl.float32)
     for d0b in range(ND):
         offs_d = d0b * BD + tl.arange(0, BD)
         dmask = offs_d < dqk
         qc = tl.load(q_ptr + b*sq_b + rows[:, None]*sq_l + offs_d[None, :]*sq_d, mask=rmask[:, None] & dmask[None, :], other=0.0)
         kc = tl.load(k_ptr + b*sq_b + rows[:, None]*sq_l + offs_d[None, :]*sq_d, mask=rmask[:, None] & dmask[None, :], other=0.0)
+        Sb = tl.load(Sb_ptr + b*ssb_b + sb*ssb_n + t*ssb_t +
+                     offs_d[:, None]*ssb_d + offs_e[None, :]*ssb_e, mask=dmask[:, None], other=0.0)
         dSa = tl.load(dSa_ptr + b*ssb_b + sb*ssb_n + t*ssb_t +
                       offs_d[:, None]*ssb_d + offs_e[None, :]*ssb_e, mask=dmask[:, None], other=0.0)
         dk_intra = tl.dot(tl.trans(dG).to(qc.dtype), qc)
@@ -792,6 +796,7 @@ def _par_grad_gla_kwv(q_ptr, k_ptr, v_ptr, wg_ptr, rg_ptr, ld_ptr, g_ptr, dSa_pt
                  dk_intra + dk_KV, mask=rmask[:, None] & dmask[None, :])
         G += tl.dot(qc, tl.trans(kc))
         KS += tl.dot(kc, dSa.to(kc.dtype))
+        ZdZ += tl.sum(tl.sum(tl.reshape(Sb * dSa, [BD, BG, BV]), axis=2), axis=0)   # Σ_{d,v}(Sb∘dSa)
     A = G * D * caus
     dD = P * G * caus
     dv_intra = tl.dot(tl.trans(A).to(gc.dtype), gc)
@@ -806,10 +811,16 @@ def _par_grad_gla_kwv(q_ptr, k_ptr, v_ptr, wg_ptr, rg_ptr, ld_ptr, g_ptr, dSa_pt
     tl.store(dwg_ptr + b*sdw_b + rows[:, None]*sdw_l + offs_c[None, :]*sdw_c, dwgc, mask=rmask[:, None] & cmask[None, :])
     tl.store(dv_ptr + b*sdv_b + sb*sdv_n + rows[:, None]*sdv_l + offs_v[None, :]*sdv_d,
              dv_intra + dv_KV, mask=rmask[:, None] & (offs_v[None, :] < dv))
-    tl.store(dakwv_ptr + b*sdaw_b + rows[:, None]*sdaw_l + offs_c[None, :]
-             * sdaw_c, da_wt + da_wend, mask=rmask[:, None] & cmask[None, :])
-    tl.store(dawend_ptr + b*sdwe_b + rows[:, None]*sdwe_l + offs_c[None, :]
-             * sdwe_c, da_wend, mask=rmask[:, None] & cmask[None, :])
+    # dLam (carry-decay adjoint) folded into da's last row, then reverse-cumsum → dld. da's read-gate
+    # term da_rt comes from the qr kernel (dart); da_wt + da_wend are local. (Mirrors _den_gla_grad.)
+    dart = tl.load(dart_ptr + b*sda_b + rows[:, None]*sda_l + offs_c[None, :]*sda_c,
+                   mask=rmask[:, None] & cmask[None, :], other=0.0)
+    dlam = tl.exp(Lam) * ZdZ - tl.sum(da_wend, axis=0)
+    da = dart + da_wt + da_wend
+    da += tl.where(offs_t[:, None] == (BT - 1), dlam[None, :], 0.0)
+    s = tl.cumsum(da, axis=0)
+    dld = tl.sum(da, axis=0)[None, :] - s + da                       # reverse cumsum (tot − cumsum + da)
+    tl.store(dld_ptr + b*sdw_b + rows[:, None]*sdw_l + offs_c[None, :]*sdw_c, dld, mask=rmask[:, None] & cmask[None, :])
 
 
 def _alloc_split(q, v, wg, chunk, BG, den=True):
@@ -875,12 +886,10 @@ def _bwd_split_gla(q, k, v, wg, rg, ld, g, chunk=None, BG=16, den=True):
     ld = ld.clamp(min=_GLA_FLOOR)
     q, k, v, wg, rg, ld, g = [x.contiguous() for x in (q, k, v, wg, rg, ld, g)]
     BD, BV, NB, NCH, Sb, dSa, dq, dk, dvo, drg, dwg = _alloc_split(q, v, wg, chunk, BG, den=den)
-    dart = torch.empty(B, L, nc, device=q.device, dtype=torch.float32)
-    dakwv = torch.empty_like(dart)
-    dawend = torch.empty_like(dart)
+    dart = torch.empty(B, L, nc, device=q.device, dtype=torch.float32)   # da_rt (read-gate decay adjoint), qr→kwv
+    dld = torch.empty(B, L, nc, device=q.device, dtype=torch.float32)    # per-token log-decay grad, assembled in kwv
     # Scans build Sb/dSa with their own fixed feature block (register accumulator, independent of the
-    # grad kernels' autotuned BD; Sb indexed by absolute feature row). BD (alloc, = next_pow2(dqk)) is
-    # the Sb tensor's real D-dim — kept for the torch dLam reduction below.
+    # grad kernels' autotuned BD; Sb indexed by absolute feature row).
     BK_scan = min(64, BD)
     ND_scan = triton.cdiv(dqk, BK_scan)
     sS = (Sb.stride(0), Sb.stride(1), Sb.stride(2), Sb.stride(3), Sb.stride(4))
@@ -898,33 +907,14 @@ def _bwd_split_gla(q, k, v, wg, rg, ld, g, chunk=None, BG=16, den=True):
                                        3), drg.stride(0), drg.stride(1), drg.stride(2),
                                    dart.stride(0), dart.stride(1), dart.stride(2),
                                    BT=chunk, BV=BV, BG=BG, NCH=NCH, DEN=DEN)
-    _par_grad_gla_kwv[(B, NB, NCH)](q, k, v, wg, rg, ld, g, dSa, dk, dwg, dvo, dakwv, dawend, L, dqk, dv, nc,
+    # kwv assembles dld IN-KERNEL (Sb + dSa → ZdZ → dLam → reverse-cumsum); dart (da_rt) comes from qr.
+    _par_grad_gla_kwv[(B, NB, NCH)](q, k, v, wg, rg, ld, g, Sb, dSa, dart, dk, dwg, dvo, dld, L, dqk, dv, nc,
                                     *sq, *sv, *sg, *sgr, *sS,
-                                    dk.stride(0), dk.stride(1), dk.stride(2), dk.stride(
-                                        3), dwg.stride(0), dwg.stride(1), dwg.stride(2),
+                                    dk.stride(0), dk.stride(1), dk.stride(2), dk.stride(3),
+                                    dwg.stride(0), dwg.stride(1), dwg.stride(2),
                                     dvo.stride(0), dvo.stride(1), dvo.stride(2), dvo.stride(3),
-                                    dakwv.stride(0), dakwv.stride(1), dakwv.stride(
-                                        2), dawend.stride(0), dawend.stride(1), dawend.stride(2),
+                                    dart.stride(0), dart.stride(1), dart.stride(2),
                                     BT=chunk, BV=BV, BG=BG, NCH=NCH, DEN=DEN)
-    # dLam in torch from the stored state buffers (keeps the kwv kernel one-state-tile):
-    #   dLam[b,t,c] = e^{Λ_t,c} Σ_{d,v} (dSa[t]∘Sb[t])_{d,(c,v)}  −  Σ_{j∈chunk t} da_wend[j,c]
-    pad = (-L) % chunk
-    Lp = L + pad
-    ld_p = F.pad(ld, (0, 0, 0, pad)) if pad else ld
-    Lam_t = ld_p.view(B, NCH, chunk, nc).sum(2)                                   # [B,NCH,nc]
-    # slice rows to :dqk — Sb/dSa are torch.empty and the kernels only WRITE rows < dqk
-    # (dmask-ed stores); rows dqk..BD-1 are uninitialized garbage that must not enter the sum.
-    t1 = torch.stack([(dSa[:, :, t] * Sb[:, :, t]).view(B, NB, BD, BG, BV)[:, :, :dqk].sum(dim=(2, 4))
-                      for t in range(NCH)], dim=2)                                # [B,NB,NCH,BG]
-    t1 = t1.permute(0, 2, 1, 3).reshape(B, NCH, NB * BG)[..., :nc] * torch.exp(Lam_t)
-    dawend_p = F.pad(dawend, (0, 0, 0, pad)) if pad else dawend
-    dlam = t1 - dawend_p.view(B, NCH, chunk, nc).sum(2)                           # [B,NCH,nc]
-    da = dart + dakwv
-    if pad:
-        da = F.pad(da, (0, 0, 0, pad))
-    da = da.view(B, NCH, chunk, nc)
-    da[:, :, -1, :] = da[:, :, -1, :] + dlam
-    dld = torch.flip(torch.cumsum(torch.flip(da, [2]), 2), [2]).reshape(B, Lp, nc)[:, :L]
     return dq.sum(1), dk.sum(1), dvo.sum(1)[..., :dv], dwg, drg, dld
 
 
