@@ -19,52 +19,22 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
-from triton.runtime.errors import OutOfResources
+from fla_rola.utils import autotune_cache_kwargs, check_shared_mem
 
-from fla_rola.utils import autotune_cache_kwargs
-
-# SMEM-fitting is OWNED BY THE AUTOTUNER + an empirical chunk fallback — NOT hardcoded device tiers.
-# This keeps the kernels device-agnostic (one build runs A100/H100/30xx/T4) with no perf compromise:
-#  * num_warps / num_stages: every autotuned kernel offers the FULL grid below. Triton compiles each
-#    config, scores any OutOfResources as inf, and keeps the largest that fits the ACTUAL device — so
-#    an A100/H100 lands on a deep pipeline and a small-smem card on stages=1, with nothing hardcoded.
-#  * chunk size BT: the one knob the autotuner cannot own (the host-side Sb/dSa allocations + launch
-#    grid are sized from it before any kernel compiles, and GLA needs BT<=32 for its fp32 decay floor).
-#    So BT is chosen EMPIRICALLY per shape via `_chunk_fallback`: start at the preferred size and halve
-#    on OutOfResources down to _MIN_CHUNK — the retry discovers the device's real limit, no tier guess.
+# SMEM fitting follows the canonical FLA idiom: the chunk size BT is a fixed per-device constant
+# (a `check_shared_mem` gate — the one structural knob the autotuner can't own, since the host-side
+# Sb/dSa allocations + launch grid are sized from it before any kernel compiles, and GLA needs BT<=32
+# for its fp32 decay floor), while the INNER blocks (num_warps / num_stages / BD) are autotune knobs
+# that Triton prunes via OutOfResources. The denominator-split (numerator-only readout, BV=next_pow2
+# (dv)) halved the per-program footprint, so the ada-class BT (64 RLA-fwd / 32 GLA+bwd) now fits down
+# to RTX 30xx (measured); sm75 (T4, 64KB) drops to BT=16.
+_BIG_SMEM = check_shared_mem('ada')
 _WARPS = (2, 4, 8)
 _STAGES = (1, 2, 3)
 _AT_CFGS = [triton.Config({}, num_warps=w, num_stages=s) for w in _WARPS for s in _STAGES]
 _AT_KEY = ['dqk', 'dv', 'nc']
-_PREF_CHUNK_FWD = 64     # RLA forward preferred chunk
-_PREF_CHUNK = 32         # GLA forward + all backwards (GLA fp32 decay floor caps BT at 32)
-_MIN_CHUNK = 16          # tl.dot floor / smallest chunk we fall back to
-
-_CHUNK_OK = {}           # (tag, dqk, dv, nc) -> the chunk that compiled+fit, so the retry is paid once
-
-
-def _chunk_fallback(tag, pref, dqk, dv, nc, fn):
-    """Run fn(chunk) starting at `pref`, halving to _MIN_CHUNK on OutOfResources until it fits.
-    fn must (re)allocate its own outputs each call so a failed attempt leaves no partial state. The
-    working chunk is cached per (tag, dqk, dv, nc). This is the device-agnostic equivalent of an
-    autotune knob for BT — which can't be a real autotune knob because host allocations depend on it."""
-    key = (tag, dqk, dv, nc)
-    cached = _CHUNK_OK.get(key)
-    seen = set()
-    chunks = []
-    for c in ([cached] if cached else [pref, pref // 2, _MIN_CHUNK]):
-        if c and c >= _MIN_CHUNK and c not in seen:
-            seen.add(c); chunks.append(c)
-    last = None
-    for c in chunks:
-        try:
-            out = fn(c)
-            _CHUNK_OK[key] = c
-            return out
-        except OutOfResources as e:
-            last = e
-            torch.cuda.empty_cache()
-    raise last
+_CHUNK_FWD = 64 if _BIG_SMEM else 16     # RLA forward
+_CHUNK = 32 if _BIG_SMEM else 16         # GLA forward + all backwards (GLA fp32 decay floor caps BT<=32)
 
 # --- Backward feature tiling: BD as an autotune knob ----------------------------------------------
 # The backward grad kernels load a [BD, BG*BV] slice of the Kronecker state per feature-block into
@@ -270,9 +240,8 @@ class _RoLARLAFn(torch.autograd.Function):
     denominator-column so the verified augmented kernels yield exactly the numerator's grads."""
     @staticmethod
     def forward(ctx, q, k, v, wg, rg, chunk, bwd_chunk, BG, den):
-        dv, dqk, nc = v.shape[-1], q.shape[-1], wg.shape[-1]
-        Oa = _chunk_fallback('rla_fwd', chunk, dqk, dv, nc,
-                             lambda c: _fwd_aug_tiled(q, k, v, wg, rg, chunk=c, BG=BG, den=den))
+        dv = v.shape[-1]
+        Oa = _fwd_aug_tiled(q, k, v, wg, rg, chunk=chunk, BG=BG, den=den)
         ctx.save_for_backward(q, k, v, wg, rg)
         ctx.bwd_chunk, ctx.BG, ctx.den = bwd_chunk, BG, den
         # den=False: Oa is [.,dv] (numerator). den=True: Oa is [.,dv+1]; [..,:dv] returns the readout
@@ -287,8 +256,7 @@ class _RoLARLAFn(torch.autograd.Function):
         # numerator's grads. numerator-only path (den=False): g IS the numerator grad ([.,dv]) — no pad.
         g = F.pad(dO.float(), (0, 1)) if ctx.den else dO.float()
         qf, kf, vf, wgf, rgf = (t.float() for t in (q, k, v, wg, rg))
-        dq, dk, dvv, dw, dr = _chunk_fallback('rla_bwd', _PREF_CHUNK, q.shape[-1], v.shape[-1], wg.shape[-1],
-                                              lambda c: _bwd_split_rla(qf, kf, vf, wgf, rgf, g, chunk=c, den=ctx.den))
+        dq, dk, dvv, dw, dr = _bwd_split_rla(qf, kf, vf, wgf, rgf, g, chunk=_CHUNK, den=ctx.den)
         def cast(t): return t.to(q.dtype)
         return cast(dq), cast(dk), cast(dvv), cast(dw), cast(dr), None, None, None, None
 
@@ -299,7 +267,7 @@ def rola_rla_triton(q, k, v, r, w, chunk=None, bwd_chunk=16, BG=16, den=True):
     den=True: caller passes v augmented with a ones-column ⇒ returns [num|den] (global-norm path).
     den=False: numerator-only ⇒ returns [BH,L,V] at BV=next_pow2(V) (half tiles); the kappa/per_state
     caller reconstructs the global denominator as Σ_c rᶜ·dᶜ from the per-state den pre-pass."""
-    chunk = _PREF_CHUNK_FWD if chunk is None else min(chunk, _PREF_CHUNK_FWD)
+    chunk = _CHUNK_FWD if chunk is None else min(chunk, _CHUNK_FWD)
     return _RoLARLAFn.apply(q, k, v, w, r, chunk, bwd_chunk, BG, den)
 
 
@@ -440,9 +408,8 @@ class _RoLAGLAFn(torch.autograd.Function):
     so the verified augmented kernels yield the numerator's grads (incl. dld)."""
     @staticmethod
     def forward(ctx, q, k, v, wg, rg, ld, chunk, BG, den):
-        dv, dqk, nc = v.shape[-1], q.shape[-1], wg.shape[-1]
-        Oa = _chunk_fallback('gla_fwd', chunk, dqk, dv, nc,
-                             lambda c: _gla_fwd_aug(q, k, v, wg, rg, ld, chunk=c, BG=BG, den=den))
+        dv = v.shape[-1]
+        Oa = _gla_fwd_aug(q, k, v, wg, rg, ld, chunk=chunk, BG=BG, den=den)
         ctx.save_for_backward(q, k, v, wg, rg, ld)
         ctx.BG, ctx.den = BG, den
         return Oa[..., :dv].to(q.dtype)   # see _RoLARLAFn.forward: legacy augmented convention
@@ -452,9 +419,8 @@ class _RoLAGLAFn(torch.autograd.Function):
         q, k, v, wg, rg, ld = ctx.saved_tensors
         g = F.pad(dO.float(), (0, 1)) if ctx.den else dO.float()   # augmented: zero den-col; else numerator-only
         def fl(t): return t.float()
-        dq, dk, dvv, dwg, drg, dld = _chunk_fallback(
-            'gla_bwd', _PREF_CHUNK, q.shape[-1], v.shape[-1], wg.shape[-1],
-            lambda c: _bwd_split_gla(fl(q), fl(k), fl(v), fl(wg), fl(rg), fl(ld), g, chunk=c, den=ctx.den))
+        dq, dk, dvv, dwg, drg, dld = _bwd_split_gla(
+            fl(q), fl(k), fl(v), fl(wg), fl(rg), fl(ld), g, chunk=_CHUNK, den=ctx.den)
         def cast(t): return t.to(q.dtype)
         # forward args order: q, k, v, wg, rg, ld, chunk, BG, den
         return cast(dq), cast(dk), cast(dvv), cast(dwg), cast(drg), cast(dld), None, None, None
@@ -464,7 +430,7 @@ def rola_gla_triton(q, k, v, r, w, ld, chunk=None, BG=16, den=True):
     """Un-normalized routed GLA readout via Triton. q,k:[BH,L,K] v:[BH,L,V] r,w,ld:[BH,L,nc]
     (r=read gate, w=write gate, ld=per-state log-decay). Differentiable. den=True: augmented [num|den];
     den=False: numerator-only (BV halves) — kappa/per_state caller forms the global den from the pre-pass."""
-    chunk = _PREF_CHUNK if chunk is None else min(chunk, _PREF_CHUNK)
+    chunk = _CHUNK if chunk is None else min(chunk, _CHUNK)
     return _RoLAGLAFn.apply(q, k, v, w, r, ld, chunk, BG, den)
 
 
@@ -865,7 +831,7 @@ def _alloc_split(q, v, wg, chunk, BG, den=True):
 
 
 def _bwd_split_rla(q, k, v, wg, rg, g, chunk=None, BG=16, den=True):
-    chunk = _PREF_CHUNK if chunk is None else chunk
+    chunk = _CHUNK if chunk is None else chunk
     DEN = 1 if den else 0
     B, L, dqk = q.shape
     dv = v.shape[-1]
@@ -901,7 +867,7 @@ def _bwd_split_rla(q, k, v, wg, rg, g, chunk=None, BG=16, den=True):
 
 
 def _bwd_split_gla(q, k, v, wg, rg, ld, g, chunk=None, BG=16, den=True):
-    chunk = _PREF_CHUNK if chunk is None else chunk
+    chunk = _CHUNK if chunk is None else chunk
     DEN = 1 if den else 0
     B, L, dqk = q.shape
     dv = v.shape[-1]
@@ -1178,7 +1144,7 @@ class _DenFn(torch.autograd.Function):
 
 def rola_perstate_den_triton(q, k, w, chunk=None, BG=16):
     """Per-state denominator on folded [BH,L,*] tensors. Differentiable (Triton fwd + parallel bwd)."""
-    chunk = _PREF_CHUNK if chunk is None else min(chunk, _PREF_CHUNK)
+    chunk = _CHUNK if chunk is None else min(chunk, _CHUNK)
     return _DenFn.apply(q, k, w, chunk, BG)
 
 
@@ -1355,5 +1321,5 @@ class _DenGLAFn(torch.autograd.Function):
 
 def rola_perstate_den_gla_triton(q, k, w, ld, chunk=None, BG=16):
     """Per-state denominator under per-state log-decay ld:[BH,L,nc], folded tensors. Differentiable."""
-    chunk = _PREF_CHUNK if chunk is None else min(chunk, _PREF_CHUNK)
+    chunk = _CHUNK if chunk is None else min(chunk, _CHUNK)
     return _DenGLAFn.apply(q, k, w, ld, chunk, BG)
