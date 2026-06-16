@@ -133,6 +133,7 @@ def _fwd_aug(q, k, v, wg, rg, chunk, BG):
     return out_aug[..., :dv + 1].sum(1)
 
 
+@triton.autotune(configs=_AT_CFGS, key=_AT_KEY, **autotune_cache_kwargs)
 @triton.jit
 def _rola_fwd_intra(q_ptr, k_ptr, v_ptr, wg_ptr, rg_ptr, outa_ptr,
                     L, dqk, dv, nc,
@@ -144,7 +145,9 @@ def _rola_fwd_intra(q_ptr, k_ptr, v_ptr, wg_ptr, rg_ptr, outa_ptr,
     built by looping BK-blocks of the feature dim, so SRAM is bounded by [BT,BK]+[BT,BT] — NOT dqk.
     DEN=1: augment v with a ones-column (output width dv+1, num|den). DEN=0: numerator-only (width
     dv) — the kappa/per_state caller reconstructs the global den as Σ_c rᶜ·dᶜ from the den pre-pass,
-    so the ones-column is redundant and BV halves to next_pow2(dv)."""
+    so the ones-column is redundant and BV halves to next_pow2(dv).
+    Writes its OWN out_intra buffer (disjoint rows per chunk → plain store), so it is autotunable
+    (num_warps/num_stages pruned by OutOfResources); the inter contribution is a separate buffer."""
     b = tl.program_id(0); sb = tl.program_id(1); t = tl.program_id(2)
     offs_t = tl.arange(0, BT); offs_v = tl.arange(0, BV)
     offs_c = sb * BG + tl.arange(0, BG); cmask = offs_c < nc
@@ -169,10 +172,11 @@ def _rola_fwd_intra(q_ptr, k_ptr, v_ptr, wg_ptr, rg_ptr, outa_ptr,
     causal = (offs_t[:, None] >= offs_t[None, :]) & rmask[:, None] & rmask[None, :]
     A = G * R * causal
     o = tl.dot(A.to(vc.dtype), vc)
-    tl.atomic_add(outa_ptr + b*soa_b + sb*soa_n + rows[:, None]*soa_l + offs_v[None, :]*soa_v,
-                  o, mask=rmask[:, None] & (offs_v[None, :] < dv + DEN))
+    tl.store(outa_ptr + b*soa_b + sb*soa_n + rows[:, None]*soa_l + offs_v[None, :]*soa_v,
+             o, mask=rmask[:, None] & (offs_v[None, :] < dv + DEN))
 
 
+@triton.autotune(configs=_AT_CFGS, key=_AT_KEY, reset_to_zero=['outa_ptr'], **autotune_cache_kwargs)
 @triton.jit
 def _rola_fwd_inter(q_ptr, k_ptr, v_ptr, wg_ptr, rg_ptr, outa_ptr,
                     L, dqk, dv, nc,
@@ -183,7 +187,8 @@ def _rola_fwd_inter(q_ptr, k_ptr, v_ptr, wg_ptr, rg_ptr, outa_ptr,
     """Inter-chunk (state) contribution for one (batch, state-block, FEATURE-block d0). Carries this
     feature-block's slice Sd[BK, BG*BV] of the Kronecker state across chunks → SRAM bounded by BK,
     not dqk. o_inter uses the state BEFORE this chunk's update (causal); partials over feature-blocks
-    sum via atomic_add. DEN=1: ones-column augment; DEN=0: numerator-only (BV halves)."""
+    sum via atomic_add into its OWN out_inter buffer — autotunable with reset_to_zero (the autotuner
+    zeros out_inter between benchmark trials so the atomic accumulation stays correct). DEN: as intra."""
     b = tl.program_id(0); sb = tl.program_id(1); d0 = tl.program_id(2)
     offs_t = tl.arange(0, BT); offs_v = tl.arange(0, BV)
     offs_d = d0 * BK + tl.arange(0, BK); dmask = offs_d < dqk
@@ -223,15 +228,19 @@ def _fwd_aug_tiled(q, k, v, wg, rg, chunk, BG, BK=64, den=True):
     BK = min(BK, max(16, triton.next_power_of_2(dqk)))   # exact-width blocks for dqk<=64; tile beyond
     ND = triton.cdiv(dqk, BK); NB = triton.cdiv(nc, BG); NCH = triton.cdiv(L, chunk)
     q, k, v, wg, rg = [x.contiguous() for x in (q, k, v, wg, rg)]
-    out_aug = torch.zeros(B, NB, L, BV, device=q.device, dtype=torch.float32)
-    strides = (q.stride(0), q.stride(1), q.stride(2), v.stride(0), v.stride(1), v.stride(2),
-               wg.stride(0), wg.stride(1), wg.stride(2),
-               out_aug.stride(0), out_aug.stride(1), out_aug.stride(2), out_aug.stride(3))
-    _rola_fwd_intra[(B, NB, NCH)](q, k, v, wg, rg, out_aug, L, dqk, dv, nc, *strides,
+    # Separate intra/inter output buffers (summed after) so each kernel has a non-shared output and is
+    # independently autotunable: intra writes disjoint rows (store), inter atomic-accumulates over
+    # feature-blocks (reset_to_zero). FLA idiom — the autotuner prunes warps/stages per device.
+    out_intra = torch.zeros(B, NB, L, BV, device=q.device, dtype=torch.float32)
+    out_inter = torch.zeros_like(out_intra)
+    so = (out_intra.stride(0), out_intra.stride(1), out_intra.stride(2), out_intra.stride(3))
+    base = (q.stride(0), q.stride(1), q.stride(2), v.stride(0), v.stride(1), v.stride(2),
+            wg.stride(0), wg.stride(1), wg.stride(2))
+    _rola_fwd_intra[(B, NB, NCH)](q, k, v, wg, rg, out_intra, L, dqk, dv, nc, *base, *so,
                                   BT=chunk, BK=BK, BV=BV, BG=BG, ND=ND, DEN=DEN)
-    _rola_fwd_inter[(B, NB, ND)](q, k, v, wg, rg, out_aug, L, dqk, dv, nc, *strides,
+    _rola_fwd_inter[(B, NB, ND)](q, k, v, wg, rg, out_inter, L, dqk, dv, nc, *base, *so,
                                  BT=chunk, BK=BK, BV=BV, BG=BG, NCH=NCH, DEN=DEN)
-    return out_aug[..., :dvp].sum(1)
+    return (out_intra + out_inter)[..., :dvp].sum(1)
 
 
 class _RoLARLAFn(torch.autograd.Function):
@@ -284,6 +293,7 @@ def rola_rla_triton(q, k, v, r, w, chunk=None, bwd_chunk=16, BG=16, den=True):
 _GLA_FLOOR = -2.5   # per-token log-decay floor (retention ≥ 8.2%/tok); fp32-safe for BT≤32
 
 
+@triton.autotune(configs=_AT_CFGS, key=_AT_KEY, **autotune_cache_kwargs)
 @triton.jit
 def _rola_gla_fwd_intra(q_ptr, k_ptr, v_ptr, wg_ptr, rg_ptr, ld_ptr, outa_ptr,
                         L, dqk, dv, nc,
@@ -324,10 +334,11 @@ def _rola_gla_fwd_intra(q_ptr, k_ptr, v_ptr, wg_ptr, rg_ptr, ld_ptr, outa_ptr,
     causal = (offs_t[:, None] >= offs_t[None, :]) & rmask[:, None] & rmask[None, :]
     A = G * R * causal
     o = tl.dot(A.to(vc.dtype), vc)
-    tl.atomic_add(outa_ptr + b*soa_b + sb*soa_n + rows[:, None]*soa_l + offs_v[None, :]*soa_v,
-                  o, mask=rmask[:, None] & (offs_v[None, :] < dv + DEN))
+    tl.store(outa_ptr + b*soa_b + sb*soa_n + rows[:, None]*soa_l + offs_v[None, :]*soa_v,
+             o, mask=rmask[:, None] & (offs_v[None, :] < dv + DEN))
 
 
+@triton.autotune(configs=_AT_CFGS, key=_AT_KEY, reset_to_zero=['outa_ptr'], **autotune_cache_kwargs)
 @triton.jit
 def _rola_gla_fwd_inter(q_ptr, k_ptr, v_ptr, wg_ptr, rg_ptr, ld_ptr, outa_ptr,
                         L, dqk, dv, nc,
@@ -391,15 +402,17 @@ def _gla_fwd_aug(q, k, v, wg, rg, ld, chunk, BG, BK=64, den=True):
     NB = triton.cdiv(nc, BG)
     NCH = triton.cdiv(L, chunk)
     q, k, v, wg, rg = [x.contiguous() for x in (q, k, v, wg, rg)]
-    out_aug = torch.zeros(B, NB, L, BV, device=q.device, dtype=torch.float32)
-    strides = (q.stride(0), q.stride(1), q.stride(2), v.stride(0), v.stride(1), v.stride(2),
-               wg.stride(0), wg.stride(1), wg.stride(2),
-               out_aug.stride(0), out_aug.stride(1), out_aug.stride(2), out_aug.stride(3))
-    _rola_gla_fwd_intra[(B, NB, NCH)](q, k, v, wg, rg, ld, out_aug, L, dqk, dv, nc, *strides,
+    # separate intra/inter buffers → each kernel autotunable (see _fwd_aug_tiled).
+    out_intra = torch.zeros(B, NB, L, BV, device=q.device, dtype=torch.float32)
+    out_inter = torch.zeros_like(out_intra)
+    so = (out_intra.stride(0), out_intra.stride(1), out_intra.stride(2), out_intra.stride(3))
+    base = (q.stride(0), q.stride(1), q.stride(2), v.stride(0), v.stride(1), v.stride(2),
+            wg.stride(0), wg.stride(1), wg.stride(2))
+    _rola_gla_fwd_intra[(B, NB, NCH)](q, k, v, wg, rg, ld, out_intra, L, dqk, dv, nc, *base, *so,
                                       BT=chunk, BK=BK, BV=BV, BG=BG, ND=ND, DEN=DEN)
-    _rola_gla_fwd_inter[(B, NB, ND)](q, k, v, wg, rg, ld, out_aug, L, dqk, dv, nc, *strides,
+    _rola_gla_fwd_inter[(B, NB, ND)](q, k, v, wg, rg, ld, out_inter, L, dqk, dv, nc, *base, *so,
                                      BT=chunk, BK=BK, BV=BV, BG=BG, NCH=NCH, DEN=DEN)
-    return out_aug[..., :dvp].sum(1)
+    return (out_intra + out_inter)[..., :dvp].sum(1)
 
 
 class _RoLAGLAFn(torch.autograd.Function):
