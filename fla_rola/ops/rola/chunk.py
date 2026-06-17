@@ -33,7 +33,8 @@ _STAGES = (1, 2, 3)
 _AT_CFGS = [triton.Config({}, num_warps=w, num_stages=s) for w in _WARPS for s in _STAGES]
 _AT_KEY = ['dqk', 'dv', 'nc']
 _CHUNK_FWD = 64 if _BIG_SMEM else 16     # RLA forward
-_CHUNK = 32 if _BIG_SMEM else 16         # GLA forward + all backwards (GLA fp32 decay floor caps BT<=32)
+_CHUNK = 32 if _BIG_SMEM else 16         # GLA forward + GLA backward (GLA fp32 decay floor caps BT<=32)
+_CHUNK_BWD_RLA = 64 if _BIG_SMEM else 16  # RLA backward — BC-split grads fit BT=64 (no decay floor)
 
 # --- Backward feature tiling: BD as an autotune knob ----------------------------------------------
 # The backward grad kernels load a [BD, BG*BV] slice of the Kronecker state per feature-block into
@@ -182,7 +183,7 @@ class _RoLARLAFn(torch.autograd.Function):
         q, k, v, wg, rg = ctx.saved_tensors
         g = dO.float()
         qf, kf, vf, wgf, rgf = (t.float() for t in (q, k, v, wg, rg))
-        dq, dk, dvv, dw, dr = _bwd_split_rla(qf, kf, vf, wgf, rgf, g, chunk=_CHUNK)
+        dq, dk, dvv, dw, dr = _bwd_split_rla(qf, kf, vf, wgf, rgf, g, chunk=_CHUNK_BWD_RLA)
         def cast(t): return t.to(q.dtype)
         return cast(dq), cast(dk), cast(dvv), cast(dw), cast(dr), None, None
 
@@ -458,26 +459,23 @@ def _scan_dS(q_ptr, rg_ptr, ld_ptr, g_ptr, dSa_ptr, L, dqk, dv, nc,
             dS += tl.dot(tl.trans(qc), rg_g.to(qc.dtype))
 
 
+# Review-3 BC split (mirrors kwv): intra keeps the [BT,BT] grams (fits at BT=64), inter is BC-tiled
+# over rows for the [BT,BG*BV] state terms (rg_g, QS). Each writes own dq/dr buffers; host-summed.
 @triton.autotune(configs=_BWD_CFGS, key=_AT_KEY,
                  prune_configs_by={'early_config_prune': _prune_bwd_bd}, **autotune_cache_kwargs)
 @triton.jit
-def _par_grad_rla_qr(q_ptr, k_ptr, v_ptr, wg_ptr, rg_ptr, g_ptr, Sb_ptr, dq_ptr, dr_ptr,
-                     L, dqk: tl.constexpr, dv, nc,
-                     sq_b, sq_l, sq_d, sv_b, sv_l, sv_d, sg_b, sg_l, sg_c, sgr_b, sgr_l, sgr_d,
-                     ssb_b, ssb_n, ssb_t, ssb_d, ssb_e,
-                     sdq_b, sdq_n, sdq_l, sdq_d, sdr_b, sdr_l, sdr_c,
-                     BT: tl.constexpr, BD: tl.constexpr, BV: tl.constexpr, BG: tl.constexpr,
-                     NCH: tl.constexpr):
-    # D-tiled: dq is feature-indexed (written per BD-block); dr needs the full content gram G + QS,
-    # accumulated over the BD-block loop ([BT,BT] and [BT,BG*BV] — bounded, independent of dqk).
-    # BD is an autotune knob; the number of feature-blocks follows from it (dqk is runtime).
+def _par_grad_rla_qr_intra(q_ptr, k_ptr, v_ptr, wg_ptr, rg_ptr, g_ptr, dq_ptr, dr_ptr,
+                           L, dqk: tl.constexpr, dv, nc,
+                           sq_b, sq_l, sq_d, sv_b, sv_l, sv_d, sg_b, sg_l, sg_c, sgr_b, sgr_l, sgr_d,
+                           sdq_b, sdq_n, sdq_l, sdq_d, sdr_b, sdr_l, sdr_c,
+                           BT: tl.constexpr, BD: tl.constexpr, BV: tl.constexpr, BG: tl.constexpr,
+                           NCH: tl.constexpr):
     ND = tl.cdiv(dqk, BD)
     b = tl.program_id(0)
     sb = tl.program_id(1)
     t = tl.program_id(2)
     offs_t = tl.arange(0, BT)
     offs_v = tl.arange(0, BV)
-    offs_e = tl.arange(0, BG * BV)
     offs_c = sb * BG + tl.arange(0, BG)
     cmask = offs_c < nc
     vmask = offs_v < dv
@@ -493,9 +491,7 @@ def _par_grad_rla_qr(q_ptr, k_ptr, v_ptr, wg_ptr, rg_ptr, g_ptr, Sb_ptr, dq_ptr,
     Rg = tl.dot(rgc, tl.trans(wgc))
     P = tl.dot(gc, tl.trans(v1))
     coef = causal * Rg * P                                          # dq_intra coefficient [BT,BT]
-    rg_g = tl.reshape(rgc[:, :, None] * gc[:, None, :], [BT, BG * BV])
     G = tl.zeros([BT, BT], dtype=tl.float32)
-    QS = tl.zeros([BT, BG * BV], dtype=tl.float32)
     for d0b in range(ND):
         offs_d = d0b * BD + tl.arange(0, BD)
         dmask = offs_d < dqk
@@ -503,39 +499,83 @@ def _par_grad_rla_qr(q_ptr, k_ptr, v_ptr, wg_ptr, rg_ptr, g_ptr, Sb_ptr, dq_ptr,
                      mask=rmask[:, None] & dmask[None, :], other=0.0)
         kc = tl.load(k_ptr + b*sq_b + rows[:, None]*sq_l + offs_d[None, :]*sq_d,
                      mask=rmask[:, None] & dmask[None, :], other=0.0)
-        Sb = tl.load(Sb_ptr + b*ssb_b + sb*ssb_n + t*ssb_t + offs_d[:, None]
-                     * ssb_d + offs_e[None, :]*ssb_e, mask=dmask[:, None], other=0.0)
-        dq_d = tl.dot(coef.to(kc.dtype), kc) + tl.dot(rg_g.to(Sb.dtype), tl.trans(Sb))
+        dq_d = tl.dot(coef.to(kc.dtype), kc)
         tl.store(dq_ptr + b*sdq_b + sb*sdq_n + rows[:, None]*sdq_l + offs_d[None, :]*sdq_d,
                  dq_d, mask=rmask[:, None] & dmask[None, :])
         G += tl.dot(qc, tl.trans(kc))
-        QS += tl.dot(qc, Sb.to(qc.dtype))
     dr_intra = tl.dot((causal * G * P).to(wgc.dtype), wgc)
-    dr_inter = tl.sum(tl.reshape(QS, [BT, BG, BV]) * gc[:, None, :], axis=2)
     tl.store(dr_ptr + b*sdr_b + rows[:, None]*sdr_l + offs_c[None, :]*sdr_c,
-             dr_intra + dr_inter, mask=rmask[:, None] & cmask[None, :])
+             dr_intra, mask=rmask[:, None] & cmask[None, :])
 
 
 @triton.autotune(configs=_BWD_CFGS, key=_AT_KEY,
                  prune_configs_by={'early_config_prune': _prune_bwd_bd}, **autotune_cache_kwargs)
 @triton.jit
-def _par_grad_rla_kwv(q_ptr, k_ptr, v_ptr, wg_ptr, rg_ptr, g_ptr, dSa_ptr, dk_ptr, dw_ptr, dv_ptr,
-                      L, dqk: tl.constexpr, dv, nc,
-                      sq_b, sq_l, sq_d, sv_b, sv_l, sv_d, sg_b, sg_l, sg_c, sgr_b, sgr_l, sgr_d,
-                      ssb_b, ssb_n, ssb_t, ssb_d, ssb_e,
-                      sdk_b, sdk_n, sdk_l, sdk_d, sdw_b, sdw_l, sdw_c, sdv_b, sdv_n, sdv_l, sdv_d,
-                      BT: tl.constexpr, BD: tl.constexpr, BV: tl.constexpr, BG: tl.constexpr,
-                      NCH: tl.constexpr):
-    # D-tiled: dk is feature-indexed (written per BD-block); dw/dv need the full content gram G + KS,
-    # accumulated over the BD-block loop ([BT,BT] and [BT,BG*BV] — bounded, independent of dqk).
-    # BD is an autotune knob; the number of feature-blocks follows from it (dqk is runtime).
+def _par_grad_rla_qr_inter(q_ptr, rg_ptr, g_ptr, Sb_ptr, dq_ptr, dr_ptr,
+                           L, dqk: tl.constexpr, dv, nc,
+                           sq_b, sq_l, sq_d, sg_b, sg_l, sg_c, sgr_b, sgr_l, sgr_d,
+                           ssb_b, ssb_n, ssb_t, ssb_d, ssb_e,
+                           sdq_b, sdq_n, sdq_l, sdq_d, sdr_b, sdr_l, sdr_c,
+                           BT: tl.constexpr, BC: tl.constexpr, NC: tl.constexpr,
+                           BD: tl.constexpr, BV: tl.constexpr, BG: tl.constexpr):
+    ND = tl.cdiv(dqk, BD)
+    b = tl.program_id(0)
+    sb = tl.program_id(1)
+    tc = tl.program_id(2)
+    t = tc // NC
+    ic = tc % NC
+    offs_t = ic * BC + tl.arange(0, BC)
+    offs_v = tl.arange(0, BV)
+    offs_e = tl.arange(0, BG * BV)
+    offs_c = sb * BG + tl.arange(0, BG)
+    cmask = offs_c < nc
+    vmask = offs_v < dv
+    rows = t * BT + offs_t
+    rmask = rows < L
+    rgc = tl.load(rg_ptr + b*sg_b + rows[:, None]*sg_l + offs_c[None, :]*sg_c, mask=rmask[:, None] & cmask[None, :], other=0.0)
+    gc = tl.load(g_ptr + b*sgr_b + rows[:, None]*sgr_l + offs_v[None, :]
+                 * sgr_d, mask=rmask[:, None] & vmask[None, :], other=0.0)
+    rg_g = tl.reshape(rgc[:, :, None] * gc[:, None, :], [BC, BG * BV])
+    QS = tl.zeros([BC, BG * BV], dtype=tl.float32)
+    for d0b in range(ND):
+        offs_d = d0b * BD + tl.arange(0, BD)
+        dmask = offs_d < dqk
+        qc = tl.load(q_ptr + b*sq_b + rows[:, None]*sq_l + offs_d[None, :]*sq_d,
+                     mask=rmask[:, None] & dmask[None, :], other=0.0)
+        Sb = tl.load(Sb_ptr + b*ssb_b + sb*ssb_n + t*ssb_t + offs_d[:, None]
+                     * ssb_d + offs_e[None, :]*ssb_e, mask=dmask[:, None], other=0.0)
+        dq_inter = tl.dot(rg_g.to(Sb.dtype), tl.trans(Sb))
+        tl.store(dq_ptr + b*sdq_b + sb*sdq_n + rows[:, None]*sdq_l + offs_d[None, :]*sdq_d,
+                 dq_inter, mask=rmask[:, None] & dmask[None, :])
+        QS += tl.dot(qc, Sb.to(qc.dtype))
+    dr_inter = tl.sum(tl.reshape(QS, [BC, BG, BV]) * gc[:, None, :], axis=2)
+    tl.store(dr_ptr + b*sdr_b + rows[:, None]*sdr_l + offs_c[None, :]*sdr_c,
+             dr_inter, mask=rmask[:, None] & cmask[None, :])
+
+
+# Review-3 BC split: at BT=64 a single kwv program needs 128KB smem because wg_v1 AND KS (both
+# [BT,BG*BV], 64KB) are live together. The intra grads need only the [BT,BT] grams (16KB, fits at
+# BT=64); the inter (state) grads need [BT,BG*BV] but are causal-free / row-parallel. So split:
+#   _par_grad_rla_kwv_intra  (full BT, the [BT,BT] coupling): writes dk_intra/dw_intra/dv_intra.
+#   _par_grad_rla_kwv_inter  (BC-tiled rows, the [BT,BG*BV] state terms): writes dk_KV/dw_wr/dv_KV.
+# Each writes its OWN buffers with plain stores (disjoint elements → race-free AND idempotent under
+# autotuning, unlike atomic_add which would accumulate across tuning trials); _bwd_split_rla host-sums
+# the intra+inter buffers.
+@triton.autotune(configs=_BWD_CFGS, key=_AT_KEY,
+                 prune_configs_by={'early_config_prune': _prune_bwd_bd}, **autotune_cache_kwargs)
+@triton.jit
+def _par_grad_rla_kwv_intra(q_ptr, k_ptr, v_ptr, wg_ptr, rg_ptr, g_ptr, dk_ptr, dw_ptr, dv_ptr,
+                            L, dqk: tl.constexpr, dv, nc,
+                            sq_b, sq_l, sq_d, sv_b, sv_l, sv_d, sg_b, sg_l, sg_c, sgr_b, sgr_l, sgr_d,
+                            sdk_b, sdk_n, sdk_l, sdk_d, sdw_b, sdw_l, sdw_c, sdv_b, sdv_n, sdv_l, sdv_d,
+                            BT: tl.constexpr, BD: tl.constexpr, BV: tl.constexpr, BG: tl.constexpr,
+                            NCH: tl.constexpr):
     ND = tl.cdiv(dqk, BD)
     b = tl.program_id(0)
     sb = tl.program_id(1)
     t = tl.program_id(2)
     offs_t = tl.arange(0, BT)
     offs_v = tl.arange(0, BV)
-    offs_e = tl.arange(0, BG * BV)
     offs_c = sb * BG + tl.arange(0, BG)
     cmask = offs_c < nc
     vmask = offs_v < dv
@@ -551,9 +591,7 @@ def _par_grad_rla_kwv(q_ptr, k_ptr, v_ptr, wg_ptr, rg_ptr, g_ptr, dSa_ptr, dk_pt
     Rg = tl.dot(rgc, tl.trans(wgc))
     P = tl.dot(gc, tl.trans(v1))
     A2 = Rg * P * causal                                            # dk_intra coef [BT,BT]
-    wg_v1 = tl.reshape(wgc[:, :, None] * v1[:, None, :], [BT, BG * BV])
     G = tl.zeros([BT, BT], dtype=tl.float32)
-    KS = tl.zeros([BT, BG * BV], dtype=tl.float32)
     for d0b in range(ND):
         offs_d = d0b * BD + tl.arange(0, BD)
         dmask = offs_d < dqk
@@ -561,24 +599,70 @@ def _par_grad_rla_kwv(q_ptr, k_ptr, v_ptr, wg_ptr, rg_ptr, g_ptr, dSa_ptr, dk_pt
                      mask=rmask[:, None] & dmask[None, :], other=0.0)
         kc = tl.load(k_ptr + b*sq_b + rows[:, None]*sq_l + offs_d[None, :]*sq_d,
                      mask=rmask[:, None] & dmask[None, :], other=0.0)
-        dSa = tl.load(dSa_ptr + b*ssb_b + sb*ssb_n + t*ssb_t +
-                      offs_d[:, None]*ssb_d + offs_e[None, :]*ssb_e, mask=dmask[:, None], other=0.0)
-        dk_d = tl.dot(tl.trans(A2).to(qc.dtype), qc) + tl.dot(wg_v1.to(dSa.dtype), tl.trans(dSa))
+        dk_d = tl.dot(tl.trans(A2).to(qc.dtype), qc)
         tl.store(dk_ptr + b*sdk_b + sb*sdk_n + rows[:, None]*sdk_l + offs_d[None, :]*sdk_d,
                  dk_d, mask=rmask[:, None] & dmask[None, :])
         G += tl.dot(qc, tl.trans(kc))
-        KS += tl.dot(kc, dSa.to(kc.dtype))
     A = G * Rg * causal
     B2 = G * P * causal
     dw_intra = tl.dot(tl.trans(B2).to(rgc.dtype), rgc)
     dv_intra = tl.dot(tl.trans(A).to(gc.dtype), gc)
-    KS3 = tl.reshape(KS, [BT, BG, BV])
+    tl.store(dw_ptr + b*sdw_b + rows[:, None]*sdw_l + offs_c[None, :]*sdw_c,
+             dw_intra, mask=rmask[:, None] & cmask[None, :])
+    tl.store(dv_ptr + b*sdv_b + sb*sdv_n + rows[:, None]*sdv_l + offs_v[None, :]*sdv_d,
+             dv_intra, mask=rmask[:, None] & (offs_v[None, :] < dv))
+
+
+@triton.autotune(configs=_BWD_CFGS, key=_AT_KEY,
+                 prune_configs_by={'early_config_prune': _prune_bwd_bd}, **autotune_cache_kwargs)
+@triton.jit
+def _par_grad_rla_kwv_inter(k_ptr, v_ptr, wg_ptr, dSa_ptr, dk_ptr, dw_ptr, dv_ptr,
+                            L, dqk: tl.constexpr, dv, nc,
+                            sq_b, sq_l, sq_d, sv_b, sv_l, sv_d, sg_b, sg_l, sg_c,
+                            ssb_b, ssb_n, ssb_t, ssb_d, ssb_e,
+                            sdk_b, sdk_n, sdk_l, sdk_d, sdw_b, sdw_l, sdw_c, sdv_b, sdv_n, sdv_l, sdv_d,
+                            BT: tl.constexpr, BC: tl.constexpr, NC: tl.constexpr,
+                            BD: tl.constexpr, BV: tl.constexpr, BG: tl.constexpr):
+    # Inter-chunk (state) grads for one BC-row sub-block: the [BC,BG*BV] state terms (wg_v1, KS) fit
+    # at any BT. Writes its OWN dk/dw/dv buffers (disjoint rows per BC-block → plain store, autotune-
+    # safe); _bwd_split_rla host-sums them with the intra kernel's buffers.
+    ND = tl.cdiv(dqk, BD)
+    b = tl.program_id(0)
+    sb = tl.program_id(1)
+    tc = tl.program_id(2)
+    t = tc // NC
+    ic = tc % NC
+    offs_t = ic * BC + tl.arange(0, BC)
+    offs_v = tl.arange(0, BV)
+    offs_e = tl.arange(0, BG * BV)
+    offs_c = sb * BG + tl.arange(0, BG)
+    cmask = offs_c < nc
+    vmask = offs_v < dv
+    rows = t * BT + offs_t
+    rmask = rows < L
+    v1 = tl.load(v_ptr + b*sv_b + rows[:, None]*sv_l + offs_v[None, :]*sv_d,
+                 mask=rmask[:, None] & (offs_v[None, :] < dv), other=0.0)
+    wgc = tl.load(wg_ptr + b*sg_b + rows[:, None]*sg_l + offs_c[None, :]*sg_c, mask=rmask[:, None] & cmask[None, :], other=0.0)
+    wg_v1 = tl.reshape(wgc[:, :, None] * v1[:, None, :], [BC, BG * BV])
+    KS = tl.zeros([BC, BG * BV], dtype=tl.float32)
+    for d0b in range(ND):
+        offs_d = d0b * BD + tl.arange(0, BD)
+        dmask = offs_d < dqk
+        kc = tl.load(k_ptr + b*sq_b + rows[:, None]*sq_l + offs_d[None, :]*sq_d,
+                     mask=rmask[:, None] & dmask[None, :], other=0.0)
+        dSa = tl.load(dSa_ptr + b*ssb_b + sb*ssb_n + t*ssb_t +
+                      offs_d[:, None]*ssb_d + offs_e[None, :]*ssb_e, mask=dmask[:, None], other=0.0)
+        dk_KV = tl.dot(wg_v1.to(dSa.dtype), tl.trans(dSa))
+        tl.store(dk_ptr + b*sdk_b + sb*sdk_n + rows[:, None]*sdk_l + offs_d[None, :]*sdk_d,
+                 dk_KV, mask=rmask[:, None] & dmask[None, :])
+        KS += tl.dot(kc, dSa.to(kc.dtype))
+    KS3 = tl.reshape(KS, [BC, BG, BV])
     dw_wr = tl.sum(KS3 * v1[:, None, :], axis=2)
     dv_wr = tl.sum(wgc[:, :, None] * KS3, axis=1)
     tl.store(dw_ptr + b*sdw_b + rows[:, None]*sdw_l + offs_c[None, :]*sdw_c,
-             dw_intra + dw_wr, mask=rmask[:, None] & cmask[None, :])
+             dw_wr, mask=rmask[:, None] & cmask[None, :])
     tl.store(dv_ptr + b*sdv_b + sb*sdv_n + rows[:, None]*sdv_l + offs_v[None, :]*sdv_d,
-             dv_intra + dv_wr, mask=rmask[:, None] & (offs_v[None, :] < dv))
+             dv_wr, mask=rmask[:, None] & (offs_v[None, :] < dv))
 
 
 @triton.autotune(configs=_BWD_CFGS, key=_AT_KEY,
@@ -779,18 +863,31 @@ def _bwd_split_rla(q, k, v, wg, rg, g, chunk=None, BG=16):
                               USE_G=False, BT=chunk, BD=BK_scan, BV=BV, BG=BG, NCH=NCH)
     _scan_dS[(B, NB, ND_scan)](q, rg, wg, g, dSa, L, dqk, dv, nc, *sq, *sg, *sgr, *sS,
                                USE_G=False, BT=chunk, BD=BK_scan, BV=BV, BG=BG, NCH=NCH)
-    _par_grad_rla_qr[(B, NB, NCH)](q, k, v, wg, rg, g, Sb, dq, dr, L, dqk, dv, nc,
-                                   *sq, *sv, *sg, *sgr, *sS,
-                                   dq.stride(0), dq.stride(1), dq.stride(2), dq.stride(
-                                       3), dr.stride(0), dr.stride(1), dr.stride(2),
-                                   BT=chunk, BV=BV, BG=BG, NCH=NCH)
-    _par_grad_rla_kwv[(B, NB, NCH)](q, k, v, wg, rg, g, dSa, dk, dw, dvo, L, dqk, dv, nc,
-                                    *sq, *sv, *sg, *sgr, *sS,
-                                    dk.stride(0), dk.stride(1), dk.stride(2), dk.stride(
-                                        3), dw.stride(0), dw.stride(1), dw.stride(2),
-                                    dvo.stride(0), dvo.stride(1), dvo.stride(2), dvo.stride(3),
-                                    BT=chunk, BV=BV, BG=BG, NCH=NCH)
-    return dq.sum(1), dk.sum(1), dvo.sum(1)[..., :dv], dw, dr
+    sdq = (dq.stride(0), dq.stride(1), dq.stride(2), dq.stride(3))
+    sdr = (dr.stride(0), dr.stride(1), dr.stride(2))
+    sdk = (dk.stride(0), dk.stride(1), dk.stride(2), dk.stride(3))
+    sdw = (dw.stride(0), dw.stride(1), dw.stride(2))
+    sdv = (dvo.stride(0), dvo.stride(1), dvo.stride(2), dvo.stride(3))
+    # qr / kwv split (Review-3 BC): intra keeps the [BT,BT] grams (full BT); inter is BC-tiled over
+    # rows for the [BT,BG*BV] state terms — lets BT grow past the single-program 128KB smem wall.
+    # Each writes its OWN buffers (autotune-safe plain stores); host-summed below.
+    dqi, dri = torch.empty_like(dq), torch.empty_like(dr)
+    dki, dwi, dvi = torch.empty_like(dk), torch.empty_like(dw), torch.empty_like(dvo)
+    BC = min(16, chunk)
+    NC = triton.cdiv(chunk, BC)
+    _par_grad_rla_qr_intra[(B, NB, NCH)](q, k, v, wg, rg, g, dq, dr, L, dqk, dv, nc,
+                                         *sq, *sv, *sg, *sgr, *sdq, *sdr,
+                                         BT=chunk, BV=BV, BG=BG, NCH=NCH)
+    _par_grad_rla_qr_inter[(B, NB, NCH * NC)](q, rg, g, Sb, dqi, dri, L, dqk, dv, nc,
+                                              *sq, *sg, *sgr, *sS, *sdq, *sdr,
+                                              BT=chunk, BC=BC, NC=NC, BV=BV, BG=BG)
+    _par_grad_rla_kwv_intra[(B, NB, NCH)](q, k, v, wg, rg, g, dk, dw, dvo, L, dqk, dv, nc,
+                                          *sq, *sv, *sg, *sgr, *sdk, *sdw, *sdv,
+                                          BT=chunk, BV=BV, BG=BG, NCH=NCH)
+    _par_grad_rla_kwv_inter[(B, NB, NCH * NC)](k, v, wg, dSa, dki, dwi, dvi, L, dqk, dv, nc,
+                                               *sq, *sv, *sg, *sS, *sdk, *sdw, *sdv,
+                                               BT=chunk, BC=BC, NC=NC, BV=BV, BG=BG)
+    return (dq + dqi).sum(1), (dk + dki).sum(1), (dvo + dvi).sum(1)[..., :dv], dw + dwi, dr + dri
 
 
 def _bwd_split_gla(q, k, v, wg, rg, ld, g, chunk=None, BG=16):
