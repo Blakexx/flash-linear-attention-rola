@@ -40,11 +40,11 @@ def _unfold(t, B, H):                          # [B*H, L, D] -> [B, L, H, D]
 
 def rla_triton_normalized(q, k, v, rg, wg):
     """[B,L,H,*] -> normalized [B,L,H,dv] via the SPLIT path (production kappa/global): numerator-only
-    kernel (den=False, BV=next_pow2(dv)) + global denominator reconstructed as Σ_c rgᶜ·dᶜ from the
-    per-state den pre-pass — the ones-column is redundant (= Σ_c rgᶜ·dᶜ). Half the tile width."""
+    kernel (BV=next_pow2(dv)) + global denominator reconstructed as Σ_c rgᶜ·dᶜ from the per-state
+    den pre-pass. Half the tile width."""
     B, L, H, dv = v.shape
     qf, kf, rgf, wgf = _fold(q), _fold(k), _fold(rg), _fold(wg)
-    numf = rola_rla_triton(qf, kf, _fold(v), rgf, wgf, den=False)         # [BH,L,dv]
+    numf = rola_rla_triton(qf, kf, _fold(v), rgf, wgf)                    # [BH,L,dv]
     d = rola_perstate_den_triton(qf, kf, wgf)                            # [BH,L,nc]
     denf = (rgf * d).sum(-1, keepdim=True)
     return _unfold(numf / (denf + EPS), B, H)
@@ -69,7 +69,7 @@ def gla_triton_normalized(q, k, v, rg, wg, ld):
     + global den Σ_c rgᶜ·dᶜ from the decayed per-state den pre-pass. r=read=rg, w=write=wg."""
     B, L, H, dv = v.shape
     qf, kf, rgf, wgf, ldf = _fold(q), _fold(k), _fold(rg), _fold(wg), _fold(ld)
-    numf = rola_gla_triton(qf, kf, _fold(v), rgf, wgf, ldf, den=False)   # [BH,L,dv]
+    numf = rola_gla_triton(qf, kf, _fold(v), rgf, wgf, ldf)             # [BH,L,dv]
     d = rola_perstate_den_gla_triton(qf, kf, wgf, ldf)                   # [BH,L,nc]
     denf = (rgf * d).sum(-1, keepdim=True)
     return _unfold(numf / (denf + EPS), B, H)

@@ -94,13 +94,13 @@ def _perstate_den_torch(q, k, w, ld, chunk_size, eps=1e-5):
     return torch.exp(A) * s
 
 
-def _readout(qf, kf, vf, rf, wf, gf, chunk_size, den):
-    """Folded routed readout. CUDA → device-agnostic Triton kernels (den flag); else → eager core.
-    den=False is the numerator-only path (BV halves); den=True augments (caller pre-adds ones-col)."""
+def _readout(qf, kf, vf, rf, wf, gf, chunk_size):
+    """Folded routed readout (numerator-only). CUDA → device-agnostic Triton kernels; else → eager
+    core. The global denominator is the caller's separate per-state den pre-pass."""
     if qf.is_cuda:
         if gf is None:
-            return rola_rla_triton(qf, kf, vf, rf, wf, chunk=chunk_size, den=den)
-        return rola_gla_triton(qf, kf, vf, rf, wf, gf, den=den)
+            return rola_rla_triton(qf, kf, vf, rf, wf, chunk=chunk_size)
+        return rola_gla_triton(qf, kf, vf, rf, wf, gf)
     return _rola_chunk_core(qf, kf, vf, wf, rf, gf, chunk_size)
 
 
@@ -139,7 +139,7 @@ def chunk_rola(q, k, v, r, w, g=None, norm='kappa', kappa=None, scale=None, eps=
     gf = fold(g) if g is not None else None
 
     if norm == 'raw':
-        return unfold(_readout(qf, kf, vf, rf, wf, gf, chunk_size, den=False)).to(v.dtype)
+        return unfold(_readout(qf, kf, vf, rf, wf, gf, chunk_size)).to(v.dtype)
 
     # global / per_state / kappa: per-state den pre-pass → rescale read gates → numerator-only
     # readout → divide by the reconstructed global den Σ_c r̃ᶜ·dᶜ.
@@ -156,6 +156,6 @@ def chunk_rola(q, k, v, r, w, g=None, norm='kappa', kappa=None, scale=None, eps=
     elif norm == 'per_state':
         rf = (rf / (d + eps)).to(gate_dtype)
     # norm == 'global': r̃ = r (unchanged)
-    num = _readout(qf, kf, vf, rf, wf, gf, chunk_size, den=False)
+    num = _readout(qf, kf, vf, rf, wf, gf, chunk_size)
     den = (rf * d).sum(-1, keepdim=True)
     return unfold(num / (den + eps)).to(v.dtype)
