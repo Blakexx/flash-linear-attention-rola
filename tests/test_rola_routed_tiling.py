@@ -19,7 +19,7 @@ numerator — so we fold + apply the ones-column denominator trick (exactly as r
 import sys
 import torch
 
-from rola import _rola_global_ref, _rola_gla_ref, _rola_perstate_den, _rola_gla_perstate_den
+from fla_rola.ops.rola.naive import _rola_global_ref, _rola_gla_ref, _rola_perstate_den, _rola_gla_perstate_den
 from fla_rola.ops.rola import (rola_rla_triton, rola_gla_triton,
                                rola_perstate_den_triton, rola_perstate_den_gla_triton)
 
@@ -95,7 +95,7 @@ def check_forward(Ks):
         ref = _rola_global_ref(q, k, v, wg, rg)
         out = rla_triton_normalized(*[t.float() for t in (q, k, v, rg, wg)]).double()
         rel = (out - ref).abs().max().item() / (ref.abs().max().item() + 1e-9)
-        res[K] = rel < 2e-2
+        res[K] = rel < 5e-3
         P(f"  K={K:4d}  {'PASS' if res[K] else 'FAIL'}  rel={rel:.2e}")
     return res
 
@@ -113,7 +113,7 @@ def check_backward(Ks):
             rels = [("qkvrw"[i], (ik[i].grad.double() - io[i].grad).abs().max().item()
                      / (io[i].grad.abs().max().item() + 1e-9)) for i in range(5)]
             worst = max(r for _, r in rels)
-            res[K] = worst < 3e-2
+            res[K] = worst < 8e-3
             P(f"  K={K:4d}  {'PASS' if res[K] else 'FAIL'}  worst={worst:.2e}  "
               f"({', '.join(f'{n}:{r:.1e}' for n, r in rels)})")
         except Exception as e:
@@ -143,7 +143,8 @@ def check_forward_gla(Ks):
             ref = _rola_gla_ref(q, k, v, wg, rg, ld, normalized=True)
             out = gla_triton_normalized(*[t.float() for t in (q, k, v, rg, wg, ld)]).double()
             rel = (out - ref).abs().max().item() / (ref.abs().max().item() + 1e-9)
-            res[K] = rel < 2e-2
+            res[K] = rel < 3e-2   # GLA exp(cumsum(ld)) decay caps fp32-vs-fp64 at ~1.5e-2; tight GLA-fwd
+            #                       correctness is the inter routed==chunk gate (fp32 vs fp32, ~1.5e-3).
             P(f"  K={K:4d}  {'PASS' if res[K] else 'FAIL'}  rel={rel:.2e}")
         except Exception as e:
             res[K] = False
@@ -164,7 +165,7 @@ def check_backward_gla(Ks):
             rels = [("qkvrwl"[i], (ik[i].grad.double() - io[i].grad).abs().max().item()
                      / (io[i].grad.abs().max().item() + 1e-9)) for i in range(6)]
             worst = max(r for _, r in rels)
-            res[K] = worst < 3e-2
+            res[K] = worst < 8e-3
             P(f"  K={K:4d}  {'PASS' if res[K] else 'FAIL'}  worst={worst:.2e}  "
               f"({', '.join(f'{n}:{r:.1e}' for n, r in rels)})")
         except Exception as e:
@@ -188,7 +189,7 @@ def check_forward_den(Ks):
             out = _unfold(rola_perstate_den_triton(_fold(q.float()), _fold(k.float()),
                                                    _fold(wg.float())), 2, 2).double()
             rel = (out - ref).abs().max().item() / (ref.abs().max().item() + 1e-9)
-            res[K] = rel < 2e-2
+            res[K] = rel < 5e-3
             P(f"  K={K:4d}  {'PASS' if res[K] else 'FAIL'}  rel={rel:.2e}")
         except Exception as e:
             res[K] = False
@@ -209,7 +210,7 @@ def check_backward_den(Ks):
             rels = [("qkw"[i], (ik[i].grad.double() - io[i].grad).abs().max().item()
                      / (io[i].grad.abs().max().item() + 1e-9)) for i in range(3)]
             worst = max(r for _, r in rels)
-            res[K] = worst < 3e-2
+            res[K] = worst < 8e-3
             P(f"  K={K:4d}  {'PASS' if res[K] else 'FAIL'}  worst={worst:.2e}  "
               f"({', '.join(f'{n}:{r:.1e}' for n, r in rels)})")
         except Exception as e:
@@ -228,7 +229,7 @@ def check_forward_den_gla(Ks):
             out = _unfold(rola_perstate_den_gla_triton(_fold(q.float()), _fold(k.float()),
                                                        _fold(wg.float()), _fold(ld.float())), 2, 2).double()
             rel = (out - ref).abs().max().item() / (ref.abs().max().item() + 1e-9)
-            res[K] = rel < 2e-2
+            res[K] = rel < 3e-2   # GLA decay fp32-vs-fp64 floor (see check_forward_gla)
             P(f"  K={K:4d}  {'PASS' if res[K] else 'FAIL'}  rel={rel:.2e}")
         except Exception as e:
             res[K] = False
@@ -250,7 +251,7 @@ def check_backward_den_gla(Ks):
             rels = [("qkwl"[i], (ik[i].grad.double() - io[i].grad).abs().max().item()
                      / (io[i].grad.abs().max().item() + 1e-9)) for i in range(4)]
             worst = max(r for _, r in rels)
-            res[K] = worst < 3e-2
+            res[K] = worst < 8e-3
             P(f"  K={K:4d}  {'PASS' if res[K] else 'FAIL'}  worst={worst:.2e}  "
               f"({', '.join(f'{n}:{r:.1e}' for n, r in rels)})")
         except Exception as e:

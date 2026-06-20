@@ -17,7 +17,7 @@ import torch
 
 from fla_rola.ops.simple_gla import chunk_simple_gla
 from fla_rola.ops.simple_gla.fused_recurrent import fused_recurrent_simple_gla
-from rola import _rola_global_ref, _rola_gla_ref     # naive O(L^2) DIRECT oracle (no vh glue)
+from fla_rola.ops.rola.naive import _rola_global_ref, _rola_gla_ref     # naive O(L^2) DIRECT oracle (no vh glue)
 
 DEV = "cuda"
 B, H, DQK, DV = 4, 4, 16, 16
@@ -110,41 +110,93 @@ def main():
       f"B={B} H={H} dqk=dv={DQK}, L=64 | max-rel over random seeds")
     SEEDS = range(6)                       # random-sampled inputs (reproducible)
     NCS = (16, 64)
-    TOL = 3e-2
+    DVS = (16, 32, 64)                     # dv=16: un-tiled (ND_V=1); 32/64: engage the value-tiling (ND_V>=2)
+    TOL = 5e-3          # clean residuals are ~1.5e-3 (routed==naive); 5e-3 = ~3x headroom, catches a
+                        # ~1% uniform error (the audit's MUT-1 blind spot was the old loose 3e-2).
     res = {}
-    for gla in (False, True):
-        for nc in NCS:
-            for norm in ('global', 'kappa', 'per_state'):
-                w_rc, w_cn, w_rn, w_kc = 0.0, 0.0, 0.0, 0.0   # rec-chunk, chunk-naive, rec-naive, routed-chunk
-                w_kn = 0.0                                     # routed-naive (global only)
-                for seed in SEEDS:
-                    q, k, v, r, w, ld = _mk(64, nc, gla, seed)
-                    o_chunk = _chunked(q, k, v, r, w, ld, nc, norm)
-                    o_rec = _recurrent(q, k, v, r, w, ld, nc, norm)
-                    o_routed = _routed(q, k, v, r, w, ld, nc, norm)        # the routed (split) kernel
-                    w_rc = max(w_rc, _relmax(o_rec, o_chunk))
-                    w_kc = max(w_kc, _relmax(o_routed, o_chunk))           # vh == routed-kernel
-                    # naive direct oracle exists for the GLOBAL norm (no vh glue) — the 3-way anchor
-                    # that catches a shared vh-expand/combine bug recurrent==chunked alone would miss.
+    global DV
+    for DV in DVS:                         # routed kernel's value tile follows from dv -> exercises every ND_V
+        for gla in (False, True):
+            for nc in NCS:
+                for norm in ('global', 'kappa', 'per_state'):
+                    w_rc, w_cn, w_rn, w_kc = 0.0, 0.0, 0.0, 0.0   # rec-chunk, chunk-naive, rec-naive, routed-chunk
+                    w_kn = 0.0                                     # routed-naive (global only)
+                    for seed in SEEDS:
+                        q, k, v, r, w, ld = _mk(64, nc, gla, seed)
+                        o_chunk = _chunked(q, k, v, r, w, ld, nc, norm)
+                        o_rec = _recurrent(q, k, v, r, w, ld, nc, norm)
+                        o_routed = _routed(q, k, v, r, w, ld, nc, norm)        # the routed (split) kernel
+                        w_rc = max(w_rc, _relmax(o_rec, o_chunk))
+                        w_kc = max(w_kc, _relmax(o_routed, o_chunk))           # vh == routed-kernel
+                        # naive direct oracle exists for the GLOBAL norm (no vh glue) — the 3-way anchor
+                        # that catches a shared vh-expand/combine bug recurrent==chunked alone would miss.
+                        if norm == 'global':
+                            o_naive = _naive(q, k, v, r, w, ld, gla)
+                            w_cn = max(w_cn, _relmax(o_chunk, o_naive))
+                            w_rn = max(w_rn, _relmax(o_rec, o_naive))
+                            w_kn = max(w_kn, _relmax(o_routed, o_naive))
+                    tag = f"dv={DV:<3d} {'GLA' if gla else 'RLA'} nc={nc:<3d} norm={norm}"
                     if norm == 'global':
-                        o_naive = _naive(q, k, v, r, w, ld, gla)
-                        w_cn = max(w_cn, _relmax(o_chunk, o_naive))
-                        w_rn = max(w_rn, _relmax(o_rec, o_naive))
-                        w_kn = max(w_kn, _relmax(o_routed, o_naive))
-                tag = f"{'GLA' if gla else 'RLA'} nc={nc:<3d} norm={norm}"
-                if norm == 'global':
-                    ok = max(w_rc, w_cn, w_rn, w_kc, w_kn) < TOL
-                    P(f"  {tag:24s} rec==chunk={w_rc:.1e} chunk==naive={w_cn:.1e} rec==naive={w_rn:.1e}"
-                      f" routed==chunk={w_kc:.1e} routed==naive={w_kn:.1e}  {'PASS' if ok else 'FAIL'}")
-                else:
-                    ok = max(w_rc, w_kc) < TOL
-                    P(f"  {tag:24s} rec==chunk={w_rc:.1e} routed==chunk={w_kc:.1e} (norm-rescale; naive=global only)"
-                      f"  {'PASS' if ok else 'FAIL'}")
-                res[tag] = ok
+                        ok = max(w_rc, w_cn, w_rn, w_kc, w_kn) < TOL
+                        P(f"  {tag:30s} rec==chunk={w_rc:.1e} chunk==naive={w_cn:.1e} rec==naive={w_rn:.1e}"
+                          f" routed==chunk={w_kc:.1e} routed==naive={w_kn:.1e}  {'PASS' if ok else 'FAIL'}")
+                    else:
+                        ok = max(w_rc, w_kc) < TOL
+                        P(f"  {tag:30s} rec==chunk={w_rc:.1e} routed==chunk={w_kc:.1e} (norm-rescale; naive=global only)"
+                          f"  {'PASS' if ok else 'FAIL'}")
+                    res[tag] = ok
     allok = all(res.values())
     P(f"\n-> {'ALL GREEN' if allok else 'NOT GREEN'}")
     return 0 if allok else 1
 
 
+def _grad_through(fwd, q, k, v, r, w, ld, gla, coef):
+    """autograd grads of (fwd(...)*coef).sum() w.r.t. (q,k,v,r,w[,ld]) — the backward source of truth."""
+    ins = [x.clone().requires_grad_() for x in ([q, k, v, r, w] + ([ld] if gla else []))]
+    ld_in = ins[5] if gla else None
+    o = fwd(ins[0], ins[1], ins[2], ins[3], ins[4], ld_in)
+    return torch.autograd.grad((o * coef).sum(), ins)
+
+
+def backward_gate():
+    """INTER backward: the routed kernel's analytic grad must equal autograd through TWO independent
+    implementations — the naive O(L^2) oracle AND the virtual-heads chunk_simple_gla — across dv (so
+    the value-tiled backward is what's checked). global norm (the naive oracle exists there). Run at
+    BT=16 so the fp32 value-tiled backward fits a 99KB card (rigorous ~1e-3, not the bf16 floor)."""
+    import fla_rola.ops.rola.chunk as _C
+    _C._CHUNK = 16
+    _C._CHUNK_FWD = 16
+    global DV
+    P("\n=== INTER backward | routed-kernel grad == autograd(naive oracle) == autograd(vh-chunk), norm=global, BT=16 fp32 ===")
+    SEEDS = range(3)
+    TOL = 8e-3          # clean ~4e-3 (routed==vhchunk, two distinct fp32 impls); 8e-3 = 2x, catches the
+                        # ~2% MUT-1 class. (Backward across two impls is intrinsically looser than fwd.)
+    res = {}
+    for DV in (16, 32, 64):
+        for gla in (False, True):
+            for nc in (16, 64):
+                w_kn = w_kc = w_cn = 0.0   # routed-vs-naive, routed-vs-vhchunk, vhchunk-vs-naive (grads)
+                for seed in SEEDS:
+                    q, k, v, r, w, ld = _mk(64, nc, gla, seed)
+                    coef = torch.randn(*v.shape, device=DEV)
+                    g_routed = _grad_through(lambda a, b, c, d, e, f: _routed(a, b, c, d, e, f, nc, 'global'),
+                                             q, k, v, r, w, ld, gla, coef)
+                    g_naive = _grad_through(lambda a, b, c, d, e, f: _naive(a, b, c, d, e, f, gla),
+                                            q, k, v, r, w, ld, gla, coef)
+                    g_chunk = _grad_through(lambda a, b, c, d, e, f: _chunked(a, b, c, d, e, f, nc, 'global'),
+                                            q, k, v, r, w, ld, gla, coef)
+                    w_kn = max(w_kn, max(_relmax(a, b) for a, b in zip(g_routed, g_naive)))
+                    w_kc = max(w_kc, max(_relmax(a, b) for a, b in zip(g_routed, g_chunk)))
+                    w_cn = max(w_cn, max(_relmax(a, b) for a, b in zip(g_chunk, g_naive)))
+                tag = f"dv={DV:<3d} {'GLA' if gla else 'RLA'} nc={nc}"
+                ok = max(w_kn, w_kc, w_cn) < TOL
+                P(f"  {tag:22s} routed==naive={w_kn:.1e} routed==vhchunk={w_kc:.1e} vhchunk==naive={w_cn:.1e}  {'PASS' if ok else 'FAIL'}")
+                res[tag] = ok
+    return all(res.values())
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    fwd_ok = main() == 0
+    bwd_ok = backward_gate()
+    P(f"\n=> forward {'GREEN' if fwd_ok else 'RED'} | backward {'GREEN' if bwd_ok else 'RED'}")
+    sys.exit(0 if (fwd_ok and bwd_ok) else 1)
