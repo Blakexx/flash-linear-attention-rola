@@ -45,7 +45,7 @@ class RoLABlock(GradientCheckpointingLayer):
         self.attn_norm = (RMSNorm if config.fuse_norm else nn.RMSNorm)(config.hidden_size, eps=config.norm_eps)
         # The RoLA layer is first-class (returns the 3-tuple) — call it directly, no adapter.
         kw = rola_instance(config.rola_instance, head_k_dim=config.d_qk, head_v_dim=config.d_v,
-                           num_states=config.num_states, num_heads=config.num_heads)
+                           states_per_head=config.states_per_head, num_heads=config.num_heads)
         self.attn = RoLA(hidden_size=config.hidden_size, layer_idx=layer_idx, **kw)
         self.mlp_norm = (RMSNorm if config.fuse_norm else nn.RMSNorm)(config.hidden_size, eps=config.norm_eps)
         self.mlp = GatedMLP(

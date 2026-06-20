@@ -2,7 +2,7 @@
 
 """RoLAConfig — HF config for the RoLA causal LM. Mirrors GLAConfig (same backbone/MLP/norm/fuse
 fields); the sequence mixer is RoLA, parameterized by a `rola_instance` preset name + the routed-
-state geometry (num_states, d_qk, d_v, num_heads)."""
+state geometry (states_per_head, d_qk, d_v, num_heads)."""
 from transformers.configuration_utils import PretrainedConfig
 
 
@@ -15,7 +15,7 @@ class RoLAConfig(PretrainedConfig):
         self,
         # --- RoLA mixer (the only architecture-specific axis) ---
         rola_instance: str = 'rola-rla-kappa-asym',   # see fla_rola.models.rola.instances.ROLA_INSTANCES
-        num_states: int = 16,                          # routed states (nc)
+        states_per_head: int = 16,                          # routed states (nc)
         d_qk: int = 16,
         d_v: int = 16,
         num_heads: int = 8,
@@ -43,7 +43,7 @@ class RoLAConfig(PretrainedConfig):
         **kwargs,
     ):
         self.rola_instance = rola_instance
-        self.num_states = num_states
+        self.states_per_head = states_per_head
         self.d_qk = d_qk
         self.d_v = d_v
         self.num_heads = num_heads

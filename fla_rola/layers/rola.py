@@ -2,7 +2,7 @@
 
 """RoLA — Routed Linear Attention (canonical FLA layer).
 
-Shared q/k/v/o projections + learned dense read/write routing over `num_states`
+Shared q/k/v/o projections + learned dense read/write routing over `states_per_head`
 recurrent states, with a feature-mapped linear-attention inner kernel. The whole
 normalization recipe (per-state denominator pre-pass, read-gate rescale, shared-Gram
 numerator-only readout, divide) lives in the `chunk_rola` op — the layer only
@@ -63,7 +63,7 @@ class RoLA(nn.Module):
         num_heads (int): number of heads (H). Default 8.
         head_k_dim (int): per-head query/key dim (d_qk). Default 16.
         head_v_dim (int): per-head value dim (d_v). Default 32.
-        num_states (int): number of routed recurrent states (nc). Default 16.
+        states_per_head (int): number of routed recurrent states (nc). Default 16.
         kernel (str): 'rla' (un-decayed) or 'gla_scalar' (per-state scalar decay). Default 'rla'.
         phi (str): feature map for 'rla' — 'elu' | 'hedgehog' | 'based' | 'rebased'. Default 'elu'.
                    ('gla_scalar' always uses elu.)
@@ -84,7 +84,7 @@ class RoLA(nn.Module):
         num_heads: int = 8,
         head_k_dim: int = 16,
         head_v_dim: int = 32,
-        num_states: int = 16,
+        states_per_head: int = 16,
         kernel: str = 'rla',
         phi: str = 'elu',
         state_norm: str = 'kappa',
@@ -109,7 +109,7 @@ class RoLA(nn.Module):
         self.num_heads = num_heads
         self.head_k_dim = head_k_dim
         self.head_v_dim = head_v_dim
-        self.num_states = num_states
+        self.states_per_head = states_per_head
         self.kernel = kernel
         self.phi = phi
         self.state_norm = state_norm
@@ -157,11 +157,11 @@ class RoLA(nn.Module):
         # read_router=None and reuses write_router in _route — registering a second module that
         # aliases the same weight puts two keys for one tensor in the state_dict and crashes HF
         # safetensors save ("shared tensors ... not properly defined").
-        self.write_router = nn.Linear(hidden_size, num_heads * num_states, bias=router_bias)
+        self.write_router = nn.Linear(hidden_size, num_heads * states_per_head, bias=router_bias)
         if tie_routers:
             self.read_router = None
         else:
-            self.read_router = nn.Linear(hidden_size, num_heads * num_states, bias=router_bias)
+            self.read_router = nn.Linear(hidden_size, num_heads * states_per_head, bias=router_bias)
             if tie_router_init:
                 self.read_router.weight.data.copy_(self.write_router.weight.data)
                 if router_bias:
@@ -186,7 +186,7 @@ class RoLA(nn.Module):
 
     def _route(self, x):
         B, L = x.shape[0], x.shape[1]
-        H, C = self.num_heads, self.num_states
+        H, C = self.num_heads, self.states_per_head
         write_gates = F.softmax(self.write_router(x).view(B, L, H, C), dim=-1)
         rr = self.read_router if self.read_router is not None else self.write_router  # sym reuses write
         read_gates = F.softmax(rr(x).view(B, L, H, C), dim=-1)
@@ -262,8 +262,8 @@ class RoLA(nn.Module):
             'feat_dim': self.feat_dim,
             'd_v': self.head_v_dim,
             'n_heads': self.num_heads,
-            'num_chunks': self.num_states,
-            'state_floats': self.num_heads * self.num_states * per_entry,
+            'num_chunks': self.states_per_head,
+            'state_floats': self.num_heads * self.states_per_head * per_entry,
         }
 
     def state_size(self, sequence_length: int = None, **kwargs) -> int:

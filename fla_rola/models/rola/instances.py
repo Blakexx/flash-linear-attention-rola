@@ -23,9 +23,9 @@ ROLA_INSTANCES = (
 _EXPERIMENTAL = ('rola-gla-sym', 'rola-gla-norm-sym', 'rola-gdn-sym')
 
 
-def rola_instance(name, head_k_dim, head_v_dim, num_states, num_heads=8):
+def rola_instance(name, head_k_dim, head_v_dim, states_per_head, num_heads=8):
     """Return fla_rola.layers.RoLA kwargs for a named instance."""
-    common = dict(head_k_dim=head_k_dim, head_v_dim=head_v_dim, num_states=num_states,
+    common = dict(head_k_dim=head_k_dim, head_v_dim=head_v_dim, states_per_head=states_per_head,
                   num_heads=num_heads, use_short_conv=False)
     sym = name.endswith('-sym')
 
