@@ -28,6 +28,7 @@ from .nsa import NativeSparseAttention
 from .path_attn import PaTHAttention
 from .rebased import ReBasedLinearAttention
 from .rodimus import RodimusAttention, SlidingWindowSharedKeyAttention
+from .rola import RoLA
 from .rwkv6 import RWKV6Attention
 from .rwkv7 import RWKV7Attention
 
@@ -61,6 +62,7 @@ __all__ = [
     'RWKV6Attention',
     'RWKV7Attention',
     'ReBasedLinearAttention',
+    'RoLA',
     'RodimusAttention',
     'SlidingWindowSharedKeyAttention',
 ]
