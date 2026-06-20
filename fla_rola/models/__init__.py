@@ -28,6 +28,7 @@ from fla_rola.models.nsa import NSAConfig, NSAForCausalLM, NSAModel
 from fla_rola.models.path_attn import PaTHAttentionConfig, PaTHAttentionForCausalLM, PaTHAttentionModel
 from fla_rola.models.retnet import RetNetConfig, RetNetForCausalLM, RetNetModel
 from fla_rola.models.rodimus import RodimusConfig, RodimusForCausalLM, RodimusModel
+from fla_rola.models.rola import ROLA_INSTANCES, RoLAConfig, RoLAForCausalLM, RoLAModel, rola_instance
 from fla_rola.models.rwkv6 import RWKV6Config, RWKV6ForCausalLM, RWKV6Model
 from fla_rola.models.rwkv7 import RWKV7Config, RWKV7ForCausalLM, RWKV7Model
 from fla_rola.models.samba import SambaConfig, SambaForCausalLM, SambaModel
@@ -112,6 +113,11 @@ __all__ = [
     'RetNetConfig',
     'RetNetForCausalLM',
     'RetNetModel',
+    'ROLA_INSTANCES',
+    'RoLAConfig',
+    'RoLAForCausalLM',
+    'RoLAModel',
+    'rola_instance',
     'RodimusConfig',
     'RodimusForCausalLM',
     'RodimusModel',
