@@ -19,6 +19,7 @@ class RoLAConfig(PretrainedConfig):
         d_qk: int = 16,
         d_v: int = 16,
         num_heads: int = 8,
+        qk_norm: bool = False,                              # per-head qk-rmsnorm (LM-scale stabilizer)
         # --- backbone (mirrors GLAConfig) ---
         hidden_size: int = 1024,
         num_hidden_layers: int = 24,
@@ -47,6 +48,7 @@ class RoLAConfig(PretrainedConfig):
         self.d_qk = d_qk
         self.d_v = d_v
         self.num_heads = num_heads
+        self.qk_norm = qk_norm
 
         self.hidden_size = hidden_size
         self.num_hidden_layers = num_hidden_layers

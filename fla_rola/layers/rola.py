@@ -91,6 +91,7 @@ class RoLA(nn.Module):
         tie_routers: bool = False,
         tie_router_init: bool = False,
         router_bias: bool = False,
+        qk_norm: bool = False,
         use_short_conv: bool = False,
         conv_size: int = 4,
         conv_bias: bool = False,
@@ -114,6 +115,7 @@ class RoLA(nn.Module):
         self.phi = phi
         self.state_norm = state_norm
         self.tie_routers = tie_routers
+        self.qk_norm = qk_norm
         self.use_short_conv = use_short_conv
         self.conv_size = conv_size
         self.layer_idx = layer_idx
@@ -147,6 +149,13 @@ class RoLA(nn.Module):
         self.k_proj = nn.Linear(hidden_size, self.key_dim, bias=False)
         self.v_proj = nn.Linear(hidden_size, self.value_dim, bias=False)
         self.o_proj = nn.Linear(self.value_dim, hidden_size, bias=False)
+
+        # Optional qk-rmsnorm (per-head, pre-feature-map) — an LM-scale training stabilizer. Params
+        # are created ONLY when enabled, so the default (qk_norm=False) state_dict is byte-identical
+        # to before — the MQAR cells stay valid + reproducible.
+        if qk_norm:
+            self.q_norm_w = nn.Parameter(torch.ones(self.proj_qk))
+            self.k_norm_w = nn.Parameter(torch.ones(self.proj_qk))
 
         if use_short_conv:
             self.q_conv1d = ShortConvolution(self.key_dim, conv_size, bias=conv_bias, activation='silu')
@@ -228,6 +237,10 @@ class RoLA(nn.Module):
         q = rearrange(q, 'b l (h d) -> b l h d', d=self.proj_qk)
         k = rearrange(k, 'b l (h d) -> b l h d', d=self.proj_qk)
         v = rearrange(v, 'b l (h d) -> b l h d', d=self.head_v_dim)
+
+        if self.qk_norm:                              # unit-RMS q/k per head before the feature map
+            q = self.q_norm_w * q * torch.rsqrt(q.pow(2).mean(-1, keepdim=True) + 1e-5)
+            k = self.k_norm_w * k * torch.rsqrt(k.pow(2).mean(-1, keepdim=True) + 1e-5)
 
         qf, kf = self._feature_map(q, k)
         write_gates, read_gates = self._route(x)
