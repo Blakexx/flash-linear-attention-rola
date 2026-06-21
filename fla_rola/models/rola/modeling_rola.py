@@ -1,4 +1,4 @@
-# Copyright (c) 2023-2025, RoLA authors.
+# Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 
 """RoLAForCausalLM — HF causal LM with RoLA sequence mixers. Mirrors GLA's modeling (RMSNorm +
 mixer + GatedMLP blocks, fused losses, FLA cache/generation); the mixer is the first-class

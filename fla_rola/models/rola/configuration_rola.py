@@ -1,4 +1,4 @@
-# Copyright (c) 2023-2025, RoLA authors.
+# Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 
 """RoLAConfig — HF config for the RoLA causal LM. Mirrors GLAConfig (same backbone/MLP/norm/fuse
 fields); the sequence mixer is RoLA, parameterized by a `rola_instance` preset name + the routed-

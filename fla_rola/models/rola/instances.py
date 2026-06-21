@@ -1,4 +1,4 @@
-# Copyright (c) 2023-2025, RoLA authors.
+# Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 
 """rola_instance — named RoLA preset → fla_rola.layers.RoLA kwargs.
 
