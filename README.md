@@ -1,13 +1,54 @@
 # flash-linear-attention-rola
 
-Fork of [flash-linear-attention](https://github.com/fla-org/flash-linear-attention) carrying the
-**RoLA (Routed Linear Attention)** kernels: routed reads/writes over multiple shared-projection
-recurrent states as additive `r`/`w`/`g` parameters on `chunk_simple_gla`, with shared-gram fused
-Triton forward and chunk-parallel backward kernels (RLA and scalar-gated GLA variants), and the
-per-state denominator kernels for the learned kappa normalization (additive and decayed, with
-in-kernel dld assembly). The routed entry points live in `fla_rola/ops/simple_gla/` (`rola.py`,
-`chunk.py`); the unrouted path is verified bit-identical to upstream. Part of the RoLA paper
+Fork of [flash-linear-attention](https://github.com/fla-org/flash-linear-attention) adding **RoLA
+(Routed Linear Attention)** as a first-class FLA arch. **This fork is the RoLA model's source of
+truth** — the layer, the HF model, and the fused Triton kernels all live here. Part of the RoLA
 project (Blake Bottum, 2026): see [rola-paper](https://github.com/Blakexx/rola-paper).
+
+## What RoLA is
+
+RoLA expands a linear-attention head's recurrent state into `states_per_head` (nc) sub-states that
+**share the head's q/k/v/o projections**, with learned **dense read/write routing** over those states.
+Effective attention factors as a Hadamard product of a routing Gram and a kernel Gram, so realized
+attention rank scales with the state count at one shared projection. The routing composes with a
+decomposable inner kernel, and the normalization's placement is a learned per-token quantity (the
+`kappa` family). Knobs (`RoLA.__init__`, `fla_rola/layers/rola.py`):
+
+- **`kernel`** — inner kernel: `'rla'` (un-decayed feature-mapped linear attention, φ = elu+1) or
+  `'gla_scalar'` (per-state scalar forget gate on the same kernel).
+- **`state_norm`** — read-gate normalization: `'global'` (shared-gram partition `Σ_c r_c·d_c`),
+  `'per_state'` (each state self-normalizes), `'kappa'` (learned per-token interpolation between the
+  two), or `'raw'` (numerator-only; `gla_scalar` only).
+- **routing symmetry** — `tie_routers=False` (asymmetric: separate read/write routers) vs.
+  `tie_routers=True` (symmetric: one shared router); `tie_router_init` keeps them untied but
+  initialized equal.
+- **`states_per_head`** (nc), plus `qk_norm`, `router_bias`, `router_zloss_coef`, `use_short_conv`.
+
+The full normalization pipeline (per-state denominator pre-pass, read-gate rescale, shared-Gram
+numerator-only readout) lives in the fused operator `chunk_rola` (`fla_rola/ops/rola/`); the lower-level
+Triton kernels (`rola_rla_triton`, `rola_gla_triton`, and the per-state denominator kernels) are exposed
+there for the correctness harness. The unrouted path stays bit-identical to upstream FLA.
+
+## Using it
+
+```python
+# the layer (e.g. as a mixer in your own block)
+from fla_rola.layers.rola import RoLA
+mixer = RoLA(hidden_size=1024, num_heads=8, head_k_dim=16, head_v_dim=32,
+             states_per_head=16, kernel='rla', state_norm='kappa', tie_routers=False)
+
+# the HF model
+from fla_rola.models.rola import RoLAConfig, RoLAForCausalLM
+import fla_rola.models.rola            # registers RoLA with the HF auto-classes
+model = RoLAForCausalLM(RoLAConfig(...))
+
+# named presets (kernel × norm × routing): rola-rla-kappa-asym, rola-gla-scalar-sym, …
+from fla_rola.models.rola.instances import rola_instance
+kwargs = rola_instance('rola-rla-kappa-asym', head_k_dim=16, head_v_dim=32, states_per_head=16)
+```
+
+Package name `fla-rola`, import path `fla_rola`. The HF model suite is in `fla_rola/models/rola/`
+(`RoLAConfig`, `RoLAModel`, `RoLAForCausalLM`, and `rola_instance` presets in `instances.py`).
 
 ---
 
