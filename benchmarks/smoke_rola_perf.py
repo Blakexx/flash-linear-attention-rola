@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Quick perf smoke for the routed RoLA op (chunk_rola) — a fast LOCAL signal, NOT a benchmark and
-NOT a correctness check (use test_recurrent_vs_chunked.py / test_rola_routed_tiling.py for that).
+NOT a correctness check (use tests/ops/test_rola.py for correctness).
 
 Times fwd and fwd+bwd (CUDA events, warmup, median) for RLA/GLA × {global, kappa} at a representative
-shape, in the training dtype (bf16). Run on an idle GPU:  python -u tests/smoke_rola_perf.py
+shape, in the training dtype (bf16). Run on an idle GPU:  python -u benchmarks/smoke_rola_perf.py
 """
 import sys
 
@@ -44,7 +44,10 @@ def main():
     B, L, H, K, nc, dv = 4, 1024, 4, 16, 64, 16
     print(f"device: {torch.cuda.get_device_name(0)} | B={B} L={L} H={H} dqk=dv={dv} nc={nc} bf16 | median ms / 20")
     g = torch.Generator(device=DEV).manual_seed(0)
-    rb = lambda *s: torch.randn(*s, generator=g, device=DEV, dtype=torch.bfloat16)
+
+    def rb(*s):
+        return torch.randn(*s, generator=g, device=DEV, dtype=torch.bfloat16)
+
     for gla in (False, True):
         q = (torch.nn.functional.elu(rb(B, L, H, K)) + 1).requires_grad_()
         k = (torch.nn.functional.elu(rb(B, L, H, K)) + 1).requires_grad_()
@@ -56,8 +59,9 @@ def main():
         kap = torch.full((B, L, H, 1), 0.5, device=DEV, dtype=torch.bfloat16)
         leaves = [x for x in (q, k, v, r, w, ld) if x is not None]
         for norm in ("global", "kappa"):
-            fn = lambda: chunk_rola(q, k, v, r=r, w=w, g=ld, norm=norm,
-                                    kappa=kap if norm == "kappa" else None, scale=1.0)
+            def fn(norm=norm):
+                return chunk_rola(q, k, v, r=r, w=w, g=ld, norm=norm,
+                                  kappa=kap if norm == "kappa" else None, scale=1.0)
             fwd = _median_ms(fn, leaves, bwd=False)
             fb = _median_ms(fn, leaves, bwd=True)
             print(f"  {'GLA' if gla else 'RLA'}/{norm:7s}  fwd={fwd:.2f}ms  fwd+bwd={fb:.2f}ms")
