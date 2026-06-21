@@ -15,6 +15,8 @@
 # O(L²) ground truth). The readout is numerator-only (width dv, BV=next_pow2(dv)); there is no
 # ones-column augmentation — the denominator is the caller's separate per-state pre-pass.
 
+import os
+
 import torch
 import torch.nn.functional as F
 import triton
@@ -1079,79 +1081,139 @@ def _alloc_split(q, v, wg, chunk, BG):
     return BD, BV, NB, NCH, Sb, dSa, dq, dk, dvo, dr, dw
 
 
-def _bwd_split_rla(q, k, v, wg, rg, g, chunk=None, BG=16):
+# State-block tiling knob (#3): process at most `_NB_TILE` state-blocks per backward pass, looping over
+# the rest, to bound the Sb/dSa snapshot buffers — the dominant backward memory (≈55% of peak). The
+# scans/grad kernels index state by `sb*BG` (program_id), so a tile is just sliced gate views + a
+# tile-local Sb/dSa: identical math, summed over tiles. None = all blocks at once (byte-identical to
+# the untiled path); smaller trades sb-parallelism for peak memory.
+_NB_TILE = int(os.environ['ROLA_NB_TILE']) if os.environ.get('ROLA_NB_TILE') else None
+
+
+def _resolve_nb_tile(nb_tile, B, NB, NCH, BD, BV, BG):
+    """How many state-blocks to process per backward pass. Priority: explicit arg > ROLA_NB_TILE env >
+    auto-budget. Auto keeps the resident Sb+dSa snapshots under ROLA_SB_BUDGET_MB (default 1024): small
+    shapes resolve to all blocks (untiled, byte-identical to the original path), only long-L/large-nc
+    shapes — the ones that OOM — tile down. Always >=1 and <=NB."""
+    explicit = nb_tile if nb_tile is not None else _NB_TILE
+    if explicit is not None:
+        return max(1, min(int(explicit), NB))
+    budget = int(os.environ.get('ROLA_SB_BUDGET_MB', '1024')) * (1 << 20)
+    per_block = max(1, B * NCH * BD * BG * BV * 8)            # (Sb+dSa) fp32 bytes for ONE state-block
+    return max(1, min(budget // per_block, NB))
+
+
+def _bwd_split_rla(q, k, v, wg, rg, g, chunk=None, BG=16, nb_tile=None):
     chunk = _CHUNK if chunk is None else chunk
     B, L, dqk = q.shape
     dv = v.shape[-1]
     nc = wg.shape[-1]
     q, k, v, wg, rg, g = [x.contiguous() for x in (q, k, v, wg, rg, g)]
-    BD, BV, NB, NCH, Sb, dSa, dq, dk, dvo, dr, dw = _alloc_split(q, v, wg, chunk, BG)
-    # The scans build Sb/dSa with their OWN feature block (Sflat is a register accumulator, not a
-    # loaded SRAM tile, so a fixed block is fine and independent of the grad kernels' autotuned BD —
-    # Sb is indexed by absolute feature row). The grad kernels pick BD by autotune (SRAM-fit empirical).
+    BD = max(16, triton.next_power_of_2(dqk))
+    BV = max(16, triton.next_power_of_2(dv))
+    NB = triton.cdiv(nc, BG)
+    NCH = triton.cdiv(L, chunk)
+    nb_tile = _resolve_nb_tile(nb_tile, B, NB, NCH, BD, BV, BG)
     BK_scan = min(64, BD)
     ND_scan = triton.cdiv(dqk, BK_scan)
-    sS = (Sb.stride(0), Sb.stride(1), Sb.stride(2), Sb.stride(3), Sb.stride(4))
     sq = (q.stride(0), q.stride(1), q.stride(2))
     sv = (v.stride(0), v.stride(1), v.stride(2))
-    sg = (wg.stride(0), wg.stride(1), wg.stride(2))
     sgr = (g.stride(0), g.stride(1), g.stride(2))
-    _scan_S[(B, NB, ND_scan)](k, v, wg, wg, Sb, L, dqk, dv, nc, *sq, *sv, *sg, *sS,
-                              USE_G=False, BT=chunk, BD=BK_scan, BVF=BV, BG=BG, NCH=NCH)
-    _scan_dS[(B, NB, ND_scan)](q, rg, wg, g, dSa, L, dqk, dv, nc, *sq, *sg, *sgr, *sS,
-                               USE_G=False, BT=chunk, BD=BK_scan, BVF=BV, BG=BG, NCH=NCH)
-    _par_grad_rla_qr[(B, NB, NCH)](q, k, v, wg, rg, g, Sb, dq, dr, L, dqk, dv, nc,
-                                   *sq, *sv, *sg, *sgr, *sS,
-                                   dq.stride(0), dq.stride(1), dq.stride(2), dq.stride(
-                                       3), dr.stride(0), dr.stride(1), dr.stride(2),
-                                   BT=chunk, BVF=BV, BG=BG, NCH=NCH)
-    _par_grad_rla_kwv[(B, NB, NCH)](q, k, v, wg, rg, g, dSa, dk, dw, dvo, L, dqk, dv, nc,
-                                    *sq, *sv, *sg, *sgr, *sS,
-                                    dk.stride(0), dk.stride(1), dk.stride(2), dk.stride(
-                                        3), dw.stride(0), dw.stride(1), dw.stride(2),
-                                    dvo.stride(0), dvo.stride(1), dvo.stride(2), dvo.stride(3),
-                                    BT=chunk, BVF=BV, BG=BG, NCH=NCH)
-    return dq.sum(1), dk.sum(1), dvo.sum(1)[..., :dv], dw, dr
+    dr = torch.empty(B, L, nc, device=q.device, dtype=torch.float32)     # full-nc, written per slice
+    dw = torch.empty_like(dr)
+    dq = torch.zeros(B, L, dqk, device=q.device, dtype=torch.float32)     # running sums over state-blocks
+    dk = torch.zeros_like(dq)
+    dvo = torch.zeros(B, L, BV, device=q.device, dtype=torch.float32)
+    for j0 in range(0, NB, nb_tile):
+        nbt = min(nb_tile, NB - j0)
+        c0, c1 = j0 * BG, min(nc, (j0 + nbt) * BG)
+        nct = c1 - c0                                                     # this tile's state width
+        wg_s, rg_s, dr_s, dw_s = wg[:, :, c0:c1], rg[:, :, c0:c1], dr[:, :, c0:c1], dw[:, :, c0:c1]
+        sg = (wg_s.stride(0), wg_s.stride(1), wg_s.stride(2))
+        Sb = torch.empty(B, nbt, NCH, BD, BG * BV, device=q.device, dtype=torch.float32)
+        dSa = torch.empty_like(Sb)
+        dq_t = torch.empty(B, nbt, L, dqk, device=q.device, dtype=torch.float32)
+        dk_t = torch.empty_like(dq_t)
+        dvo_t = torch.empty(B, nbt, L, BV, device=q.device, dtype=torch.float32)
+        sS = (Sb.stride(0), Sb.stride(1), Sb.stride(2), Sb.stride(3), Sb.stride(4))
+        _scan_S[(B, nbt, ND_scan)](k, v, wg_s, wg_s, Sb, L, dqk, dv, nct, *sq, *sv, *sg, *sS,
+                                   USE_G=False, BT=chunk, BD=BK_scan, BVF=BV, BG=BG, NCH=NCH)
+        _scan_dS[(B, nbt, ND_scan)](q, rg_s, wg_s, g, dSa, L, dqk, dv, nct, *sq, *sg, *sgr, *sS,
+                                    USE_G=False, BT=chunk, BD=BK_scan, BVF=BV, BG=BG, NCH=NCH)
+        _par_grad_rla_qr[(B, nbt, NCH)](q, k, v, wg_s, rg_s, g, Sb, dq_t, dr_s, L, dqk, dv, nct,
+                                        *sq, *sv, *sg, *sgr, *sS,
+                                        dq_t.stride(0), dq_t.stride(1), dq_t.stride(2), dq_t.stride(3),
+                                        dr_s.stride(0), dr_s.stride(1), dr_s.stride(2),
+                                        BT=chunk, BVF=BV, BG=BG, NCH=NCH)
+        _par_grad_rla_kwv[(B, nbt, NCH)](q, k, v, wg_s, rg_s, g, dSa, dk_t, dw_s, dvo_t, L, dqk, dv, nct,
+                                         *sq, *sv, *sg, *sgr, *sS,
+                                         dk_t.stride(0), dk_t.stride(1), dk_t.stride(2), dk_t.stride(3),
+                                         dw_s.stride(0), dw_s.stride(1), dw_s.stride(2),
+                                         dvo_t.stride(0), dvo_t.stride(1), dvo_t.stride(2), dvo_t.stride(3),
+                                         BT=chunk, BVF=BV, BG=BG, NCH=NCH)
+        dq += dq_t.sum(1)
+        dk += dk_t.sum(1)
+        dvo += dvo_t.sum(1)
+    return dq, dk, dvo[..., :dv], dw, dr
 
 
-def _bwd_split_gla(q, k, v, wg, rg, ld, g, chunk=None, BG=16):
+def _bwd_split_gla(q, k, v, wg, rg, ld, g, chunk=None, BG=16, nb_tile=None):
     chunk = _CHUNK if chunk is None else chunk
     B, L, dqk = q.shape
     dv = v.shape[-1]
     nc = wg.shape[-1]
     ld = ld.clamp(min=_GLA_FLOOR)
     q, k, v, wg, rg, ld, g = [x.contiguous() for x in (q, k, v, wg, rg, ld, g)]
-    BD, BV, NB, NCH, Sb, dSa, dq, dk, dvo, drg, dwg = _alloc_split(q, v, wg, chunk, BG)
-    dart = torch.empty(B, L, nc, device=q.device, dtype=torch.float32)   # da_rt (read-gate decay adjoint), qr→kwv
-    dld = torch.empty(B, L, nc, device=q.device, dtype=torch.float32)    # per-token log-decay grad, assembled in kwv
-    # Scans build Sb/dSa with their own fixed feature block (register accumulator, independent of the
-    # grad kernels' autotuned BD; Sb indexed by absolute feature row).
+    BD = max(16, triton.next_power_of_2(dqk))
+    BV = max(16, triton.next_power_of_2(dv))
+    NB = triton.cdiv(nc, BG)
+    NCH = triton.cdiv(L, chunk)
+    nb_tile = _resolve_nb_tile(nb_tile, B, NB, NCH, BD, BV, BG)
     BK_scan = min(64, BD)
     ND_scan = triton.cdiv(dqk, BK_scan)
-    sS = (Sb.stride(0), Sb.stride(1), Sb.stride(2), Sb.stride(3), Sb.stride(4))
     sq = (q.stride(0), q.stride(1), q.stride(2))
     sv = (v.stride(0), v.stride(1), v.stride(2))
-    sg = (wg.stride(0), wg.stride(1), wg.stride(2))
     sgr = (g.stride(0), g.stride(1), g.stride(2))
-    _scan_S[(B, NB, ND_scan)](k, v, wg, ld, Sb, L, dqk, dv, nc, *sq, *sv, *sg, *sS,
-                              USE_G=True, BT=chunk, BD=BK_scan, BVF=BV, BG=BG, NCH=NCH)
-    _scan_dS[(B, NB, ND_scan)](q, rg, ld, g, dSa, L, dqk, dv, nc, *sq, *sg, *sgr, *sS,
-                               USE_G=True, BT=chunk, BD=BK_scan, BVF=BV, BG=BG, NCH=NCH)
-    _par_grad_gla_qr[(B, NB, NCH)](q, k, v, wg, rg, ld, g, Sb, dq, drg, dart, L, dqk, dv, nc,
-                                   *sq, *sv, *sg, *sgr, *sS,
-                                   dq.stride(0), dq.stride(1), dq.stride(2), dq.stride(
-                                       3), drg.stride(0), drg.stride(1), drg.stride(2),
-                                   dart.stride(0), dart.stride(1), dart.stride(2),
-                                   BT=chunk, BVF=BV, BG=BG, NCH=NCH)
-    # kwv assembles dld IN-KERNEL (Sb + dSa → ZdZ → dLam → reverse-cumsum); dart (da_rt) comes from qr.
-    _par_grad_gla_kwv[(B, NB, NCH)](q, k, v, wg, rg, ld, g, Sb, dSa, dart, dk, dwg, dvo, dld, L, dqk, dv, nc,
-                                    *sq, *sv, *sg, *sgr, *sS,
-                                    dk.stride(0), dk.stride(1), dk.stride(2), dk.stride(3),
-                                    dwg.stride(0), dwg.stride(1), dwg.stride(2),
-                                    dvo.stride(0), dvo.stride(1), dvo.stride(2), dvo.stride(3),
-                                    dart.stride(0), dart.stride(1), dart.stride(2),
-                                    BT=chunk, BVF=BV, BG=BG, NCH=NCH)
-    return dq.sum(1), dk.sum(1), dvo.sum(1)[..., :dv], dwg, drg, dld
+    drg = torch.empty(B, L, nc, device=q.device, dtype=torch.float32)    # full-nc, written per slice
+    dwg = torch.empty_like(drg)
+    dart = torch.empty_like(drg)                                         # da_rt (read-gate decay adjoint), qr→kwv
+    dld = torch.empty_like(drg)                                          # per-token log-decay grad, in kwv
+    dq = torch.zeros(B, L, dqk, device=q.device, dtype=torch.float32)    # running sums over state-blocks
+    dk = torch.zeros_like(dq)
+    dvo = torch.zeros(B, L, BV, device=q.device, dtype=torch.float32)
+    for j0 in range(0, NB, nb_tile):
+        nbt = min(nb_tile, NB - j0)
+        c0, c1 = j0 * BG, min(nc, (j0 + nbt) * BG)
+        nct = c1 - c0
+        wg_s, rg_s, ld_s = wg[:, :, c0:c1], rg[:, :, c0:c1], ld[:, :, c0:c1]
+        drg_s, dwg_s, dart_s, dld_s = drg[:, :, c0:c1], dwg[:, :, c0:c1], dart[:, :, c0:c1], dld[:, :, c0:c1]
+        sg = (wg_s.stride(0), wg_s.stride(1), wg_s.stride(2))
+        Sb = torch.empty(B, nbt, NCH, BD, BG * BV, device=q.device, dtype=torch.float32)
+        dSa = torch.empty_like(Sb)
+        dq_t = torch.empty(B, nbt, L, dqk, device=q.device, dtype=torch.float32)
+        dk_t = torch.empty_like(dq_t)
+        dvo_t = torch.empty(B, nbt, L, BV, device=q.device, dtype=torch.float32)
+        sS = (Sb.stride(0), Sb.stride(1), Sb.stride(2), Sb.stride(3), Sb.stride(4))
+        _scan_S[(B, nbt, ND_scan)](k, v, wg_s, ld_s, Sb, L, dqk, dv, nct, *sq, *sv, *sg, *sS,
+                                   USE_G=True, BT=chunk, BD=BK_scan, BVF=BV, BG=BG, NCH=NCH)
+        _scan_dS[(B, nbt, ND_scan)](q, rg_s, ld_s, g, dSa, L, dqk, dv, nct, *sq, *sg, *sgr, *sS,
+                                    USE_G=True, BT=chunk, BD=BK_scan, BVF=BV, BG=BG, NCH=NCH)
+        _par_grad_gla_qr[(B, nbt, NCH)](q, k, v, wg_s, rg_s, ld_s, g, Sb, dq_t, drg_s, dart_s, L, dqk, dv, nct,
+                                        *sq, *sv, *sg, *sgr, *sS,
+                                        dq_t.stride(0), dq_t.stride(1), dq_t.stride(2), dq_t.stride(3),
+                                        drg_s.stride(0), drg_s.stride(1), drg_s.stride(2),
+                                        dart_s.stride(0), dart_s.stride(1), dart_s.stride(2),
+                                        BT=chunk, BVF=BV, BG=BG, NCH=NCH)
+        _par_grad_gla_kwv[(B, nbt, NCH)](q, k, v, wg_s, rg_s, ld_s, g, Sb, dSa, dart_s, dk_t, dwg_s, dvo_t, dld_s,
+                                         L, dqk, dv, nct, *sq, *sv, *sg, *sgr, *sS,
+                                         dk_t.stride(0), dk_t.stride(1), dk_t.stride(2), dk_t.stride(3),
+                                         dwg_s.stride(0), dwg_s.stride(1), dwg_s.stride(2),
+                                         dvo_t.stride(0), dvo_t.stride(1), dvo_t.stride(2), dvo_t.stride(3),
+                                         dart_s.stride(0), dart_s.stride(1), dart_s.stride(2),
+                                         BT=chunk, BVF=BV, BG=BG, NCH=NCH)
+        dq += dq_t.sum(1)
+        dk += dk_t.sum(1)
+        dvo += dvo_t.sum(1)
+    return dq, dk, dvo[..., :dv], dwg, drg, dld
 
 
 # ============================================================================
