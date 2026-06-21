@@ -36,7 +36,6 @@ import torch.nn.functional as F
 from einops import rearrange
 
 from fla_rola.modules import ShortConvolution
-from fla_rola.modules.feature_map import HedgehogFeatureMap, RebasedFeatureMap, TaylorFeatureMap
 from fla_rola.ops.rola import chunk_rola
 
 if TYPE_CHECKING:
@@ -100,11 +99,11 @@ class RoLA(nn.Module):
     ) -> RoLA:
         super().__init__()
         assert kernel in ('rla', 'gla_scalar'), f"unsupported kernel {kernel!r}"
+        assert phi == 'elu', f"only the elu feature map is supported (got {phi!r})"
         if kernel == 'rla':
             assert state_norm in ('global', 'per_state', 'kappa'), state_norm
         else:  # gla_scalar
             assert state_norm in ('raw', 'global', 'per_state', 'kappa'), state_norm
-            assert phi == 'elu', "gla_scalar uses the elu feature map"
 
         self.hidden_size = hidden_size
         self.num_heads = num_heads
@@ -120,23 +119,9 @@ class RoLA(nn.Module):
         self.conv_size = conv_size
         self.layer_idx = layer_idx
 
-        # Feature-map geometry: proj_qk is the projected q/k width (hedgehog projects d_qk//2 and its
-        # ±-map doubles back to d_qk); feat_dim is the state-governing feature dim.
+        # Feature map is elu+1 only (the fused chunk_rola path): proj_qk == feat_dim == head_k_dim.
         self.proj_qk = head_k_dim
         self.feat_dim = head_k_dim
-        if kernel == 'rla' and phi == 'hedgehog':
-            assert head_k_dim % 2 == 0, "hedgehog needs even head_k_dim (feature dim 2*(d_qk//2))"
-            self.hh_q = HedgehogFeatureMap(head_dim=head_k_dim // 2)
-            self.hh_k = HedgehogFeatureMap(head_dim=head_k_dim // 2)
-            self.proj_qk = head_k_dim // 2
-            self.feat_dim = head_k_dim
-        elif kernel == 'rla' and phi == 'based':
-            self.taylor = TaylorFeatureMap(head_dim=head_k_dim)
-            self.feat_dim = 1 + 2 * head_k_dim + head_k_dim * (head_k_dim - 1) // 2
-        elif kernel == 'rla' and phi == 'rebased':
-            self.rebased_q = RebasedFeatureMap(head_dim=head_k_dim)
-            self.rebased_k = RebasedFeatureMap(head_dim=head_k_dim)
-            self.feat_dim = head_k_dim * (head_k_dim + 1) // 2
 
         # 'global'/'per_state'/'kappa' carry the +feat_dim global-partition term in the recurrent
         # state; gla_scalar 'raw' does not.
@@ -185,13 +170,7 @@ class RoLA(nn.Module):
 
     # --- feature map / routing / decay (mirror the rola.py kernels exactly) ---
     def _feature_map(self, q, k):
-        if self.kernel == 'gla_scalar' or self.phi == 'elu':
-            return F.elu(q) + 1.0, F.elu(k) + 1.0
-        if self.phi == 'hedgehog':
-            return self.hh_q(q), self.hh_k(k)
-        if self.phi == 'based':
-            return self.taylor(q), self.taylor(k)
-        return self.rebased_q(q), self.rebased_k(k)  # rebased
+        return F.elu(q) + 1.0, F.elu(k) + 1.0      # elu+1 — the only supported feature map
 
     def _route(self, x):
         B, L = x.shape[0], x.shape[1]
