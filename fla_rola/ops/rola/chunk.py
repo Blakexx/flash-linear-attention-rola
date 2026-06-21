@@ -5,7 +5,8 @@
 # Routed linear attention shares the content gram G=qkᵀ across `nc` states and modulates it by a
 # routing gram R=Σ_c r_i^c w_j^c (+ optional per-state scalar decay). These kernels compute the
 # *un-normalized* routed readout O = (G∘R∘causal) @ v — the FLA convention; the global denominator is
-# reconstructed by the caller as Σ_c r̃ᶜ·dᶜ from the per-state den pre-pass (see interface.py). Tiled
+# reconstructed by the caller as Σ_c r̃ᶜ·dᶜ from the per-state den pre-pass (see `chunk_rola` at the
+# bottom of this file — the norm-aware public entry point, FLA-style). Tiled
 # over state-blocks (BG states/program) so only this block's slice of the Kronecker state lives in
 # SRAM → scales to any nc. The content gram is formed ONCE per chunk (the FLOP win), never
 # materializing the L×nc product nor replicating q/k.
@@ -15,10 +16,17 @@
 # ones-column augmentation — the denominator is the caller's separate per-state pre-pass.
 
 import torch
+import torch.nn.functional as F
 import triton
 import triton.language as tl
 
-from fla_rola.utils import autotune_cache_kwargs, check_shared_mem
+from fla_rola.utils import (
+    autocast_custom_bwd,
+    autocast_custom_fwd,
+    autotune_cache_kwargs,
+    check_shared_mem,
+    input_guard,
+)
 
 # SMEM fitting follows the canonical FLA idiom: the chunk size BT is a fixed per-device constant
 # (a `check_shared_mem` gate — the one structural knob the autotuner can't own, since the host-side
@@ -112,13 +120,19 @@ def _rola_fwd_intra(q_ptr, k_ptr, v_ptr, wg_ptr, rg_ptr, outa_ptr,
     separate per-state pre-pass.
     Writes its OWN out_intra buffer (disjoint rows per chunk → plain store), so it is autotunable
     (num_warps/num_stages pruned by OutOfResources); the inter contribution is a separate buffer."""
-    b = tl.program_id(0); sb = tl.program_id(1); t = tl.program_id(2)
-    offs_t = tl.arange(0, BT); offs_v = tl.arange(0, BV)
-    offs_c = sb * BG + tl.arange(0, BG); cmask = offs_c < nc
-    rows = t * BT + offs_t; rmask = rows < L
+    b = tl.program_id(0)
+    sb = tl.program_id(1)
+    t = tl.program_id(2)
+    offs_t = tl.arange(0, BT)
+    offs_v = tl.arange(0, BV)
+    offs_c = sb * BG + tl.arange(0, BG)
+    cmask = offs_c < nc
+    rows = t * BT + offs_t
+    rmask = rows < L
     G = tl.zeros([BT, BT], dtype=tl.float32)
     for d0 in range(ND):
-        offs_d = d0 * BK + tl.arange(0, BK); dmask = offs_d < dqk
+        offs_d = d0 * BK + tl.arange(0, BK)
+        dmask = offs_d < dqk
         qc = tl.load(q_ptr + b*sq_b + rows[:, None]*sq_l + offs_d[None, :]*sq_d,
                      mask=rmask[:, None] & dmask[None, :], other=0.0)
         kc = tl.load(k_ptr + b*sq_b + rows[:, None]*sq_l + offs_d[None, :]*sq_d,
@@ -152,16 +166,22 @@ def _rola_fwd_inter(q_ptr, k_ptr, v_ptr, wg_ptr, rg_ptr, outa_ptr,
     the autotuned value-tile BV (value-OUTER over cdiv(dv,BV) blocks; ND_V==1 == the un-tiled kernel).
     o_inter uses the state BEFORE this chunk's update (causal); partials over feature-blocks sum via
     atomic_add into its OWN out_inter buffer — autotunable with reset_to_zero."""
-    b = tl.program_id(0); sb = tl.program_id(1); d0 = tl.program_id(2)
+    b = tl.program_id(0)
+    sb = tl.program_id(1)
+    d0 = tl.program_id(2)
     ND_V = (dv + BV - 1) // BV
     offs_t = tl.arange(0, BT)
-    offs_d = d0 * BK + tl.arange(0, BK); dmask = offs_d < dqk
-    offs_c = sb * BG + tl.arange(0, BG); cmask = offs_c < nc
+    offs_d = d0 * BK + tl.arange(0, BK)
+    dmask = offs_d < dqk
+    offs_c = sb * BG + tl.arange(0, BG)
+    cmask = offs_c < nc
     for vb in range(ND_V):
-        offs_v = vb * BV + tl.arange(0, BV); vmask = offs_v < dv
+        offs_v = vb * BV + tl.arange(0, BV)
+        vmask = offs_v < dv
         Sd = tl.zeros([BK, BG * BV], dtype=tl.float32)
         for t in range(NCH):
-            rows = t * BT + offs_t; rmask = rows < L
+            rows = t * BT + offs_t
+            rmask = rows < L
             qc = tl.load(q_ptr + b*sq_b + rows[:, None]*sq_l + offs_d[None, :]*sq_d,
                          mask=rmask[:, None] & dmask[None, :], other=0.0)
             rgc = tl.load(rg_ptr + b*sg_b + rows[:, None]*sg_l + offs_c[None, :]*sg_c,
@@ -185,10 +205,14 @@ def _fwd_tiled(q, k, v, wg, rg, chunk, BG, BK=64):
     """D-tiled numerator-only forward: smem bounded by BK (feature-block), so ANY dqk fits. Returns
     [B,L,dv] at BV=next_pow2(dv); the kappa/per_state caller forms the global den from the den
     pre-pass (Σ_c rᶜ·dᶜ)."""
-    B, L, dqk = q.shape; dv = v.shape[-1]; nc = wg.shape[-1]
+    B, L, dqk = q.shape
+    dv = v.shape[-1]
+    nc = wg.shape[-1]
     BV = max(16, triton.next_power_of_2(dv))
     BK = min(BK, max(16, triton.next_power_of_2(dqk)))   # exact-width blocks for dqk<=64; tile beyond
-    ND = triton.cdiv(dqk, BK); NB = triton.cdiv(nc, BG); NCH = triton.cdiv(L, chunk)
+    ND = triton.cdiv(dqk, BK)
+    NB = triton.cdiv(nc, BG)
+    NCH = triton.cdiv(L, chunk)
     q, k, v, wg, rg = [x.contiguous() for x in (q, k, v, wg, rg)]
     # Separate intra/inter output buffers (summed after) so each kernel has a non-shared output and is
     # independently autotunable: intra writes disjoint rows (store), inter atomic-accumulates over
@@ -210,6 +234,8 @@ class _RoLARLAFn(torch.autograd.Function):
     tensors. Numerator-only ([.,dv]); the global denominator is the caller's separate per-state
     pre-pass."""
     @staticmethod
+    @input_guard
+    @autocast_custom_fwd
     def forward(ctx, q, k, v, wg, rg, chunk, BG):
         Oa = _fwd_tiled(q, k, v, wg, rg, chunk=chunk, BG=BG)
         ctx.save_for_backward(q, k, v, wg, rg)
@@ -217,6 +243,8 @@ class _RoLARLAFn(torch.autograd.Function):
         return Oa.to(q.dtype)
 
     @staticmethod
+    @input_guard
+    @autocast_custom_bwd
     def backward(ctx, dO):
         q, k, v, wg, rg = ctx.saved_tensors
         g = dO.float()
@@ -226,6 +254,7 @@ class _RoLARLAFn(torch.autograd.Function):
         return cast(dq), cast(dk), cast(dvv), cast(dw), cast(dr), None, None
 
 
+@input_guard
 def rola_rla_triton(q, k, v, r, w, chunk=None, BG=16):
     """Un-normalized routed RLA readout via Triton. q,k:[BH,L,K] v:[BH,L,V] r,w:[BH,L,nc]
     (r=read gate, w=write gate). Differentiable (fused Triton backward). Numerator-only ⇒ returns
@@ -260,13 +289,19 @@ def _rola_gla_fwd_intra(q_ptr, k_ptr, v_ptr, wg_ptr, rg_ptr, ld_ptr, outa_ptr,
     the routing gram uses the decayed gates rt=rg·e^a, wt=wg·e^-a (a = intra-chunk cumsum of ld). The
     [BT,BT] content gram is built by looping BK-blocks of the feature dim → SRAM bounded by BK.
     Numerator-only (output width dv, BV=next_pow2(dv))."""
-    b = tl.program_id(0); sb = tl.program_id(1); t = tl.program_id(2)
-    offs_t = tl.arange(0, BT); offs_v = tl.arange(0, BV)
-    offs_c = sb * BG + tl.arange(0, BG); cmask = offs_c < nc
-    rows = t * BT + offs_t; rmask = rows < L
+    b = tl.program_id(0)
+    sb = tl.program_id(1)
+    t = tl.program_id(2)
+    offs_t = tl.arange(0, BT)
+    offs_v = tl.arange(0, BV)
+    offs_c = sb * BG + tl.arange(0, BG)
+    cmask = offs_c < nc
+    rows = t * BT + offs_t
+    rmask = rows < L
     G = tl.zeros([BT, BT], dtype=tl.float32)
     for d0 in range(ND):
-        offs_d = d0 * BK + tl.arange(0, BK); dmask = offs_d < dqk
+        offs_d = d0 * BK + tl.arange(0, BK)
+        dmask = offs_d < dqk
         qc = tl.load(q_ptr + b*sq_b + rows[:, None]*sq_l + offs_d[None, :]*sq_d,
                      mask=rmask[:, None] & dmask[None, :], other=0.0)
         kc = tl.load(k_ptr + b*sq_b + rows[:, None]*sq_l + offs_d[None, :]*sq_d,
@@ -304,16 +339,22 @@ def _rola_gla_fwd_inter(q_ptr, k_ptr, v_ptr, wg_ptr, rg_ptr, ld_ptr, outa_ptr,
     this feature-block's slice Sd[BK, BG*BV] across chunks → SRAM bounded by BK and the autotuned
     value-tile BV (value-OUTER; ND_V==1 == un-tiled). The state decays by decvec = e^Λ (Λ = chunk-total
     ld) each chunk; the read uses rt = rg·e^a. The decay is d-independent; partials sum via atomic_add."""
-    b = tl.program_id(0); sb = tl.program_id(1); d0 = tl.program_id(2)
+    b = tl.program_id(0)
+    sb = tl.program_id(1)
+    d0 = tl.program_id(2)
     ND_V = (dv + BV - 1) // BV
     offs_t = tl.arange(0, BT)
-    offs_d = d0 * BK + tl.arange(0, BK); dmask = offs_d < dqk
-    offs_c = sb * BG + tl.arange(0, BG); cmask = offs_c < nc
+    offs_d = d0 * BK + tl.arange(0, BK)
+    dmask = offs_d < dqk
+    offs_c = sb * BG + tl.arange(0, BG)
+    cmask = offs_c < nc
     for vb in range(ND_V):
-        offs_v = vb * BV + tl.arange(0, BV); vmask = offs_v < dv
+        offs_v = vb * BV + tl.arange(0, BV)
+        vmask = offs_v < dv
         Sd = tl.zeros([BK, BG * BV], dtype=tl.float32)
         for t in range(NCH):
-            rows = t * BT + offs_t; rmask = rows < L
+            rows = t * BT + offs_t
+            rmask = rows < L
             qc = tl.load(q_ptr + b*sq_b + rows[:, None]*sq_l + offs_d[None, :]*sq_d,
                          mask=rmask[:, None] & dmask[None, :], other=0.0)
             rgc = tl.load(rg_ptr + b*sg_b + rows[:, None]*sg_l + offs_c[None, :]*sg_c,
@@ -371,6 +412,8 @@ class _RoLAGLAFn(torch.autograd.Function):
     """RoLA-GLA (scalar per-state decay) un-normalized routed readout, on folded [BH,L,*] tensors.
     Numerator-only ([.,dv]); the global denominator is the caller's separate per-state pre-pass."""
     @staticmethod
+    @input_guard
+    @autocast_custom_fwd
     def forward(ctx, q, k, v, wg, rg, ld, chunk, BG):
         Oa = _gla_fwd(q, k, v, wg, rg, ld, chunk=chunk, BG=BG)
         ctx.save_for_backward(q, k, v, wg, rg, ld)
@@ -378,6 +421,8 @@ class _RoLAGLAFn(torch.autograd.Function):
         return Oa.to(q.dtype)
 
     @staticmethod
+    @input_guard
+    @autocast_custom_bwd
     def backward(ctx, dO):
         q, k, v, wg, rg, ld = ctx.saved_tensors
         g = dO.float()
@@ -389,6 +434,7 @@ class _RoLAGLAFn(torch.autograd.Function):
         return cast(dq), cast(dk), cast(dvv), cast(dwg), cast(drg), cast(dld), None, None
 
 
+@input_guard
 def rola_gla_triton(q, k, v, r, w, ld, chunk=None, BG=16):
     """Un-normalized routed GLA readout via Triton. q,k:[BH,L,K] v:[BH,L,V] r,w,ld:[BH,L,nc]
     (r=read gate, w=write gate, ld=per-state log-decay). Differentiable. Numerator-only (BV=next_pow2
@@ -830,19 +876,22 @@ def _par_grad_gla_qr(q_ptr, k_ptr, v_ptr, wg_ptr, rg_ptr, ld_ptr, g_ptr, Sb_ptr,
     else:
         P = tl.zeros([BT, BT], dtype=tl.float32)
         for vb in range(ND_V):
-            offs_v = vb * BV + tl.arange(0, BV); vm = offs_v < dv
+            offs_v = vb * BV + tl.arange(0, BV)
+            vm = offs_v < dv
             v1 = tl.load(v_ptr + b*sv_b + rows[:, None]*sv_l + offs_v[None, :]*sv_d, mask=rmask[:, None] & vm[None, :], other=0.0)
             gv = tl.load(g_ptr + b*sgr_b + rows[:, None]*sgr_l + offs_v[None, :]*sgr_d, mask=rmask[:, None] & vm[None, :], other=0.0)
             P += tl.dot(gv, tl.trans(v1))
         dG = P * D * caus
         G = tl.zeros([BT, BT], dtype=tl.float32)
         for d0b in range(ND):
-            offs_d = d0b * BD + tl.arange(0, BD); dmask = offs_d < dqk
+            offs_d = d0b * BD + tl.arange(0, BD)
+            dmask = offs_d < dqk
             qc = tl.load(q_ptr + b*sq_b + rows[:, None]*sq_l + offs_d[None, :]*sq_d, mask=rmask[:, None] & dmask[None, :], other=0.0)
             kc = tl.load(k_ptr + b*sq_b + rows[:, None]*sq_l + offs_d[None, :]*sq_d, mask=rmask[:, None] & dmask[None, :], other=0.0)
             dq_d = tl.dot(dG.to(kc.dtype), kc)
             for vb in range(ND_V):
-                offs_v = vb * BV + tl.arange(0, BV); vm = offs_v < dv
+                offs_v = vb * BV + tl.arange(0, BV)
+                vm = offs_v < dv
                 gv = tl.load(g_ptr + b*sgr_b + rows[:, None]*sgr_l + offs_v[None, :]*sgr_d, mask=rmask[:, None] & vm[None, :], other=0.0)
                 rt_g = tl.reshape(rt[:, :, None] * gv[:, None, :], [BT, BG * BV])
                 offs_e = tl.reshape(offs_g[:, None] * BVF + offs_v[None, :], [BG * BV])
@@ -855,12 +904,14 @@ def _par_grad_gla_qr(q_ptr, k_ptr, v_ptr, wg_ptr, rg_ptr, ld_ptr, g_ptr, Sb_ptr,
         drt_intra = tl.dot(dD.to(wt.dtype), wt)
         drt_inter = tl.zeros([BT, BG], dtype=tl.float32)
         for vb in range(ND_V):
-            offs_v = vb * BV + tl.arange(0, BV); vm = offs_v < dv
+            offs_v = vb * BV + tl.arange(0, BV)
+            vm = offs_v < dv
             gv = tl.load(g_ptr + b*sgr_b + rows[:, None]*sgr_l + offs_v[None, :]*sgr_d, mask=rmask[:, None] & vm[None, :], other=0.0)
             offs_e = tl.reshape(offs_g[:, None] * BVF + offs_v[None, :], [BG * BV])
             QS = tl.zeros([BT, BG * BV], dtype=tl.float32)
             for d0b in range(ND):
-                offs_d = d0b * BD + tl.arange(0, BD); dmask = offs_d < dqk
+                offs_d = d0b * BD + tl.arange(0, BD)
+                dmask = offs_d < dqk
                 qc = tl.load(q_ptr + b*sq_b + rows[:, None]*sq_l + offs_d[None, :]*sq_d, mask=rmask[:, None] & dmask[None, :], other=0.0)
                 Sb = tl.load(Sb_ptr + b*ssb_b + sb*ssb_n + t*ssb_t + offs_d[:, None]*ssb_d + offs_e[None, :]*ssb_e, mask=dmask[:, None], other=0.0)
                 QS += tl.dot(qc, Sb.to(qc.dtype))
@@ -945,7 +996,8 @@ def _par_grad_gla_kwv(q_ptr, k_ptr, v_ptr, wg_ptr, rg_ptr, ld_ptr, g_ptr, Sb_ptr
     else:
         P = tl.zeros([BT, BT], dtype=tl.float32)
         for vb in range(ND_V):
-            offs_v = vb * BV + tl.arange(0, BV); vm = offs_v < dv
+            offs_v = vb * BV + tl.arange(0, BV)
+            vm = offs_v < dv
             v1 = tl.load(v_ptr + b*sv_b + rows[:, None]*sv_l + offs_v[None, :]*sv_d, mask=rmask[:, None] & vm[None, :], other=0.0)
             gv = tl.load(g_ptr + b*sgr_b + rows[:, None]*sgr_l + offs_v[None, :]*sgr_d, mask=rmask[:, None] & vm[None, :], other=0.0)
             P += tl.dot(gv, tl.trans(v1))
@@ -953,12 +1005,14 @@ def _par_grad_gla_kwv(q_ptr, k_ptr, v_ptr, wg_ptr, rg_ptr, ld_ptr, g_ptr, Sb_ptr
         G = tl.zeros([BT, BT], dtype=tl.float32)
         ZdZ = tl.zeros([BG], dtype=tl.float32)
         for d0b in range(ND):
-            offs_d = d0b * BD + tl.arange(0, BD); dmask = offs_d < dqk
+            offs_d = d0b * BD + tl.arange(0, BD)
+            dmask = offs_d < dqk
             qc = tl.load(q_ptr + b*sq_b + rows[:, None]*sq_l + offs_d[None, :]*sq_d, mask=rmask[:, None] & dmask[None, :], other=0.0)
             kc = tl.load(k_ptr + b*sq_b + rows[:, None]*sq_l + offs_d[None, :]*sq_d, mask=rmask[:, None] & dmask[None, :], other=0.0)
             dk_d = tl.dot(tl.trans(dG).to(qc.dtype), qc)
             for vb in range(ND_V):
-                offs_v = vb * BV + tl.arange(0, BV); vm = offs_v < dv
+                offs_v = vb * BV + tl.arange(0, BV)
+                vm = offs_v < dv
                 v1 = tl.load(v_ptr + b*sv_b + rows[:, None]*sv_l + offs_v[None, :]*sv_d, mask=rmask[:, None] & vm[None, :], other=0.0)
                 wv1 = tl.reshape(w_end[:, :, None] * v1[:, None, :], [BT, BG * BV])
                 offs_e = tl.reshape(offs_g[:, None] * BVF + offs_v[None, :], [BG * BV])
@@ -974,13 +1028,15 @@ def _par_grad_gla_kwv(q_ptr, k_ptr, v_ptr, wg_ptr, rg_ptr, ld_ptr, g_ptr, Sb_ptr
         dwt = tl.dot(tl.trans(dD).to(rt.dtype), rt)
         dw_end = tl.zeros([BT, BG], dtype=tl.float32)
         for vb in range(ND_V):
-            offs_v = vb * BV + tl.arange(0, BV); vm = offs_v < dv
+            offs_v = vb * BV + tl.arange(0, BV)
+            vm = offs_v < dv
             v1 = tl.load(v_ptr + b*sv_b + rows[:, None]*sv_l + offs_v[None, :]*sv_d, mask=rmask[:, None] & vm[None, :], other=0.0)
             gv = tl.load(g_ptr + b*sgr_b + rows[:, None]*sgr_l + offs_v[None, :]*sgr_d, mask=rmask[:, None] & vm[None, :], other=0.0)
             offs_e = tl.reshape(offs_g[:, None] * BVF + offs_v[None, :], [BG * BV])
             KS = tl.zeros([BT, BG * BV], dtype=tl.float32)
             for d0b in range(ND):
-                offs_d = d0b * BD + tl.arange(0, BD); dmask = offs_d < dqk
+                offs_d = d0b * BD + tl.arange(0, BD)
+                dmask = offs_d < dqk
                 kc = tl.load(k_ptr + b*sq_b + rows[:, None]*sq_l + offs_d[None, :]*sq_d, mask=rmask[:, None] & dmask[None, :], other=0.0)
                 dSa = tl.load(dSa_ptr + b*ssb_b + sb*ssb_n + t*ssb_t + offs_d[:, None]*ssb_d + offs_e[None, :]*ssb_e, mask=dmask[:, None], other=0.0)
                 KS += tl.dot(kc, dSa.to(kc.dtype))
@@ -1123,15 +1179,20 @@ def _den_fwd_intra(q_ptr, k_ptr, wg_ptr, ld_ptr, d_ptr, L, dqk: tl.constexpr, nc
     compile-time and the loop unrolls (ND==1 → straight-line). USE_G pre-scales by e^a (row-wise,
     distributes over the intra+inter sum)."""
     ND = tl.cdiv(dqk, BD)
-    b = tl.program_id(0); sb = tl.program_id(1); t = tl.program_id(2)
+    b = tl.program_id(0)
+    sb = tl.program_id(1)
+    t = tl.program_id(2)
     offs_t = tl.arange(0, BT)
-    offs_c = sb * BG + tl.arange(0, BG); cmask = offs_c < nc
-    rows = t * BT + offs_t; rmask = rows < L
+    offs_c = sb * BG + tl.arange(0, BG)
+    cmask = offs_c < nc
+    rows = t * BT + offs_t
+    rmask = rows < L
     wgc = tl.load(wg_ptr + b*sg_b + rows[:, None]*sg_l + offs_c[None, :]*sg_c, mask=rmask[:, None] & cmask[None, :], other=0.0)
     caus = (offs_t[:, None] >= offs_t[None, :]) & rmask[:, None] & rmask[None, :]
     G = tl.zeros([BT, BT], dtype=tl.float32)
     for d0 in range(ND):
-        offs_d = d0 * BD + tl.arange(0, BD); dmask = offs_d < dqk
+        offs_d = d0 * BD + tl.arange(0, BD)
+        dmask = offs_d < dqk
         qc = tl.load(q_ptr + b*sq_b + rows[:, None]*sq_l + offs_d[None, :]*sq_d,
                      mask=rmask[:, None] & dmask[None, :], other=0.0)
         kc = tl.load(k_ptr + b*sq_b + rows[:, None]*sq_l + offs_d[None, :]*sq_d,
@@ -1161,14 +1222,19 @@ def _den_fwd_inter(q_ptr, k_ptr, wg_ptr, ld_ptr, d_ptr, Zb_ptr, L, dqk, nc,
     over feature-blocks sum via atomic_add into its OWN d_inter buffer (reset_to_zero — autotunable;
     the host sums d = d_intra + d_inter). BD is an autotune knob; the grid's feature-block count is a
     launch lambda over meta['BD']. USE_G pre-scales by e^a; the carry decays by e^{Lam}."""
-    b = tl.program_id(0); sb = tl.program_id(1); d0 = tl.program_id(2)
+    b = tl.program_id(0)
+    sb = tl.program_id(1)
+    d0 = tl.program_id(2)
     offs_t = tl.arange(0, BT)
-    offs_d = d0 * BD + tl.arange(0, BD); dmask = offs_d < dqk
-    offs_c = sb * BG + tl.arange(0, BG); cmask = offs_c < nc
+    offs_d = d0 * BD + tl.arange(0, BD)
+    dmask = offs_d < dqk
+    offs_c = sb * BG + tl.arange(0, BG)
+    cmask = offs_c < nc
     offs_g = tl.arange(0, BG)
     Zd = tl.zeros([BD, BG], dtype=tl.float32)
     for t in range(NCH):
-        rows = t * BT + offs_t; rmask = rows < L
+        rows = t * BT + offs_t
+        rmask = rows < L
         qc = tl.load(q_ptr + b*sq_b + rows[:, None]*sq_l + offs_d[None, :]*sq_d,
                      mask=rmask[:, None] & dmask[None, :], other=0.0)
         wgc = tl.load(wg_ptr + b*sg_b + rows[:, None]*sg_l + offs_c[None, :]*sg_c,
@@ -1278,6 +1344,8 @@ def _den_grad(q_ptr, k_ptr, wg_ptr, gd_ptr, Zb_ptr, dZa_ptr, dq_ptr, dk_ptr, dw_
 class _DenFn(torch.autograd.Function):
     """Per-state denominator d[i,c] on folded [BH,L,*] tensors, Triton fwd + chunk-parallel bwd."""
     @staticmethod
+    @input_guard
+    @autocast_custom_fwd
     def forward(ctx, q, k, wg, chunk, BG):
         B, L, dqk = q.shape
         nc = wg.shape[-1]
@@ -1297,7 +1365,8 @@ class _DenFn(torch.autograd.Function):
         sZ = (Zb.stride(0), Zb.stride(1), Zb.stride(2), Zb.stride(3), Zb.stride(4))
         _den_fwd_intra[(B, NB, NCH)](q, k, wg, wg, d_intra, L, dqk, nc, *sq, *sg, *sd,
                                      USE_G=False, BT=chunk, BG=BG)
-        grid_inter = lambda meta: (B, NB, triton.cdiv(dqk, meta['BD']))
+        def grid_inter(meta):
+            return (B, NB, triton.cdiv(dqk, meta['BD']))
         _den_fwd_inter[grid_inter](q, k, wg, wg, d_inter, Zb, L, dqk, nc, *sq, *sg, *sd, *sZ,
                                    USE_G=False, BT=chunk, BG=BG, NCH=NCH)
         d = d_intra + d_inter
@@ -1306,6 +1375,8 @@ class _DenFn(torch.autograd.Function):
         return d
 
     @staticmethod
+    @input_guard
+    @autocast_custom_bwd
     def backward(ctx, gd):
         q, k, wg, Zb = ctx.saved_tensors
         chunk, BG, BD, NB, NCH = ctx.meta
@@ -1335,6 +1406,7 @@ class _DenFn(torch.autograd.Function):
         return cast(dq.sum(1)), cast(dk.sum(1)), cast(dw), None, None
 
 
+@input_guard
 def rola_perstate_den_triton(q, k, w, chunk=None, BG=16):
     """Per-state denominator on folded [BH,L,*] tensors. Differentiable (Triton fwd + parallel bwd)."""
     chunk = _CHUNK if chunk is None else min(chunk, _CHUNK)
@@ -1459,6 +1531,8 @@ class _DenGLAFn(torch.autograd.Function):
     scale, value-free (_den_gla_bwd_scan + _den_gla_grad with in-kernel dld assembly) — the
     same cost class as the additive den, not a second full GLA backward."""
     @staticmethod
+    @input_guard
+    @autocast_custom_fwd
     def forward(ctx, q, k, wg, ld, chunk, BG):
         B, L, dqk = q.shape
         nc = wg.shape[-1]
@@ -1479,7 +1553,8 @@ class _DenGLAFn(torch.autograd.Function):
         sZ = (Zb.stride(0), Zb.stride(1), Zb.stride(2), Zb.stride(3), Zb.stride(4))
         _den_fwd_intra[(B, NB, NCH)](q, k, wg, ld, d_intra, L, dqk, nc, *sq, *sg, *sd,
                                      USE_G=True, BT=chunk, BG=BG)
-        grid_inter = lambda meta: (B, NB, triton.cdiv(dqk, meta['BD']))
+        def grid_inter(meta):
+            return (B, NB, triton.cdiv(dqk, meta['BD']))
         _den_fwd_inter[grid_inter](q, k, wg, ld, d_inter, Zb, L, dqk, nc, *sq, *sg, *sd, *sZ,
                                    USE_G=True, BT=chunk, BG=BG, NCH=NCH)
         d = d_intra + d_inter
@@ -1488,6 +1563,8 @@ class _DenGLAFn(torch.autograd.Function):
         return d
 
     @staticmethod
+    @input_guard
+    @autocast_custom_bwd
     def backward(ctx, gd):
         q, k, wg, ld, Zb = ctx.saved_tensors
         chunk, BG, BD, NB, NCH = ctx.meta
@@ -1518,7 +1595,175 @@ class _DenGLAFn(torch.autograd.Function):
         return cast(dq.sum(1)), cast(dk.sum(1)), cast(dw), dld.to(ld.dtype), None, None
 
 
+@input_guard
 def rola_perstate_den_gla_triton(q, k, w, ld, chunk=None, BG=16):
     """Per-state denominator under per-state log-decay ld:[BH,L,nc], folded tensors. Differentiable."""
     chunk = _CHUNK if chunk is None else min(chunk, _CHUNK)
     return _DenGLAFn.apply(q, k, w, ld, chunk, BG)
+
+
+# ============================================================================
+# `chunk_rola` — the norm-aware public entry point (FLA inlines the norm-aware entrypoint at the
+# bottom of `chunk.py`, cf. `chunk_gla` in `ops/gla/chunk.py`).
+#
+# It is the ONE norm-aware entry point: it owns the whole recipe — the per-state denominator
+# pre-pass, the read-gate rescale, the (numerator-only) shared-gram readout, and the divide — so
+# callers (the LM layer) just pass `norm=...`. There is no routed branch bolted onto simple_gla and
+# no normalization logic in the model.
+#
+# Normalization is unified on the DENOMINATOR-SPLIT: the readout is always numerator-only
+# (BV=next_pow2(dv), no ones-column → ~2× occupancy, fits small smem), and the global denominator is
+# reconstructed as Σ_c r̃ᶜ·dᶜ from the per-state den pre-pass `d` (the same `d` that rescales the read
+# gates for kappa/per_state). global/kappa/per_state differ ONLY in how the read gates are rescaled:
+#   global    : r̃ = r                      (den = Σ_c rᶜ·dᶜ — the partition function)
+#   per_state : r̃ = r / (d+ε)              (≡ kappa=1, each state self-normalizes)
+#   kappa     : r̃ = r · (d+ε)^(-κ(x))      (input-dependent interpolation global↔per_state)
+#   raw       : numerator only, no divide   (GLA convention)
+#
+# Differentiable by COMPOSITION — the den pre-pass and the readout are verified autograd Functions
+# and the rescale/divide are plain torch, so gradients flow automatically (no custom backward).
+#
+# NO-CACHE LIMITATION: `chunk_rola` is the chunk-parallel (training) path only — there is no fused
+# recurrent / KV-cache decode kernel yet (the recurrent form lives in the tests as virtual-heads over
+# `fused_recurrent_simple_gla`). A first-class `fused_recurrent_rola.py` is deferred.
+# ============================================================================
+_NORMS = ('raw', 'global', 'per_state', 'kappa')
+
+
+def _rola_chunk_core(q, k, v, w, r, ld, chunk_size):
+    """Eager (CPU / capability-fallback) shared-gram routed readout on folded [BH, T, *] tensors.
+    ld=None ⇒ RLA (chunk-parallel cumsum scan); ld given ⇒ scalar-gated GLA (decayed scan). Returns
+    the un-normalized readout [BH, T, v.shape[-1]] (numerator; the den is a separate pre-pass)."""
+    BH, T, K = q.shape
+    V = v.shape[-1]
+    nc = w.shape[-1]
+    if ld is None:
+        pad = (-T) % chunk_size
+        if pad:
+            q, k, v, w, r = [F.pad(t, (0, 0, 0, pad)) for t in (q, k, v, w, r)]
+        Tp = T + pad
+        nch = Tp // chunk_size
+        C = chunk_size
+        qc, kc, vc = q.view(BH, nch, C, K), k.view(BH, nch, C, K), v.view(BH, nch, C, V)
+        rc, wc = r.view(BH, nch, C, nc), w.view(BH, nch, C, nc)
+        G = torch.einsum('bnid,bnjd->bnij', qc, kc)
+        R = torch.einsum('bnic,bnjc->bnij', rc, wc)
+        causal = torch.tril(torch.ones(C, C, device=q.device, dtype=q.dtype))
+        A = G * R * causal
+        o_intra = torch.einsum('bnij,bnjv->bniv', A, vc)
+        KV = torch.einsum('bnjc,bnjd,bnjv->bncdv', wc, kc, vc)
+        S_before = torch.cumsum(KV, dim=1) - KV
+        M = torch.einsum('bnic,bncdv->bnidv', rc, S_before)
+        o_inter = torch.einsum('bnid,bnidv->bniv', qc, M)
+        return (o_intra + o_inter).reshape(BH, Tp, V)[:, :T]
+    # GLA: per-state scalar decay, sequential decayed scan over chunks.
+    S = q.new_zeros(BH, nc, K, V)
+    outs = []
+    for c0 in range(0, T, chunk_size):
+        c1 = min(c0 + chunk_size, T)
+        Cc = c1 - c0
+        qcc, kcc, vcc = q[:, c0:c1], k[:, c0:c1], v[:, c0:c1]
+        rcc, wcc, ldc = r[:, c0:c1], w[:, c0:c1], ld[:, c0:c1]
+        a = torch.cumsum(ldc, dim=1)
+        rt, wt = rcc * torch.exp(a), wcc * torch.exp(-a)
+        G = torch.einsum('bid,bjd->bij', qcc, kcc)
+        D = torch.einsum('bic,bjc->bij', rt, wt)
+        causal = torch.tril(torch.ones(Cc, Cc, device=q.device, dtype=q.dtype))
+        o_intra = torch.einsum('bij,bjv->biv', G * D * causal, vcc)
+        M = torch.einsum('bic,bcdv->bidv', rt, S)
+        o_inter = torch.einsum('bid,bidv->biv', qcc, M)
+        outs.append(o_intra + o_inter)
+        Lam = a[:, -1, :]
+        w_end = wcc * torch.exp(Lam[:, None, :] - a)
+        KV = torch.einsum('bjc,bjd,bjv->bcdv', w_end, kcc, vcc)
+        S = torch.exp(Lam)[:, :, None, None] * S + KV
+    return torch.cat(outs, dim=1)
+
+
+def _perstate_den_torch(q, k, w, ld, chunk_size, eps=1e-5):
+    """Eager per-state denominator dᵢᶜ = Σ_{j≤i} (φqᵢ·φkⱼ) wⱼᶜ [· e^{Λᵢᶜ−Λⱼᶜ} under decay], folded
+    [BH,T,*] → [BH,T,nc]. CPU/capability fallback for the Triton den kernels."""
+    BH, T, K = q.shape
+    G = torch.einsum('bid,bjd->bij', q, k)
+    causal = torch.tril(torch.ones(T, T, device=q.device, dtype=q.dtype))
+    if ld is None:
+        return torch.einsum('bij,bjc->bic', G * causal, w)
+    A = torch.cumsum(ld, dim=1)                          # [BH,T,nc] cumulative log-decay
+    s = torch.einsum('bij,bjc->bic', G * causal, w * torch.exp(-A))
+    return torch.exp(A) * s
+
+
+def _rola_readout(qf, kf, vf, rf, wf, gf, chunk_size):
+    """Folded routed readout (numerator-only). CUDA → device-agnostic Triton kernels; else → eager
+    core. The global denominator is the caller's separate per-state den pre-pass."""
+    if qf.is_cuda:
+        if gf is None:
+            return rola_rla_triton(qf, kf, vf, rf, wf, chunk=chunk_size)
+        return rola_gla_triton(qf, kf, vf, rf, wf, gf)
+    return _rola_chunk_core(qf, kf, vf, wf, rf, gf, chunk_size)
+
+
+@torch.compiler.disable
+@input_guard
+def chunk_rola(q, k, v, r, w, g=None, norm='kappa', kappa=None, scale=None, eps=1e-5):
+    """Routed RoLA (shared-gram) readout with built-in normalization.
+
+    Args:
+        q, k:  φ-mapped queries/keys [B, T, H, K] (the feature map φ stays in the caller — the
+               operator is φ-agnostic, seeing only the content gram G=φ(q)φ(k)ᵀ).
+        v:     values [B, T, H, V].
+        r, w:  read / write routing gates [B, T, H, nc].
+        g:     per-state log-decay [B, T, H, nc] for the scalar-gated (GLA) variant, or None (RLA).
+        norm:  'raw' | 'global' | 'per_state' | 'kappa'.
+        kappa: per-token exponent [B, T, H, 1] (required for norm='kappa').
+        scale: query scale (default 1/sqrt(K)).
+    Returns:
+        Normalized readout [B, T, H, V] ('raw' returns the un-normalized numerator).
+    """
+    if norm not in _NORMS:
+        raise ValueError(f"norm must be one of {_NORMS}, got {norm!r}")
+    if norm == 'kappa' and kappa is None:
+        raise ValueError("norm='kappa' requires a per-token `kappa` exponent tensor [B,T,H,1]")
+    B, T, H, K = q.shape
+    if scale is None:
+        scale = K ** -0.5
+    chunk_size = min(64, max(16, triton.next_power_of_2(T)))
+
+    def fold(t):
+        return t.permute(0, 2, 1, 3).reshape(B * H, T, t.shape[-1])
+
+    def unfold(t):
+        return t.view(B, H, T, -1).permute(0, 2, 1, 3).contiguous()
+
+    # The op owns the kernel dtype contract (the layer no longer hand-rolls it). The shared-gram
+    # tl.dot needs same-dtype operands, but the feature map (q,k bf16) and the router softmax (r,w
+    # fp32) disagree under autocast — so unify every folded kernel input onto ONE compute dtype here.
+    # Under autocast that is the autocast dtype; otherwise the inputs' own dtype.
+    compute_dtype = torch.get_autocast_dtype('cuda') if torch.is_autocast_enabled() else q.dtype
+
+    def foldc(t):
+        return fold(t).to(compute_dtype)
+
+    qf, kf, vf, rf, wf = foldc(q) * scale, foldc(k), foldc(v), foldc(r), foldc(w)
+    gf = foldc(g) if g is not None else None
+
+    if norm == 'raw':
+        return unfold(_rola_readout(qf, kf, vf, rf, wf, gf, chunk_size)).to(v.dtype)
+
+    # global / per_state / kappa: per-state den pre-pass → rescale read gates → numerator-only
+    # readout → divide by the reconstructed global den Σ_c r̃ᶜ·dᶜ.
+    if qf.is_cuda:
+        d = (rola_perstate_den_gla_triton(qf, kf, wf, gf) if gf is not None
+             else rola_perstate_den_triton(qf, kf, wf))
+    else:
+        d = _perstate_den_torch(qf, kf, wf, gf, chunk_size, eps)
+    # Rescale read gates, then cast BACK to the compute dtype: `d` is fp32, so the rescale would
+    # upcast r̃ to fp32 and break the kernel's same-dtype requirement (tl.dot(r̃, wᵀ) with w in bf16).
+    if norm == 'kappa':
+        rf = (rf * (d + eps).pow(-fold(kappa).to(d.dtype))).to(compute_dtype)
+    elif norm == 'per_state':
+        rf = (rf / (d + eps)).to(compute_dtype)
+    # norm == 'global': r̃ = r (unchanged)
+    num = _rola_readout(qf, kf, vf, rf, wf, gf, chunk_size)
+    den = (rf * d).sum(-1, keepdim=True)
+    return unfold(num / (den + eps)).to(v.dtype)
