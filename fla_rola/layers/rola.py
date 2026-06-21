@@ -1,4 +1,4 @@
-# Copyright (c) 2023-2025, RoLA authors.
+# Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 
 """RoLA — Routed Linear Attention (canonical FLA layer).
 
@@ -35,23 +35,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 
-from fla_rola.modules import ShortConvolution
+from fla_rola.modules import RMSNorm, ShortConvolution
 from fla_rola.ops.rola import chunk_rola
 
 if TYPE_CHECKING:
     from transformers.processing_utils import Unpack
 
     from fla_rola.models.utils import Cache
-
-
-def _triton_compute_dtype(fallback):
-    """Dtype the Triton kernels should run in. Under autocast use the AUTOCAST dtype (bf16) — NOT
-    whatever the feature map emits (e.g. hedgehog softmax is fp32 under autocast, forcing slow fp32
-    matmuls). The router softmax is also fp32 under autocast; casting all inputs to this one dtype
-    avoids tl.dot dtype mismatches. Outside autocast use the input dtype."""
-    if torch.is_autocast_enabled():
-        return torch.get_autocast_gpu_dtype()
-    return fallback
 
 
 class RoLA(nn.Module):
@@ -138,12 +128,13 @@ class RoLA(nn.Module):
         self.v_proj = nn.Linear(hidden_size, self.value_dim, bias=False)
         self.o_proj = nn.Linear(self.value_dim, hidden_size, bias=False)
 
-        # Optional qk-rmsnorm (per-head, pre-feature-map) — an LM-scale training stabilizer. Params
-        # are created ONLY when enabled, so the default (qk_norm=False) state_dict is byte-identical
-        # to before — the MQAR cells stay valid + reproducible.
+        # Optional qk-rmsnorm (per-head, pre-feature-map) — an LM-scale training stabilizer. The
+        # FLA `RMSNorm` module (fp32, cf. `layers/gla.py`) is created ONLY when enabled, so the
+        # default (qk_norm=False) state_dict is byte-identical to before — the MQAR cells stay valid
+        # + reproducible.
         if qk_norm:
-            self.q_norm_w = nn.Parameter(torch.ones(self.proj_qk))
-            self.k_norm_w = nn.Parameter(torch.ones(self.proj_qk))
+            self.q_norm = RMSNorm(self.proj_qk, eps=1e-5, dtype=torch.float32)
+            self.k_norm = RMSNorm(self.proj_qk, eps=1e-5, dtype=torch.float32)
 
         if use_short_conv:
             self.q_conv1d = ShortConvolution(self.key_dim, conv_size, bias=conv_bias, activation='silu')
@@ -184,7 +175,8 @@ class RoLA(nn.Module):
         read_gates = F.softmax(rl, dim=-1)
         if self.router_zloss_coef > 0.0:
             # ST-MoE router z-loss: penalize the log-partition magnitude of the routing logits.
-            zl = lambda lg: torch.logsumexp(lg.float(), dim=-1).square().mean()   # fp32 (bf16 loses the tail)
+            def zl(lg):
+                return torch.logsumexp(lg.float(), dim=-1).square().mean()   # fp32 (bf16 loses the tail)
             self._router_aux = self.router_zloss_coef * (zl(wl) + (zl(rl) if self.read_router is not None else 0.0))
         return write_gates, read_gates
 
@@ -230,12 +222,8 @@ class RoLA(nn.Module):
         k = rearrange(k, 'b l (h d) -> b l h d', d=self.proj_qk)
         v = rearrange(v, 'b l (h d) -> b l h d', d=self.head_v_dim)
 
-        if self.qk_norm:                              # per-head qk-RMSNorm before the feature map.
-            # Computed in fp32 for bf16 stability (matches fla.layers.attn's RMSNorm(dtype=fp32)).
-            def _rms(t, w):
-                tf = t.float()
-                return (w * tf * torch.rsqrt(tf.pow(2).mean(-1, keepdim=True) + 1e-5)).to(t.dtype)
-            q, k = _rms(q, self.q_norm_w), _rms(k, self.k_norm_w)
+        if self.qk_norm:                              # per-head qk-RMSNorm (fp32) before the feature map.
+            q, k = self.q_norm(q), self.k_norm(k)
 
         qf, kf = self._feature_map(q, k)
         write_gates, read_gates = self._route(x)
@@ -243,21 +231,12 @@ class RoLA(nn.Module):
         kap = (torch.sigmoid(self.w_kappa(x)).view(B, L, H, 1)
                if self.state_norm == 'kappa' else None)
 
-        if qf.is_cuda:
-            # Cast all kernel inputs to the autocast compute dtype (bf16); autocast OFF so the
-            # tl.dot intermediates aren't re-cast. Accumulation stays fp32 inside the kernel.
-            with torch.autocast(device_type='cuda', enabled=False):
-                dt = _triton_compute_dtype(qf.dtype)
-                c = lambda t: t.to(dt)
-                out = chunk_rola(
-                    c(qf), c(kf), c(v), r=c(read_gates), w=c(write_gates),
-                    g=(c(g) if g is not None else None),
-                    norm=self.state_norm, kappa=(c(kap) if kap is not None else None),
-                    scale=1.0,
-                ).to(v.dtype)
-        else:
-            out = chunk_rola(qf, kf, v, r=read_gates, w=write_gates, g=g,
-                             norm=self.state_norm, kappa=kap, scale=1.0)
+        # The `chunk_rola` op owns dtype/autocast: its Triton autograd Functions carry
+        # @input_guard + @autocast_custom_fwd/bwd (the FLA idiom), so under autocast they cast their
+        # own inputs to the compute dtype (unifying the tl.dot operands) with fp32 accumulation —
+        # the layer no longer hand-rolls the cast.
+        out = chunk_rola(qf, kf, v, r=read_gates, w=write_gates, g=g,
+                         norm=self.state_norm, kappa=kap, scale=1.0).to(v.dtype)
 
         o = self.o_proj(out.reshape(B, L, H * self.head_v_dim))
         return o, None, past_key_values
