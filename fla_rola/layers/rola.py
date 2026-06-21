@@ -238,9 +238,12 @@ class RoLA(nn.Module):
         k = rearrange(k, 'b l (h d) -> b l h d', d=self.proj_qk)
         v = rearrange(v, 'b l (h d) -> b l h d', d=self.head_v_dim)
 
-        if self.qk_norm:                              # unit-RMS q/k per head before the feature map
-            q = self.q_norm_w * q * torch.rsqrt(q.pow(2).mean(-1, keepdim=True) + 1e-5)
-            k = self.k_norm_w * k * torch.rsqrt(k.pow(2).mean(-1, keepdim=True) + 1e-5)
+        if self.qk_norm:                              # per-head qk-RMSNorm before the feature map.
+            # Computed in fp32 for bf16 stability (matches fla.layers.attn's RMSNorm(dtype=fp32)).
+            def _rms(t, w):
+                tf = t.float()
+                return (w * tf * torch.rsqrt(tf.pow(2).mean(-1, keepdim=True) + 1e-5)).to(t.dtype)
+            q, k = _rms(q, self.q_norm_w), _rms(k, self.k_norm_w)
 
         qf, kf = self._feature_map(q, k)
         write_gates, read_gates = self._route(x)
