@@ -1,0 +1,622 @@
+# Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
+
+"""Correctness suite for the routed RoLA operator (`chunk_rola`) and its Triton kernels.
+
+Pytest port of the four original script-style harnesses, preserving every gate with the SAME
+shapes / dtypes / tolerances / fp64 oracles (the new file passing IS the correctness gate — it is
+not weakened):
+
+  * INTER equivalence (was test_recurrent_vs_chunked.py): the chunked (vh `chunk_simple_gla`),
+    recurrent (step `fused_recurrent_simple_gla`) and routed (`chunk_rola`) forms agree with each
+    other and — for the global norm — with the direct O(L²) naive oracle, across
+    {RLA,GLA} × nc × dv × norm{global,kappa,per_state}. Plus the INTER backward: the routed-kernel
+    analytic grad == autograd through the naive oracle AND the vh chunk, at BT=16 fp32.
+  * KERNEL vs fp64 ORACLE (was test_rola_routed_tiling.py): fp64 gradcheck of the naive oracles,
+    then the numerator-readout AND per-state-den Triton kernels (RLA + GLA) vs the fp64 oracle —
+    forward + analytic backward — swept across the feature dim K (<=64 SRAM regime and well beyond),
+    plus the den caller E2E at dqk=128.
+  * INTRA branch-invariance (was test_kernel_self_consistency.py): at dv=64 the value tile BV admits
+    ND_V=4 (BV=16) and ND_V=2 (BV=32); both are forced and the full fwd+bwd must agree (fp32, BT=16).
+  * DEN-FWD config sweep (was test_den_fwd_tile_sweep.py): FORCE every autotune feature-tile (BD)
+    config of the two den-forward kernels and assert each matches the fp64 oracle — the only check
+    that exercises the small-SMEM fallback tiles the autotuner never picks on the dev card.
+
+Run:  PYTHONPATH=. pytest tests/ops/test_rola.py -q   (CUDA required; CPU is skipped).
+"""
+
+import contextlib
+import itertools
+
+import pytest
+import torch
+import triton
+
+import fla_rola.ops.rola.chunk as C
+from fla_rola.ops.rola import chunk_rola, fused_recurrent_rola
+from fla_rola.ops.rola.chunk import (
+    rola_gla_triton,
+    rola_perstate_den_gla_triton,
+    rola_perstate_den_triton,
+    rola_rla_triton,
+)
+from fla_rola.ops.rola.naive import (
+    naive_rola_gla,
+    naive_rola_gla_perstate_den,
+    naive_rola_global,
+    naive_rola_perstate_den,
+)
+from fla_rola.ops.simple_gla import chunk_simple_gla
+from fla_rola.ops.simple_gla.fused_recurrent import fused_recurrent_simple_gla
+from fla_rola.utils import assert_close, device
+
+EPS = 1e-5
+KAPPA = 0.5
+
+
+# -----------------------------------------------------------------------------
+# helpers (the original max-rel metric — do NOT swap for an RMS-rel; the gates were calibrated to it)
+# -----------------------------------------------------------------------------
+def _relmax(a, b):
+    return (a - b).abs().max().item() / (b.abs().max().item() + 1e-9)
+
+
+def _fold(t):
+    B, L, H, D = t.shape
+    return t.permute(0, 2, 1, 3).reshape(B * H, L, D).contiguous()
+
+
+def _unfold(t, B, H):
+    BH, L, D = t.shape
+    return t.view(B, H, L, D).permute(0, 2, 1, 3).contiguous()
+
+
+# =============================================================================
+# INTER equivalence: chunk (vh chunk_simple_gla) == recurrent (step fused_recurrent) == routed
+#                    (chunk_rola) == naive direct O(L²) oracle (global norm).
+# (was tests/test_recurrent_vs_chunked.py — same B/H/dqk=dv, L=64, seeds, nc/dv grid, TOL.)
+# =============================================================================
+_B, _H, _DQK = 4, 4, 16
+
+
+def _mk_inter(L, nc, dv, gla, seed):
+    g = torch.Generator(device=device).manual_seed(seed)
+
+    def t(*s):
+        return torch.randn(*s, device=device, generator=g, dtype=torch.float32)
+    q, k = t(_B, L, _H, _DQK).abs(), t(_B, L, _H, _DQK).abs()       # elu+1-like: positive features
+    v = t(_B, L, _H, dv)
+    r = torch.softmax(t(_B, L, _H, nc), -1)
+    w = torch.softmax(t(_B, L, _H, nc), -1)
+    ld = (-torch.rand(_B, L, _H, nc, device=device, generator=g) * 0.5).clamp(min=-2.5) if gla else None
+    return q, k, v, r, w, ld
+
+
+def _vh_expand(q, k, v, w, ld, nc, dv):
+    """[B,L,H,*] -> virtual-head [B,L,H*nc,*]; v carries the write gate + a den ones-column."""
+    Bq, L = q.shape[0], q.shape[1]
+    qv = q.unsqueeze(3).expand(Bq, L, _H, nc, _DQK).reshape(Bq, L, _H * nc, _DQK)
+    kv = k.unsqueeze(3).expand(Bq, L, _H, nc, _DQK).reshape(Bq, L, _H * nc, _DQK)
+    v1 = torch.cat([v, torch.ones_like(v[..., :1])], -1)
+    vv = (v1.unsqueeze(3) * w.unsqueeze(-1)).reshape(Bq, L, _H * nc, dv + 1)
+    gv = ld.reshape(Bq, L, _H * nc).float() if ld is not None else None
+    return qv, kv, vv, gv
+
+
+def _vh_combine(o_aug, r, nc, norm, dv):
+    """o_aug:[B,L,H*nc,dv+1] per-state (num|den) -> combined [B,L,H,dv] under the given norm."""
+    Bq, L = o_aug.shape[0], o_aug.shape[1]
+    o = o_aug.view(Bq, L, _H, nc, dv + 1)
+    num, den = o[..., :dv], o[..., dv]
+    if norm == 'kappa':
+        r = r * (den.abs() + EPS).pow(-KAPPA)
+    elif norm == 'per_state':
+        r = r / (den.abs() + EPS)
+    return (num * r.unsqueeze(-1)).sum(3) / ((den * r).sum(3).unsqueeze(-1) + EPS)
+
+
+def _chunked(q, k, v, r, w, ld, nc, norm, dv):
+    qv, kv, vv, gv = _vh_expand(q, k, v, w, ld, nc, dv)
+    o_aug, _ = chunk_simple_gla(qv, kv, vv, g=gv, scale=1.0)
+    return _vh_combine(o_aug.float(), r, nc, norm, dv)
+
+
+def _recurrent(q, k, v, r, w, ld, nc, norm, dv):
+    """Step-by-step decode: one fused_recurrent step per token, carrying the state."""
+    L = q.shape[1]
+    state, outs = None, []
+    for tstep in range(L):
+        s = slice(tstep, tstep + 1)
+        qv, kv, vv, gv = _vh_expand(q[:, s], k[:, s], v[:, s], w[:, s],
+                                    ld[:, s] if ld is not None else None, nc, dv)
+        o, state = fused_recurrent_simple_gla(qv, kv, vv, g=gv, scale=1.0,
+                                              initial_state=state, output_final_state=True)
+        outs.append(_vh_combine(o.float(), r[:, s], nc, norm, dv))
+    return torch.cat(outs, 1)
+
+
+def _naive(q, k, v, r, w, ld, gla):
+    """DIRECT O(L²) global-norm oracle (no vh glue). r=read, w=write."""
+    if gla:
+        return naive_rola_gla(q, k, v, w, r, ld, normalized=True)
+    return naive_rola_global(q, k, v, w, r)
+
+
+def _routed(q, k, v, r, w, ld, nc, norm):
+    """The first-class chunk_rola operator — the third leg of vh == routed-kernel == naive."""
+    kap = (torch.full((q.shape[0], q.shape[1], _H, 1), KAPPA, device=q.device, dtype=q.dtype)
+           if norm == 'kappa' else None)
+    return chunk_rola(q, k, v, r=r, w=w, g=ld, norm=norm, kappa=kap, scale=1.0)
+
+
+@pytest.mark.parametrize('dv', [16, 32, 64])     # 16: un-tiled ND_V==1; 32/64: value-tiling ND_V>=2
+@pytest.mark.parametrize('nc', [16, 64])
+@pytest.mark.parametrize('gla', [False, True])
+@pytest.mark.parametrize('norm', ['global', 'kappa', 'per_state'])
+def test_inter_equivalence_fwd(norm, gla, nc, dv):
+    """chunk == recurrent == routed (== naive for global), forward, L=64, over seeds. TOL 5e-3
+    (clean residuals ~1.5e-3; 5e-3 = ~3x headroom — catches the old loose-3e-2 MUT-1 blind spot)."""
+    if device != 'cuda':
+        pytest.skip('RoLA Triton kernels require CUDA')
+    L, tol = 64, 5e-3
+    w_rc = w_kc = w_cn = w_rn = w_kn = 0.0
+    for seed in range(6):
+        q, k, v, r, w, ld = _mk_inter(L, nc, dv, gla, seed)
+        o_chunk = _chunked(q, k, v, r, w, ld, nc, norm, dv)
+        o_rec = _recurrent(q, k, v, r, w, ld, nc, norm, dv)
+        o_routed = _routed(q, k, v, r, w, ld, nc, norm)
+        w_rc = max(w_rc, _relmax(o_rec, o_chunk))            # recurrent == chunked
+        w_kc = max(w_kc, _relmax(o_routed, o_chunk))         # routed-kernel == vh chunk
+        if norm == 'global':
+            o_naive = _naive(q, k, v, r, w, ld, gla)         # the 3-way anchor (direct oracle)
+            w_cn = max(w_cn, _relmax(o_chunk, o_naive))
+            w_rn = max(w_rn, _relmax(o_rec, o_naive))
+            w_kn = max(w_kn, _relmax(o_routed, o_naive))
+    # FLA-idiom assert_close on the primary leg + the original max-rel gate (strictly not weaker).
+    assert_close('routed==chunk', o_chunk, o_routed, tol)
+    assert w_rc < tol, f'recurrent==chunk max-rel {w_rc:.2e}'
+    assert w_kc < tol, f'routed==chunk max-rel {w_kc:.2e}'
+    if norm == 'global':
+        assert max(w_cn, w_rn, w_kn) < tol, \
+            f'chunk==naive {w_cn:.2e} rec==naive {w_rn:.2e} routed==naive {w_kn:.2e}'
+
+
+def _grad_through(fwd, q, k, v, r, w, ld, gla, coef):
+    """autograd grads of (fwd(...)*coef).sum() w.r.t. (q,k,v,r,w[,ld])."""
+    ins = [x.clone().requires_grad_() for x in ([q, k, v, r, w] + ([ld] if gla else []))]
+    ld_in = ins[5] if gla else None
+    o = fwd(ins[0], ins[1], ins[2], ins[3], ins[4], ld_in)
+    return torch.autograd.grad((o * coef).sum(), ins)
+
+
+@pytest.mark.parametrize('dv', [16, 32, 64])
+@pytest.mark.parametrize('nc', [16, 64])
+@pytest.mark.parametrize('gla', [False, True])
+def test_inter_backward_global(gla, nc, dv):
+    """INTER backward: routed-kernel grad == autograd(naive oracle) == autograd(vh-chunk), norm=global,
+    at BT=16 fp32 (so the value-tiled fp32 backward fits a small card → rigorous ~1e-3, not the bf16
+    floor). TOL 8e-3 (clean ~4e-3; 2x headroom — catches the ~2% MUT-1 class)."""
+    if device != 'cuda':
+        pytest.skip('RoLA Triton kernels require CUDA')
+    saved = (C._CHUNK, C._CHUNK_FWD)
+    C._CHUNK = 16
+    C._CHUNK_FWD = 16
+    try:
+        tol = 8e-3
+        w_kn = w_kc = w_cn = 0.0
+        for seed in range(3):
+            q, k, v, r, w, ld = _mk_inter(64, nc, dv, gla, seed)
+            coef = torch.randn(*v.shape, device=device)
+            g_routed = _grad_through(lambda a, b, c, d, e, f: _routed(a, b, c, d, e, f, nc, 'global'),
+                                     q, k, v, r, w, ld, gla, coef)
+            g_naive = _grad_through(lambda a, b, c, d, e, f: _naive(a, b, c, d, e, f, gla),
+                                    q, k, v, r, w, ld, gla, coef)
+            g_chunk = _grad_through(lambda a, b, c, d, e, f: _chunked(a, b, c, d, e, f, nc, 'global', dv),
+                                    q, k, v, r, w, ld, gla, coef)
+            w_kn = max(w_kn, max(_relmax(a, b) for a, b in zip(g_routed, g_naive)))
+            w_kc = max(w_kc, max(_relmax(a, b) for a, b in zip(g_routed, g_chunk)))
+            w_cn = max(w_cn, max(_relmax(a, b) for a, b in zip(g_chunk, g_naive)))
+        assert max(w_kn, w_kc, w_cn) < tol, \
+            f'routed==naive {w_kn:.2e} routed==vhchunk {w_kc:.2e} vhchunk==naive {w_cn:.2e}'
+    finally:
+        C._CHUNK, C._CHUNK_FWD = saved
+
+
+# =============================================================================
+# KERNEL vs fp64 ORACLE: numerator-readout + per-state-den, fwd + analytic bwd, swept across K.
+# (was tests/test_rola_routed_tiling.py.)
+# =============================================================================
+def _mk_oracle(B, L, H, K, nc, dv, dtype, seed=0, with_ld=False):
+    g = torch.Generator(device=device).manual_seed(seed)
+
+    def rnd(*s):
+        return torch.randn(*s, generator=g, device=device, dtype=dtype)
+    q = torch.nn.functional.elu(rnd(B, L, H, K)) + 1.0
+    k = torch.nn.functional.elu(rnd(B, L, H, K)) + 1.0
+    v = rnd(B, L, H, dv)
+    rg = torch.softmax(rnd(B, L, H, nc), dim=-1)
+    wg = torch.softmax(rnd(B, L, H, nc), dim=-1)
+    if with_ld:
+        ld = torch.log(torch.sigmoid(rnd(B, L, H, nc)))      # per-state log-decay in (-inf, 0)
+        return q, k, v, rg, wg, ld
+    return q, k, v, rg, wg
+
+
+def _rla_normalized(q, k, v, rg, wg):
+    """[B,L,H,*] -> normalized [B,L,H,dv] via the SPLIT path (numerator-only kernel + global den
+    reconstructed as Σ_c rgᶜ·dᶜ from the per-state den pre-pass)."""
+    B, L, H, dv = v.shape
+    qf, kf, rgf, wgf = _fold(q), _fold(k), _fold(rg), _fold(wg)
+    numf = rola_rla_triton(qf, kf, _fold(v), rgf, wgf)
+    d = rola_perstate_den_triton(qf, kf, wgf)
+    denf = (rgf * d).sum(-1, keepdim=True)
+    return _unfold(numf / (denf + EPS), B, H)
+
+
+def _gla_normalized(q, k, v, rg, wg, ld):
+    B, L, H, dv = v.shape
+    qf, kf, rgf, wgf, ldf = _fold(q), _fold(k), _fold(rg), _fold(wg), _fold(ld)
+    numf = rola_gla_triton(qf, kf, _fold(v), rgf, wgf, ldf)
+    d = rola_perstate_den_gla_triton(qf, kf, wgf, ldf)
+    denf = (rgf * d).sum(-1, keepdim=True)
+    return _unfold(numf / (denf + EPS), B, H)
+
+
+def test_oracle_gradcheck_rla():
+    """fp64 gradcheck of the naive global-norm oracle — proves its gradients are a valid reference."""
+    if device != 'cuda':
+        pytest.skip('RoLA Triton kernels require CUDA')
+    q, k, v, rg, wg = _mk_oracle(1, 12, 1, 8, nc=3, dv=4, dtype=torch.float64)
+    ins = [t.detach().requires_grad_(True) for t in (q, k, v, rg, wg)]
+    assert torch.autograd.gradcheck(
+        lambda q, k, v, rg, wg: naive_rola_global(q, k, v, wg, rg),
+        tuple(ins), eps=1e-6, atol=1e-5, rtol=1e-4)
+
+
+def test_oracle_gradcheck_gla():
+    """fp64 gradcheck of the naive GLA oracle (per-state decay ld)."""
+    if device != 'cuda':
+        pytest.skip('RoLA Triton kernels require CUDA')
+    q, k, v, rg, wg, ld = _mk_oracle(1, 12, 1, 8, nc=3, dv=4, dtype=torch.float64, with_ld=True)
+    ins = [t.detach().requires_grad_(True) for t in (q, k, v, rg, wg, ld)]
+    assert torch.autograd.gradcheck(
+        lambda q, k, v, rg, wg, ld: naive_rola_gla(q, k, v, wg, rg, ld, normalized=True),
+        tuple(ins), eps=1e-6, atol=1e-5, rtol=1e-4)
+
+
+# K spans the K<=64 SRAM regime AND well beyond (the conservative-bound region the tiling makes robust).
+_KS = [16, 64, 128, 256, 512]
+_KS_DEN = [16, 64, 96, 128, 256, 512]   # +96 (non-pow2) exercises the padded-tail dmask
+
+
+@pytest.mark.parametrize('K', _KS)
+def test_readout_fwd_rla(K):
+    """RLA numerator-readout normalized fwd: kernel(fp32) vs oracle(fp64). TOL 5e-3."""
+    if device != 'cuda':
+        pytest.skip('RoLA Triton kernels require CUDA')
+    q, k, v, rg, wg = _mk_oracle(2, 64, 2, K, nc=4, dv=16, dtype=torch.float64)
+    ref = naive_rola_global(q, k, v, wg, rg)
+    out = _rla_normalized(*[t.float() for t in (q, k, v, rg, wg)]).double()
+    assert _relmax(out, ref) < 5e-3
+
+
+@pytest.mark.parametrize('K', _KS)
+def test_readout_bwd_rla(K):
+    """RLA analytic grads (fp32 autograd) vs oracle analytic grads (fp64 autograd), per input. TOL 8e-3.
+    NEVER gradcheck-in-fp64 through the fp32 kernel (fails to compile by construction)."""
+    if device != 'cuda':
+        pytest.skip('RoLA Triton kernels require CUDA')
+    q, k, v, rg, wg = _mk_oracle(2, 48, 2, K, nc=4, dv=16, dtype=torch.float32)
+    ik = [t.clone().requires_grad_(True) for t in (q, k, v, rg, wg)]
+    _rla_normalized(*ik).sum().backward()
+    io = [t.double().detach().requires_grad_(True) for t in (q, k, v, rg, wg)]
+    naive_rola_global(io[0], io[1], io[2], io[4], io[3]).sum().backward()
+    worst = max((ik[i].grad.double() - io[i].grad).abs().max().item()
+                / (io[i].grad.abs().max().item() + 1e-9) for i in range(5))
+    assert worst < 8e-3
+
+
+@pytest.mark.parametrize('K', _KS)
+def test_readout_fwd_gla(K):
+    """GLA numerator-readout normalized fwd vs oracle(fp64). TOL 3e-2 (GLA exp(cumsum(ld)) decay caps
+    fp32-vs-fp64 at ~1.5e-2; the tight GLA-fwd gate is the inter routed==chunk fp32-vs-fp32 ~1.5e-3)."""
+    if device != 'cuda':
+        pytest.skip('RoLA Triton kernels require CUDA')
+    q, k, v, rg, wg, ld = _mk_oracle(2, 64, 2, K, nc=4, dv=16, dtype=torch.float64, with_ld=True)
+    ref = naive_rola_gla(q, k, v, wg, rg, ld, normalized=True)
+    out = _gla_normalized(*[t.float() for t in (q, k, v, rg, wg, ld)]).double()
+    assert _relmax(out, ref) < 3e-2
+
+
+@pytest.mark.parametrize('K', _KS)
+def test_readout_bwd_gla(K):
+    """GLA analytic grads vs oracle analytic grads, per input (incl. dld). TOL 8e-3."""
+    if device != 'cuda':
+        pytest.skip('RoLA Triton kernels require CUDA')
+    q, k, v, rg, wg, ld = _mk_oracle(2, 48, 2, K, nc=4, dv=16, dtype=torch.float32, with_ld=True)
+    ik = [t.clone().requires_grad_(True) for t in (q, k, v, rg, wg, ld)]
+    _gla_normalized(*ik).sum().backward()
+    io = [t.double().detach().requires_grad_(True) for t in (q, k, v, rg, wg, ld)]
+    naive_rola_gla(io[0], io[1], io[2], io[4], io[3], io[5], normalized=True).sum().backward()
+    worst = max((ik[i].grad.double() - io[i].grad).abs().max().item()
+                / (io[i].grad.abs().max().item() + 1e-9) for i in range(6))
+    assert worst < 8e-3
+
+
+@pytest.mark.parametrize('K', _KS_DEN)
+def test_den_fwd_rla(K):
+    """RLA per-state den fwd: kernel(fp32) vs oracle(fp64). TOL 5e-3."""
+    if device != 'cuda':
+        pytest.skip('RoLA Triton kernels require CUDA')
+    q, k, v, rg, wg = _mk_oracle(2, 64, 2, K, nc=4, dv=16, dtype=torch.float64)
+    ref = naive_rola_perstate_den(q, k, wg)
+    out = _unfold(rola_perstate_den_triton(_fold(q.float()), _fold(k.float()), _fold(wg.float())), 2, 2).double()
+    assert _relmax(out, ref) < 5e-3
+
+
+@pytest.mark.parametrize('K', _KS_DEN)
+def test_den_bwd_rla(K):
+    """RLA per-state den analytic grads vs oracle. TOL 8e-3."""
+    if device != 'cuda':
+        pytest.skip('RoLA Triton kernels require CUDA')
+    q, k, v, rg, wg = _mk_oracle(2, 48, 2, K, nc=4, dv=16, dtype=torch.float32)
+    ik = [t.clone().requires_grad_(True) for t in (q, k, wg)]
+    _unfold(rola_perstate_den_triton(_fold(ik[0]), _fold(ik[1]), _fold(ik[2])), 2, 2).sum().backward()
+    io = [t.double().detach().requires_grad_(True) for t in (q, k, wg)]
+    naive_rola_perstate_den(io[0], io[1], io[2]).sum().backward()
+    worst = max((ik[i].grad.double() - io[i].grad).abs().max().item()
+                / (io[i].grad.abs().max().item() + 1e-9) for i in range(3))
+    assert worst < 8e-3
+
+
+@pytest.mark.parametrize('K', _KS_DEN)
+def test_den_fwd_gla(K):
+    """GLA per-state den fwd vs oracle(fp64). TOL 3e-2 (GLA decay fp32-vs-fp64 floor)."""
+    if device != 'cuda':
+        pytest.skip('RoLA Triton kernels require CUDA')
+    q, k, v, rg, wg, ld = _mk_oracle(2, 64, 2, K, nc=4, dv=16, dtype=torch.float64, with_ld=True)
+    ref = naive_rola_gla_perstate_den(q, k, wg, ld)
+    out = _unfold(rola_perstate_den_gla_triton(_fold(q.float()), _fold(k.float()),
+                                               _fold(wg.float()), _fold(ld.float())), 2, 2).double()
+    assert _relmax(out, ref) < 3e-2
+
+
+@pytest.mark.parametrize('K', _KS_DEN)
+def test_den_bwd_gla(K):
+    """GLA per-state den analytic grads vs oracle (incl. the dld column). TOL 8e-3."""
+    if device != 'cuda':
+        pytest.skip('RoLA Triton kernels require CUDA')
+    q, k, v, rg, wg, ld = _mk_oracle(2, 48, 2, K, nc=4, dv=16, dtype=torch.float32, with_ld=True)
+    ik = [t.clone().requires_grad_(True) for t in (q, k, wg, ld)]
+    _unfold(rola_perstate_den_gla_triton(_fold(ik[0]), _fold(ik[1]), _fold(ik[2]), _fold(ik[3])), 2, 2).sum().backward()
+    io = [t.double().detach().requires_grad_(True) for t in (q, k, wg, ld)]
+    naive_rola_gla_perstate_den(io[0], io[1], io[2], io[3]).sum().backward()
+    worst = max((ik[i].grad.double() - io[i].grad).abs().max().item()
+                / (io[i].grad.abs().max().item() + 1e-9) for i in range(4))
+    assert worst < 8e-3
+
+
+@pytest.mark.parametrize('gla', [False, True])
+def test_den_caller_e2e_dqk128(gla):
+    """E2E den caller at dqk=128 (the now-ungated model path): the Triton den entry points match the
+    eager oracle (fwd + grads), RLA and GLA. fwd<2e-2, grad<3e-2."""
+    if device != 'cuda':
+        pytest.skip('RoLA Triton kernels require CUDA')
+    K = 128
+    if not gla:
+        q, k, v, rg, wg = _mk_oracle(2, 48, 2, K, nc=4, dv=16, dtype=torch.float32)
+        ik = [t.clone().requires_grad_(True) for t in (q, k, wg)]
+        _unfold(rola_perstate_den_triton(_fold(ik[0]), _fold(ik[1]), _fold(ik[2])), 2, 2).sum().backward()
+        io = [t.double().detach().requires_grad_(True) for t in (q, k, wg)]
+        ref = naive_rola_perstate_den(io[0], io[1], io[2])
+        ref.sum().backward()
+        fwd = _relmax(_unfold(rola_perstate_den_triton(_fold(q), _fold(k), _fold(wg)), 2, 2).double(), ref)
+        gw = max((ik[i].grad.double() - io[i].grad).abs().max().item()
+                 / (io[i].grad.abs().max().item() + 1e-9) for i in range(3))
+    else:
+        q, k, v, rg, wg, ld = _mk_oracle(2, 48, 2, K, nc=4, dv=16, dtype=torch.float32, with_ld=True)
+        ik = [t.clone().requires_grad_(True) for t in (q, k, wg, ld)]
+        _unfold(rola_perstate_den_gla_triton(_fold(ik[0]), _fold(ik[1]), _fold(ik[2]), _fold(ik[3])), 2, 2).sum().backward()
+        io = [t.double().detach().requires_grad_(True) for t in (q, k, wg, ld)]
+        ref = naive_rola_gla_perstate_den(io[0], io[1], io[2], io[3])
+        ref.sum().backward()
+        fwd = _relmax(_unfold(rola_perstate_den_gla_triton(_fold(q), _fold(k), _fold(wg), _fold(ld)), 2, 2).double(), ref)
+        gw = max((ik[i].grad.double() - io[i].grad).abs().max().item()
+                 / (io[i].grad.abs().max().item() + 1e-9) for i in range(4))
+    assert fwd < 2e-2 and gw < 3e-2, f'fwd={fwd:.2e} grad={gw:.2e}'
+
+
+# =============================================================================
+# INTRA branch-invariance: at dv=64 force ND_V=4 (BV=16) vs ND_V=2 (BV=32) and assert fwd+bwd agree.
+# (was tests/test_kernel_self_consistency.py — BT=16 fp32 so the value-tiled fp32 configs fit.)
+# =============================================================================
+_VALUE_TILED = (C._scan_S, C._scan_dS, C._rola_fwd_inter, C._rola_gla_fwd_inter,
+                C._par_grad_rla_qr, C._par_grad_rla_kwv, C._par_grad_gla_qr, C._par_grad_gla_kwv)
+_HAS_BD = (C._par_grad_rla_qr, C._par_grad_rla_kwv, C._par_grad_gla_qr, C._par_grad_gla_kwv)
+
+
+def _force_bv(bv, warps, bd=16, stages=1):
+    """Pin every value-tiled kernel to one (BV, num_warps) config (grad kernels also need BD)."""
+    for k in _VALUE_TILED:
+        kw = {'BD': bd, 'BV': bv} if k in _HAS_BD else {'BV': bv}
+        k.configs = [triton.Config(dict(kw), num_warps=warps, num_stages=stages)]
+        with contextlib.suppress(Exception):
+            k.cache.clear()
+
+
+def _run_forced(gla, bv, warps, dv, B=2, H=2, L=128, K=16, nc=16, seed=0, dt=torch.float32):
+    """Forced-config forward+backward; returns (out, [grads]) as fp64."""
+    _force_bv(bv, warps)
+    g = torch.Generator(device=device).manual_seed(seed)
+
+    def rf(*s):
+        return torch.randn(*s, generator=g, device=device, dtype=torch.float64)
+    q = torch.nn.functional.elu(rf(B, L, H, K)) + 1.0
+    k = torch.nn.functional.elu(rf(B, L, H, K)) + 1.0
+    v = rf(B, L, H, dv)
+    r = torch.softmax(rf(B, L, H, nc), -1)
+    w = torch.softmax(rf(B, L, H, nc), -1)
+    ld = torch.log(torch.sigmoid(rf(B, L, H, nc))).clamp(min=-2.5)
+    coef = rf(B, L, H, dv)
+    nin = [q, k, v, r, w, ld] if gla else [q, k, v, r, w]
+    kin = [_fold(x.to(dt)).clone().requires_grad_() for x in nin]
+    out = (rola_gla_triton(*kin) if gla else rola_rla_triton(*kin))
+    gk = torch.autograd.grad((out.float() * _fold(coef.to(dt)).float()).sum(), kin)
+    return out.double(), [x.double() for x in gk]
+
+
+@pytest.mark.parametrize('gla', [False, True])
+def test_intra_branch_invariance(gla):
+    """dv=64: ND_V=4 (BV=16) vs ND_V=2 (BV=32) — same math, different value-block grouping (fp32
+    accumulation) → fwd AND every grad must agree to ~fp32 (1e-3, far under any tolerance). Validates
+    that every compiled tiling branch computes the same math (the autotuner picks just one per shape).
+    Runs at BT=16 fp32 so the value-tiled configs fit a small card."""
+    if device != 'cuda':
+        pytest.skip('RoLA Triton kernels require CUDA')
+    saved = (C._CHUNK, C._CHUNK_FWD)
+    saved_cfgs = {k: k.configs for k in _VALUE_TILED}
+    C._CHUNK = 16
+    C._CHUNK_FWD = 16
+    try:
+        dv = 64
+        o_a, g_a = _run_forced(gla, 16, 2, dv)   # ND_V=4
+        o_b, g_b = _run_forced(gla, 32, 2, dv)   # ND_V=2
+
+        def rel(a, b):
+            return ((a - b).norm() / (b.norm() + 1e-12)).item()
+        fwd = rel(o_a, o_b)
+        bwd = max(rel(a, b) for a, b in zip(g_a, g_b))
+        assert max(fwd, bwd) < 1e-3, f'forward-eq {fwd:.1e} backward-eq {bwd:.1e}'
+    finally:
+        C._CHUNK, C._CHUNK_FWD = saved
+        for k, cfg in saved_cfgs.items():     # restore autotune configs (the test pinned them)
+            k.configs = cfg
+            with contextlib.suppress(Exception):
+                k.cache.clear()
+
+
+# =============================================================================
+# DEN-FWD config sweep: FORCE every feature-tile (BD) config of the two den-forward kernels and
+# assert each matches the fp64 oracle — exercises the small-SMEM fallback tiles the autotuner never
+# picks on the dev card. (was tests/test_den_fwd_tile_sweep.py — CRITICAL, kept in full.)
+# =============================================================================
+_CHUNK = C._CHUNK
+
+
+def _fold3(t):
+    B, L, H = t.shape[:3]
+    return t.permute(0, 2, 1, 3).reshape(B * H, L, t.shape[-1])
+
+
+@contextlib.contextmanager
+def _force_config(kernel, cfg):
+    """Pin a triton.autotune kernel to a single config (len(configs)==1 => the Autotuner skips
+    pruning/benchmarking and uses configs[0] verbatim). Also clears+restores the autotune cache."""
+    saved_configs = kernel.configs
+    saved_cache = dict(kernel.cache)
+    kernel.configs = [cfg]
+    kernel.cache.clear()
+    try:
+        yield
+    finally:
+        kernel.configs = saved_configs
+        kernel.cache.clear()
+        kernel.cache.update(saved_cache)
+
+
+def _bd_configs(kernel):
+    """Distinct configs keyed by BD (the feature-tile knob)."""
+    by_bd = {}
+    for cfg in kernel.configs:
+        by_bd.setdefault(cfg.kwargs['BD'], cfg)
+    return by_bd
+
+
+@pytest.mark.parametrize('nc', [8, 24])
+@pytest.mark.parametrize('dqk', [16, 32, 64, 128])
+def test_den_fwd_tile_sweep(dqk, nc):
+    """Force EVERY (intra_BD × inter_BD) config of the den-forward kernels and assert RLA-kappa AND
+    GLA-kappa match the fp64 oracle. EVERY config (incl. the tiny tiles the autotuner never selects)
+    must match fp64 — that proves the small-SMEM fallback tiles are correct. TOL 2e-3."""
+    if device != 'cuda':
+        pytest.skip('RoLA Triton kernels require CUDA')
+    tol = 2e-3
+    torch.manual_seed(0xC0FFEE + dqk * 131 + nc)
+    B, H, L = 1, 2, 3 * _CHUNK + 5       # span >2 chunks + a ragged tail (exercises masking)
+    q = torch.randn(B, L, H, dqk, device=device, dtype=torch.float32) * 0.3
+    k = torch.randn(B, L, H, dqk, device=device, dtype=torch.float32) * 0.3
+    w = torch.rand(B, L, H, nc, device=device, dtype=torch.float32)
+    ld = -torch.rand(B, L, H, nc, device=device, dtype=torch.float32) * 0.1   # small negative log-decay
+    qf, kf, wf, ldf = _fold3(q), _fold3(k), _fold3(w), _fold3(ld)
+
+    ref_rla = _fold3(naive_rola_perstate_den(q.double(), k.double(), w.double(), chunk=_CHUNK))
+    ref_gla = _fold3(naive_rola_gla_perstate_den(q.double(), k.double(), w.double(), ld.double(), chunk=_CHUNK))
+
+    intra_cfgs = _bd_configs(C._den_fwd_intra)
+    inter_cfgs = _bd_configs(C._den_fwd_inter)
+
+    max_err = 0.0
+    n = 0
+    for (_bd_i, ci), (_bd_j, cj) in itertools.product(intra_cfgs.items(), inter_cfgs.items()):
+        with _force_config(C._den_fwd_intra, ci), _force_config(C._den_fwd_inter, cj):
+            d_rla = rola_perstate_den_triton(qf, kf, wf, chunk=_CHUNK)
+            d_gla = rola_perstate_den_gla_triton(qf, kf, wf, ldf, chunk=_CHUNK)
+        for got, ref in ((d_rla, ref_rla), (d_gla, ref_gla)):
+            # Global (Frobenius) relative error — robust to den elements crossing zero.
+            err = ((got.double() - ref).norm() / (ref.norm() + 1e-12)).item()
+            max_err = max(max_err, err)
+            n += 1
+    assert n > 0
+    assert max_err < tol, f'{n} configs swept, max rel err {max_err:.2e} (tol {tol:.0e})'
+
+
+# =============================================================================
+# RECURRENT (decode) op: fused_recurrent_rola + the chunked-prefill -> recurrent-decode handoff.
+# The op's READOUT is already exercised as the recurrent leg above (== chunk == naive); these cells add
+# the STATE: chunk_rola(output_final_state) == fused_recurrent_rola state, and the carried-state
+# equivalence (split a sequence + seed initial_state == process the whole).
+# =============================================================================
+def _kap(q, norm):
+    return (torch.full((q.shape[0], q.shape[1], _H, 1), KAPPA, device=q.device, dtype=q.dtype)
+            if norm == 'kappa' else None)
+
+
+@pytest.mark.parametrize('norm', ['global', 'kappa', 'per_state'])
+@pytest.mark.parametrize('gla', [False, True])
+def test_recurrent_handoff(gla, norm):
+    """fused_recurrent_rola readout == chunk_rola readout, and chunk_rola(output_final_state) emits the
+    SAME state fused_recurrent_rola does -> a chunked prefill hands off bit-exactly to recurrent decode."""
+    if device != 'cuda':
+        pytest.skip('RoLA Triton kernels require CUDA')
+    nc, dv, L, tol = 8, 16, 64, 5e-3
+    for seed in range(4):
+        q, k, v, r, w, ld = _mk_inter(L, nc, dv, gla, seed)
+        kw = dict(r=r, w=w, g=ld, norm=norm, kappa=_kap(q, norm), scale=1.0, output_final_state=True)
+        o_chunk, s_chunk = chunk_rola(q, k, v, **kw)
+        o_rec, s_rec = fused_recurrent_rola(q, k, v, **kw)
+        assert_close('recurrent==chunk readout', o_chunk, o_rec, tol)
+        assert_close('prefill->decode state handoff', s_chunk, s_rec, tol)
+
+
+@pytest.mark.parametrize('norm', ['global', 'kappa', 'per_state'])
+@pytest.mark.parametrize('gla', [False, True])
+def test_recurrent_state_carry(gla, norm):
+    """fused_recurrent_rola: split a sequence at t, carry the state, == process the whole (decode)."""
+    if device != 'cuda':
+        pytest.skip('RoLA Triton kernels require CUDA')
+    nc, dv, L, t, tol = 8, 16, 64, 40, 5e-3
+
+    def sl(x, a, b):
+        return x[:, a:b] if x is not None else None
+    for seed in range(4):
+        q, k, v, r, w, ld = _mk_inter(L, nc, dv, gla, seed)
+        kap = _kap(q, norm)
+        common = dict(norm=norm, scale=1.0)
+        o_full, s_full = fused_recurrent_rola(q, k, v, r=r, w=w, g=ld, kappa=kap, **common,
+                                              output_final_state=True)
+        o1, s1 = fused_recurrent_rola(sl(q, 0, t), sl(k, 0, t), sl(v, 0, t), r=sl(r, 0, t), w=sl(w, 0, t),
+                                      g=sl(ld, 0, t), kappa=sl(kap, 0, t), **common, output_final_state=True)
+        o2, s2 = fused_recurrent_rola(sl(q, t, L), sl(k, t, L), sl(v, t, L), r=sl(r, t, L), w=sl(w, t, L),
+                                      g=sl(ld, t, L), kappa=sl(kap, t, L), **common,
+                                      initial_state=s1, output_final_state=True)
+        assert_close('split==whole readout', o_full, torch.cat([o1, o2], 1), tol)
+        assert_close('split==whole state', s_full, s2, tol)
