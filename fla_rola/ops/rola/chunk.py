@@ -1109,14 +1109,20 @@ def _bwd_split_gla(q, k, v, wg, rg, ld, g, chunk=None, BG=16):
 _DEN_KEY = ['dqk', 'nc']
 
 
+@triton.autotune(configs=_BWD_CFGS, key=_DEN_KEY,
+                 prune_configs_by={'early_config_prune': _prune_bwd_bd}, **autotune_cache_kwargs)
 @triton.jit
-def _den_fwd_intra(q_ptr, k_ptr, wg_ptr, ld_ptr, d_ptr, L, dqk, nc,
+def _den_fwd_intra(q_ptr, k_ptr, wg_ptr, ld_ptr, d_ptr, L, dqk: tl.constexpr, nc,
                    sq_b, sq_l, sq_d, sg_b, sg_l, sg_c, sd_b, sd_l, sd_c,
-                   USE_G: tl.constexpr, BT: tl.constexpr, BK: tl.constexpr, BG: tl.constexpr, ND: tl.constexpr):
+                   USE_G: tl.constexpr, BT: tl.constexpr, BD: tl.constexpr, BG: tl.constexpr):
     """Intra-chunk den for one (batch, state-block, chunk). The [BT,BT] content gram is built by
-    BK-blocking the feature dim (SRAM bounded by BK, not dqk). atomic_adds dch_intra into d (a
-    torch.zeros target — the inter kernel adds the cross-chunk part). USE_G pre-scales by e^a (row-
-    wise, distributes over the intra+inter sum)."""
+    BD-blocking the feature dim (SRAM bounded by BD, not dqk). Writes its OWN d_intra buffer with
+    plain tl.store (one program per chunk → disjoint rows, race-free / idempotent under autotuning);
+    the inter kernel writes the cross-chunk part into d_inter and the host sums d = d_intra + d_inter.
+    BD is an autotune knob (the small-SMEM feature-tile fallback); dqk: tl.constexpr so ND is
+    compile-time and the loop unrolls (ND==1 → straight-line). USE_G pre-scales by e^a (row-wise,
+    distributes over the intra+inter sum)."""
+    ND = tl.cdiv(dqk, BD)
     b = tl.program_id(0); sb = tl.program_id(1); t = tl.program_id(2)
     offs_t = tl.arange(0, BT)
     offs_c = sb * BG + tl.arange(0, BG); cmask = offs_c < nc
@@ -1125,7 +1131,7 @@ def _den_fwd_intra(q_ptr, k_ptr, wg_ptr, ld_ptr, d_ptr, L, dqk, nc,
     caus = (offs_t[:, None] >= offs_t[None, :]) & rmask[:, None] & rmask[None, :]
     G = tl.zeros([BT, BT], dtype=tl.float32)
     for d0 in range(ND):
-        offs_d = d0 * BK + tl.arange(0, BK); dmask = offs_d < dqk
+        offs_d = d0 * BD + tl.arange(0, BD); dmask = offs_d < dqk
         qc = tl.load(q_ptr + b*sq_b + rows[:, None]*sq_l + offs_d[None, :]*sq_d,
                      mask=rmask[:, None] & dmask[None, :], other=0.0)
         kc = tl.load(k_ptr + b*sq_b + rows[:, None]*sq_l + offs_d[None, :]*sq_d,
@@ -1139,24 +1145,28 @@ def _den_fwd_intra(q_ptr, k_ptr, wg_ptr, ld_ptr, d_ptr, L, dqk, nc,
         dch = tl.exp(a) * tl.dot(G * caus, wt)
     else:
         dch = tl.dot((G * caus).to(wgc.dtype), wgc)
-    tl.atomic_add(d_ptr + b*sd_b + rows[:, None]*sd_l + offs_c[None, :]*sd_c, dch, mask=rmask[:, None] & cmask[None, :])
+    tl.store(d_ptr + b*sd_b + rows[:, None]*sd_l + offs_c[None, :]*sd_c, dch, mask=rmask[:, None] & cmask[None, :])
 
 
+@triton.autotune(configs=_BWD_CFGS, key=_DEN_KEY, reset_to_zero=['d_ptr'],
+                 prune_configs_by={'early_config_prune': _prune_bwd_bd}, **autotune_cache_kwargs)
 @triton.jit
 def _den_fwd_inter(q_ptr, k_ptr, wg_ptr, ld_ptr, d_ptr, Zb_ptr, L, dqk, nc,
                    sq_b, sq_l, sq_d, sg_b, sg_l, sg_c, sd_b, sd_l, sd_c,
                    szb_b, szb_n, szb_t, szb_d, szb_c,
-                   USE_G: tl.constexpr, BT: tl.constexpr, BK: tl.constexpr, BG: tl.constexpr, NCH: tl.constexpr):
+                   USE_G: tl.constexpr, BT: tl.constexpr, BD: tl.constexpr, BG: tl.constexpr, NCH: tl.constexpr):
     """Inter-chunk (state) den for one (batch, state-block, FEATURE-block d0). Carries this block's
-    slice Zd[BK,BG] of the den state across chunks (SRAM bounded by BK) and writes the PRE-update Zb
+    slice Zd[BD,BG] of the den state across chunks (SRAM bounded by BD) and writes the PRE-update Zb
     snapshot the backward needs. inter uses the state BEFORE this chunk's update (causal); partials
-    over feature-blocks sum via atomic_add. USE_G pre-scales by e^a; the carry decays by e^{Lam}."""
+    over feature-blocks sum via atomic_add into its OWN d_inter buffer (reset_to_zero — autotunable;
+    the host sums d = d_intra + d_inter). BD is an autotune knob; the grid's feature-block count is a
+    launch lambda over meta['BD']. USE_G pre-scales by e^a; the carry decays by e^{Lam}."""
     b = tl.program_id(0); sb = tl.program_id(1); d0 = tl.program_id(2)
     offs_t = tl.arange(0, BT)
-    offs_d = d0 * BK + tl.arange(0, BK); dmask = offs_d < dqk
+    offs_d = d0 * BD + tl.arange(0, BD); dmask = offs_d < dqk
     offs_c = sb * BG + tl.arange(0, BG); cmask = offs_c < nc
     offs_g = tl.arange(0, BG)
-    Zd = tl.zeros([BK, BG], dtype=tl.float32)
+    Zd = tl.zeros([BD, BG], dtype=tl.float32)
     for t in range(NCH):
         rows = t * BT + offs_t; rmask = rows < L
         qc = tl.load(q_ptr + b*sq_b + rows[:, None]*sq_l + offs_d[None, :]*sq_d,
@@ -1272,21 +1282,25 @@ class _DenFn(torch.autograd.Function):
         B, L, dqk = q.shape
         nc = wg.shape[-1]
         BD = max(16, triton.next_power_of_2(dqk))
-        BK = min(64, BD)                       # exact-width blocks for dqk<=64; D-tiled beyond
-        ND = triton.cdiv(dqk, BK)
         NB = triton.cdiv(nc, BG)
         NCH = triton.cdiv(L, chunk)
         q, k, wg = q.contiguous(), k.contiguous(), wg.contiguous()
-        d = torch.zeros(B, L, nc, device=q.device, dtype=torch.float32)   # atomic_add target
+        # Disjoint dual-buffer + host-sum (mirrors the BC-split fwd/bwd): intra writes its own buffer
+        # with plain store, inter atomic-accumulates over feature-blocks into its own (reset_to_zero).
+        # Both feature-tile-autotuned (BD knob → small-SMEM fallback); summed on the host.
+        d_intra = torch.zeros(B, L, nc, device=q.device, dtype=torch.float32)
+        d_inter = torch.zeros_like(d_intra)
         Zb = torch.empty(B, NB, NCH, BD, BG, device=q.device, dtype=torch.float32)
         sq = (q.stride(0), q.stride(1), q.stride(2))
         sg = (wg.stride(0), wg.stride(1), wg.stride(2))
-        sd = (d.stride(0), d.stride(1), d.stride(2))
+        sd = (d_intra.stride(0), d_intra.stride(1), d_intra.stride(2))
         sZ = (Zb.stride(0), Zb.stride(1), Zb.stride(2), Zb.stride(3), Zb.stride(4))
-        _den_fwd_intra[(B, NB, NCH)](q, k, wg, wg, d, L, dqk, nc, *sq, *sg, *sd,
-                                     USE_G=False, BT=chunk, BK=BK, BG=BG, ND=ND)
-        _den_fwd_inter[(B, NB, ND)](q, k, wg, wg, d, Zb, L, dqk, nc, *sq, *sg, *sd, *sZ,
-                                    USE_G=False, BT=chunk, BK=BK, BG=BG, NCH=NCH)
+        _den_fwd_intra[(B, NB, NCH)](q, k, wg, wg, d_intra, L, dqk, nc, *sq, *sg, *sd,
+                                     USE_G=False, BT=chunk, BG=BG)
+        grid_inter = lambda meta: (B, NB, triton.cdiv(dqk, meta['BD']))
+        _den_fwd_inter[grid_inter](q, k, wg, wg, d_inter, Zb, L, dqk, nc, *sq, *sg, *sd, *sZ,
+                                   USE_G=False, BT=chunk, BG=BG, NCH=NCH)
+        d = d_intra + d_inter
         ctx.save_for_backward(q, k, wg, Zb)
         ctx.meta = (chunk, BG, BD, NB, NCH)
         return d
@@ -1449,22 +1463,26 @@ class _DenGLAFn(torch.autograd.Function):
         B, L, dqk = q.shape
         nc = wg.shape[-1]
         BD = max(16, triton.next_power_of_2(dqk))
-        BK = min(64, BD)                       # exact-width blocks for dqk<=64; D-tiled beyond
-        ND = triton.cdiv(dqk, BK)
         NB = triton.cdiv(nc, BG)
         NCH = triton.cdiv(L, chunk)
         ld = ld.clamp(min=_GLA_FLOOR)
         q, k, wg, ld = q.contiguous(), k.contiguous(), wg.contiguous(), ld.contiguous()
-        d = torch.zeros(B, L, nc, device=q.device, dtype=torch.float32)   # atomic_add target
+        # Disjoint dual-buffer + host-sum (mirrors the BC-split fwd/bwd): intra writes its own buffer
+        # with plain store, inter atomic-accumulates over feature-blocks into its own (reset_to_zero).
+        # Both feature-tile-autotuned (BD knob → small-SMEM fallback); summed on the host.
+        d_intra = torch.zeros(B, L, nc, device=q.device, dtype=torch.float32)
+        d_inter = torch.zeros_like(d_intra)
         Zb = torch.empty(B, NB, NCH, BD, BG, device=q.device, dtype=torch.float32)
         sq = (q.stride(0), q.stride(1), q.stride(2))
         sg = (wg.stride(0), wg.stride(1), wg.stride(2))
-        sd = (d.stride(0), d.stride(1), d.stride(2))
+        sd = (d_intra.stride(0), d_intra.stride(1), d_intra.stride(2))
         sZ = (Zb.stride(0), Zb.stride(1), Zb.stride(2), Zb.stride(3), Zb.stride(4))
-        _den_fwd_intra[(B, NB, NCH)](q, k, wg, ld, d, L, dqk, nc, *sq, *sg, *sd,
-                                     USE_G=True, BT=chunk, BK=BK, BG=BG, ND=ND)
-        _den_fwd_inter[(B, NB, ND)](q, k, wg, ld, d, Zb, L, dqk, nc, *sq, *sg, *sd, *sZ,
-                                    USE_G=True, BT=chunk, BK=BK, BG=BG, NCH=NCH)
+        _den_fwd_intra[(B, NB, NCH)](q, k, wg, ld, d_intra, L, dqk, nc, *sq, *sg, *sd,
+                                     USE_G=True, BT=chunk, BG=BG)
+        grid_inter = lambda meta: (B, NB, triton.cdiv(dqk, meta['BD']))
+        _den_fwd_inter[grid_inter](q, k, wg, ld, d_inter, Zb, L, dqk, nc, *sq, *sg, *sd, *sZ,
+                                   USE_G=True, BT=chunk, BG=BG, NCH=NCH)
+        d = d_intra + d_inter
         ctx.save_for_backward(q, k, wg, ld, Zb)
         ctx.meta = (chunk, BG, BD, NB, NCH)
         return d
