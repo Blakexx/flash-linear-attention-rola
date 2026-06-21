@@ -1705,7 +1705,8 @@ def _rola_readout(qf, kf, vf, rf, wf, gf, chunk_size):
 
 @torch.compiler.disable
 @input_guard
-def chunk_rola(q, k, v, r, w, g=None, norm='kappa', kappa=None, scale=None, eps=1e-5):
+def chunk_rola(q, k, v, r, w, g=None, norm='kappa', kappa=None, scale=None, eps=1e-5,
+               initial_state=None, output_final_state=False):
     """Routed RoLA (shared-gram) readout with built-in normalization.
 
     Args:
@@ -1766,4 +1767,21 @@ def chunk_rola(q, k, v, r, w, g=None, norm='kappa', kappa=None, scale=None, eps=
     # norm == 'global': r̃ = r (unchanged)
     num = _rola_readout(qf, kf, vf, rf, wf, gf, chunk_size)
     den = (rf * d).sum(-1, keepdim=True)
-    return unfold(num / (den + eps)).to(v.dtype)
+    out = unfold(num / (den + eps)).to(v.dtype)
+    if not output_final_state:
+        return out
+    return out, _final_state(kf, vf, wf, gf, B, H)
+
+
+def _final_state(kf, vf, wf, gf, B, H):
+    """Final recurrent state of the chunked pass: `stateᶜ = Σ_t [e^{G_T-G_t}·]wᵗᶜ·kf_t⊗[vf_t;1]`,
+    shaped `[N, H*nc, K, V+1]` (the `+1` ones-column is the per-state denominator) — byte-compatible
+    with `fused_recurrent_rola`'s state so a chunked prefill hands off to recurrent decode. O(L), no
+    kernel; the backward through a carried state is not provided (decode is inference)."""
+    v1 = torch.cat([vf, torch.ones_like(vf[..., :1])], -1).float()      # [BH,T,V+1]
+    wgt = wf.float()                                                    # [BH,T,nc]
+    if gf is not None:                                                  # GLA: token t decays by Σ_{t'>t} g
+        G = gf.float().cumsum(1)
+        wgt = wgt * (G[:, -1:, :] - G).exp()
+    state = torch.einsum('btc,btd,bte->bcde', wgt, kf.float(), v1)      # [BH, nc, K, V+1]
+    return state.view(B, H * state.shape[1], state.shape[2], state.shape[3])

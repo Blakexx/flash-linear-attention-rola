@@ -35,8 +35,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 
+from fla_rola.layers.utils import get_layer_cache, update_layer_cache
 from fla_rola.modules import RMSNorm, ShortConvolution
-from fla_rola.ops.rola import chunk_rola
+from fla_rola.ops.rola import chunk_rola, fused_recurrent_rola
 
 if TYPE_CHECKING:
     from transformers.processing_utils import Unpack
@@ -109,6 +110,7 @@ class RoLA(nn.Module):
         self.router_zloss_coef = router_zloss_coef
         self._router_aux = None                       # stashed per forward; read by get_auxiliary_loss
         self.use_short_conv = use_short_conv
+        self.mode = 'chunk'   # training/prefill path; short-seq decode auto-switches to fused_recurrent
         self.conv_size = conv_size
         self.layer_idx = layer_idx
 
@@ -209,12 +211,21 @@ class RoLA(nn.Module):
         x = hidden_states
         B, L, _ = x.shape
         H = self.num_heads
+        # Short sequences (decode) take the recurrent path; training/prefill stay chunked.
+        mode = 'fused_recurrent' if L <= 64 else self.mode
+        last_state = get_layer_cache(self, past_key_values)
+        cu_seqlens = kwargs.get('cu_seqlens')
 
         if self.use_short_conv:
-            cu_seqlens = kwargs.get('cu_seqlens')
-            q, _ = self.q_conv1d(self.q_proj(x), cache=None, output_final_state=False, cu_seqlens=cu_seqlens)
-            k, _ = self.k_conv1d(self.k_proj(x), cache=None, output_final_state=False, cu_seqlens=cu_seqlens)
-            v, _ = self.v_conv1d(self.v_proj(x), cache=None, output_final_state=False, cu_seqlens=cu_seqlens)
+            conv_state_q = conv_state_k = conv_state_v = None
+            if last_state is not None:
+                conv_state_q, conv_state_k, conv_state_v = last_state['conv_state']
+            q, conv_state_q = self.q_conv1d(self.q_proj(x), cache=conv_state_q,
+                                            output_final_state=use_cache, cu_seqlens=cu_seqlens)
+            k, conv_state_k = self.k_conv1d(self.k_proj(x), cache=conv_state_k,
+                                            output_final_state=use_cache, cu_seqlens=cu_seqlens)
+            v, conv_state_v = self.v_conv1d(self.v_proj(x), cache=conv_state_v,
+                                            output_final_state=use_cache, cu_seqlens=cu_seqlens)
         else:
             q, k, v = self.q_proj(x), self.k_proj(x), self.v_proj(x)
 
@@ -231,12 +242,29 @@ class RoLA(nn.Module):
         kap = (torch.sigmoid(self.w_kappa(x)).view(B, L, H, 1)
                if self.state_norm == 'kappa' else None)
 
-        # The `chunk_rola` op owns dtype/autocast: its Triton autograd Functions carry
-        # @input_guard + @autocast_custom_fwd/bwd (the FLA idiom), so under autocast they cast their
-        # own inputs to the compute dtype (unifying the tl.dot operands) with fp32 accumulation —
-        # the layer no longer hand-rolls the cast.
-        out = chunk_rola(qf, kf, v, r=read_gates, w=write_gates, g=g,
-                         norm=self.state_norm, kappa=kap, scale=1.0).to(v.dtype)
+        # The ops own dtype/autocast (their Triton autograd Functions carry @input_guard +
+        # @autocast_custom_fwd/bwd), so the layer no longer hand-rolls the cast. `output_final_state`
+        # emits the recurrent state for the KV-cache; decode seeds it back via `initial_state`.
+        recurrent_state = last_state['recurrent_state'] if last_state is not None else None
+        common = dict(r=read_gates, w=write_gates, g=g, norm=self.state_norm, kappa=kap, scale=1.0)
+        if mode == 'fused_recurrent':
+            out, recurrent_state = fused_recurrent_rola(
+                qf, kf, v, **common, initial_state=recurrent_state,
+                output_final_state=use_cache, cu_seqlens=cu_seqlens)
+        elif mode == 'chunk':
+            if recurrent_state is not None:
+                raise NotImplementedError(
+                    "chunk_rola has no carried initial_state yet; continuation decode uses the "
+                    "fused_recurrent path (auto-selected for L<=64).")
+            res = chunk_rola(qf, kf, v, **common, output_final_state=use_cache)
+            out, recurrent_state = res if use_cache else (res, None)
+        else:
+            raise NotImplementedError(f"Not supported mode `{mode}`.")
+
+        update_layer_cache(
+            self, past_key_values, recurrent_state=recurrent_state,
+            conv_state=(conv_state_q, conv_state_k, conv_state_v) if self.use_short_conv else None,
+            offset=L)
 
         o = self.o_proj(out.reshape(B, L, H * self.head_v_dim))
         return o, None, past_key_values
