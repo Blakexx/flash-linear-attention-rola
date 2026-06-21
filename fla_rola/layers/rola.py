@@ -91,6 +91,7 @@ class RoLA(nn.Module):
         tie_router_init: bool = False,
         router_bias: bool = False,
         qk_norm: bool = False,
+        router_zloss_coef: float = 0.0,
         use_short_conv: bool = False,
         conv_size: int = 4,
         conv_bias: bool = False,
@@ -115,6 +116,8 @@ class RoLA(nn.Module):
         self.state_norm = state_norm
         self.tie_routers = tie_routers
         self.qk_norm = qk_norm
+        self.router_zloss_coef = router_zloss_coef
+        self._router_aux = None                       # stashed per forward; read by get_auxiliary_loss
         self.use_short_conv = use_short_conv
         self.conv_size = conv_size
         self.layer_idx = layer_idx
@@ -175,10 +178,20 @@ class RoLA(nn.Module):
     def _route(self, x):
         B, L = x.shape[0], x.shape[1]
         H, C = self.num_heads, self.states_per_head
-        write_gates = F.softmax(self.write_router(x).view(B, L, H, C), dim=-1)
-        rr = self.read_router if self.read_router is not None else self.write_router  # sym reuses write
-        read_gates = F.softmax(rr(x).view(B, L, H, C), dim=-1)
+        wl = self.write_router(x).view(B, L, H, C)               # write logits (pre-softmax)
+        write_gates = F.softmax(wl, dim=-1)
+        rl = self.read_router(x).view(B, L, H, C) if self.read_router is not None else wl  # sym reuses write
+        read_gates = F.softmax(rl, dim=-1)
+        if self.router_zloss_coef > 0.0:
+            # ST-MoE router z-loss: penalize the log-partition magnitude of the routing logits.
+            zl = lambda lg: torch.logsumexp(lg.float(), dim=-1).square().mean()   # fp32 (bf16 loses the tail)
+            self._router_aux = self.router_zloss_coef * (zl(wl) + (zl(rl) if self.read_router is not None else 0.0))
         return write_gates, read_gates
+
+    def get_auxiliary_loss(self):
+        """Router z-loss from the last forward (zoology's trainer auto-sums this across modules; the
+        HF RoLAForCausalLM aggregates it explicitly). 0.0 when router_zloss_coef == 0."""
+        return self._router_aux if self._router_aux is not None else 0.0
 
     def _log_decay(self, x, write_gates):
         B, L = x.shape[0], x.shape[1]
