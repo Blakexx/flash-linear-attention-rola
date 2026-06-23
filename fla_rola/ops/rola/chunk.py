@@ -191,7 +191,9 @@ def _rola_fwd_inter(q_ptr, k_ptr, v_ptr, wg_ptr, rg_ptr, outa_ptr,
             P = tl.dot(qc, Sd.to(qc.dtype))
             P3 = tl.reshape(P, [BT, BG, BV])
             o_inter = tl.sum(P3 * rgc[:, :, None], axis=1)
-            tl.atomic_add(outa_ptr + b*soa_b + sb*soa_n + rows[:, None]*soa_l + offs_v[None, :]*soa_v,
+            # NB-fused: state-blocks atomic-accumulate the routed sum into shared [B,L,dv] (no per-sb
+            # grid). Frontier-safe: each program still carries only THIS block's state Sd in registers.
+            tl.atomic_add(outa_ptr + b*soa_b + rows[:, None]*soa_l + offs_v[None, :]*soa_v,
                           o_inter, mask=rmask[:, None] & vmask[None, :])
             kc = tl.load(k_ptr + b*sq_b + rows[:, None]*sq_l + offs_d[None, :]*sq_d,
                          mask=rmask[:, None] & dmask[None, :], other=0.0)
@@ -219,19 +221,20 @@ def _fwd_tiled(q, k, v, wg, rg, chunk, BG, BK=64):
     # Separate intra/inter output buffers (summed after) so each kernel has a non-shared output and is
     # independently autotunable: intra writes disjoint rows (store), inter atomic-accumulates over
     # feature-blocks (reset_to_zero). FLA idiom — the autotuner prunes warps/stages per device.
-    # Intra collapses nc in-kernel → [B,L,BV] (no per-sb grid). Inter still per-sb [B,NB,L,BV]
-    # (cross-chunk read routing can't collapse), summed after. Different shapes → separate strides.
+    # Both collapse the per-sb HBM grid → [B,L,BV]: intra collapses nc in-kernel; inter atomic-
+    # accumulates the routed sum over state-blocks (the read routing can't collapse, but the SUM can
+    # be done via atomic into the shared buffer — each program still carries only its own state).
     out_intra = torch.zeros(B, L, BV, device=q.device, dtype=torch.float32)
-    out_inter = torch.zeros(B, NB, L, BV, device=q.device, dtype=torch.float32)
+    out_inter = torch.zeros(B, L, BV, device=q.device, dtype=torch.float32)
     so_a = (out_intra.stride(0), out_intra.stride(1), out_intra.stride(2))
-    so_e = (out_inter.stride(0), out_inter.stride(1), out_inter.stride(2), out_inter.stride(3))
+    so_e = (out_inter.stride(0), 0, out_inter.stride(1), out_inter.stride(2))
     base = (q.stride(0), q.stride(1), q.stride(2), v.stride(0), v.stride(1), v.stride(2),
             wg.stride(0), wg.stride(1), wg.stride(2))
     _rola_fwd_intra[(B, NCH)](q, k, v, wg, rg, out_intra, L, dqk, dv, nc, *base, *so_a,
                               BT=chunk, BK=BK, BV=BV, BG=BG, ND=ND, NB=NB)
     _rola_fwd_inter[(B, NB, ND)](q, k, v, wg, rg, out_inter, L, dqk, dv, nc, *base, *so_e,
                                  BT=chunk, BK=BK, BVF=BV, BG=BG, NCH=NCH)
-    return out_intra[..., :dv] + out_inter[..., :dv].sum(1)
+    return out_intra[..., :dv] + out_inter[..., :dv]
 
 
 @torch.library.custom_op("rola::readout_rla", mutates_args=())
