@@ -308,8 +308,26 @@ _GLA_FLOOR = -2.5   # per-token log-decay floor (retention ≥ 8.2%/tok); fp32-s
 # KSNAP chunks (slot = chunk//KSNAP), 1/KSNAP the dominant backward HBM. The grad kernels read the
 # nearest coarse anchor and recompute the ≤KSNAP-1 intervening chunks (a [BD,BG*BV] sub-scan — the
 # SAME working set as the snapshot path, so it fits SMEM at ANY dqk; full register recompute OOM'd
-# because it carried the [dqk_pad,*] feature width). Tunable via ROLA_SNAP_K (default 4 → −75% snaps).
-_SNAP_K = int(os.environ['ROLA_SNAP_K']) if os.environ.get('ROLA_SNAP_K') else 4
+# because it carried the [dqk_pad,*] feature width). Force-overridable via ROLA_SNAP_K; otherwise
+# _resolve_snap_k picks the smallest K (least recompute) whose snapshot peak fits ROLA_SNAP_BUDGET_MB.
+_SNAP_BUDGET_MB = 256   # default snapshot HBM target (Sb+dSa resident); overridable via ROLA_SNAP_BUDGET_MB
+
+
+def _resolve_snap_k(B, NB, NCH, BD, BV, BG):
+    """Snapshot-granularity stride K (#1). Priority: ROLA_SNAP_K env (force) > auto-budget. The resident
+    snapshot buffers are Sb+dSa = 2·B·NB·ceil(NCH/K)·BD·BG·BV·4 bytes; raising K shrinks them as 1/K
+    while paying K-1 chunks of recompute. Auto picks the SMALLEST K (least recompute) whose snapshot
+    peak fits under ROLA_SNAP_BUDGET_MB (default 256): small/short shapes resolve to K=1 (no
+    granularity, no recompute cost), only long-L/large-nc shapes — the ones that OOM — climb K. Capped
+    at NCH (K≥NCH is a single snapshot). Returns K in [1, NCH]."""
+    if os.environ.get('ROLA_SNAP_K'):
+        return max(1, min(int(os.environ['ROLA_SNAP_K']), NCH))
+    budget = int(os.environ.get('ROLA_SNAP_BUDGET_MB', str(_SNAP_BUDGET_MB))) * (1 << 20)
+    per_slot = max(1, 2 * B * NB * BD * BG * BV * 4)         # (Sb+dSa) fp32 bytes per snapshot SLOT
+    k = 1
+    while k < NCH and per_slot * triton.cdiv(NCH, k) > budget:
+        k += 1
+    return max(1, min(k, NCH))
 
 
 @triton.autotune(configs=_AT_CFGS, key=_AT_KEY, **autotune_cache_kwargs)
@@ -1339,7 +1357,7 @@ def _bwd_split_rla(q, k, v, wg, rg, g, chunk=None, BG=16, nb_tile=None):
     BV = max(16, triton.next_power_of_2(dv))
     NB = triton.cdiv(nc, BG)
     NCH = triton.cdiv(L, chunk)
-    KSNAP = max(1, min(_SNAP_K, NCH))
+    KSNAP = _resolve_snap_k(B, NB, NCH, BD, BV, BG)
     NSNAP = triton.cdiv(NCH, KSNAP)
     nb_tile = _resolve_nb_tile(nb_tile, B, NB, NSNAP, BD, BV, BG)
     BK_scan = min(64, BD)
@@ -1396,7 +1414,7 @@ def _bwd_split_gla(q, k, v, wg, rg, ld, g, chunk=None, BG=16, nb_tile=None):
     BV = max(16, triton.next_power_of_2(dv))
     NB = triton.cdiv(nc, BG)
     NCH = triton.cdiv(L, chunk)
-    KSNAP = max(1, min(_SNAP_K, NCH))
+    KSNAP = _resolve_snap_k(B, NB, NCH, BD, BV, BG)
     NSNAP = triton.cdiv(NCH, KSNAP)
     nb_tile = _resolve_nb_tile(nb_tile, B, NB, NSNAP, BD, BV, BG)
     BK_scan = min(64, BD)
