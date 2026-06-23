@@ -16,6 +16,7 @@
 # ones-column augmentation — the denominator is the caller's separate per-state pre-pass.
 
 import os
+import typing  # noqa: F401 (torch custom_op schema needs typing.List)
 
 import torch
 import torch.nn.functional as F
@@ -231,29 +232,49 @@ def _fwd_tiled(q, k, v, wg, rg, chunk, BG, BK=64):
     return (out_intra + out_inter)[..., :dv].sum(1)
 
 
-class _RoLARLAFn(torch.autograd.Function):
-    """RoLA-RLA (no decay) un-normalized routed readout O = (G∘R∘causal)@v, on folded [BH,L,*]
-    tensors. Numerator-only ([.,dv]); the global denominator is the caller's separate per-state
-    pre-pass."""
-    @staticmethod
-    @input_guard
-    @autocast_custom_fwd
-    def forward(ctx, q, k, v, wg, rg, chunk, BG):
-        Oa = _fwd_tiled(q, k, v, wg, rg, chunk=chunk, BG=BG)
-        ctx.save_for_backward(q, k, v, wg, rg)
-        ctx.BG = BG
-        return Oa.to(q.dtype)
+@torch.library.custom_op("rola::readout_rla", mutates_args=())
+def _readout_rla(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+                 wg: torch.Tensor, rg: torch.Tensor, chunk: int, BG: int) -> torch.Tensor:
+    """RoLA-RLA un-normalized routed readout as an opaque custom op (Triton kernels inside → no
+    Dynamo graph break; inductor fuses the surrounding glue)."""
+    with torch.autocast('cuda', enabled=False):
+        return _fwd_tiled(q, k, v, wg, rg, chunk=chunk, BG=BG).to(q.dtype)
 
-    @staticmethod
-    @input_guard
-    @autocast_custom_bwd
-    def backward(ctx, dO):
-        q, k, v, wg, rg = ctx.saved_tensors
-        g = dO
-        qf, kf, vf, wgf, rgf = q, k, v, wg, rg
-        dq, dk, dvv, dw, dr = _bwd_split_rla(qf, kf, vf, wgf, rgf, g, chunk=_CHUNK)
-        def cast(t): return t.to(q.dtype)
-        return cast(dq), cast(dk), cast(dvv), cast(dw), cast(dr), None, None
+
+@_readout_rla.register_fake
+def _readout_rla_fake(q, k, v, wg, rg, chunk, BG):
+    return q.new_empty((q.shape[0], q.shape[1], v.shape[-1]))
+
+
+def _readout_rla_setup(ctx, inputs, output):
+    q, k, v, wg, rg, chunk, BG = inputs
+    ctx.save_for_backward(q, k, v, wg, rg)
+
+
+@torch.library.custom_op("rola::readout_rla_bwd", mutates_args=())
+def _readout_rla_bwd(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+                     wg: torch.Tensor, rg: torch.Tensor, grad: torch.Tensor) -> typing.List[torch.Tensor]:  # noqa: UP006
+    """Opaque backward (Triton kernels inside) so inductor doesn't trace the kernel launches."""
+    with torch.autocast('cuda', enabled=False):
+        dq, dk, dvv, dw, dr = _bwd_split_rla(q, k, v, wg, rg, grad, chunk=_CHUNK)
+    return [dq, dk, dvv, dw, dr]
+
+
+@_readout_rla_bwd.register_fake
+def _readout_rla_bwd_fake(q, k, v, wg, rg, grad):
+    f = torch.float32
+    return [q.new_empty(q.shape, dtype=f), k.new_empty(k.shape, dtype=f),
+            v.new_empty(v.shape, dtype=f), wg.new_empty(wg.shape, dtype=f), rg.new_empty(rg.shape, dtype=f)]
+
+
+def _readout_rla_backward(ctx, grad):
+    q, k, v, wg, rg = ctx.saved_tensors
+    dq, dk, dvv, dw, dr = _readout_rla_bwd(q, k, v, wg, rg, grad)
+    def cast(t): return t.to(q.dtype)
+    return cast(dq), cast(dk), cast(dvv), cast(dw), cast(dr), None, None
+
+
+_readout_rla.register_autograd(_readout_rla_backward, setup_context=_readout_rla_setup)
 
 
 @input_guard
@@ -263,7 +284,7 @@ def rola_rla_triton(q, k, v, r, w, chunk=None, BG=16):
     [BH,L,V] at BV=next_pow2(V); the kappa/per_state caller reconstructs the global denominator as
     Σ_c rᶜ·dᶜ from the per-state den pre-pass."""
     chunk = _CHUNK_FWD if chunk is None else min(chunk, _CHUNK_FWD)
-    return _RoLARLAFn.apply(q, k, v, w, r, chunk, BG)
+    return _readout_rla(q, k, v, w, r, chunk, BG)
 
 
 # ============================================================================
@@ -1402,21 +1423,17 @@ def _den_grad(q_ptr, k_ptr, wg_ptr, gd_ptr, Zb_ptr, dZa_ptr, dq_ptr, dk_ptr, dw_
     tl.store(dw_ptr + b*sdw_b + rows[:, None]*sdw_l + offs_c[None, :]*sdw_c, dw, mask=rmask[:, None] & cmask[None, :])
 
 
-class _DenFn(torch.autograd.Function):
-    """Per-state denominator d[i,c] on folded [BH,L,*] tensors, Triton fwd + chunk-parallel bwd."""
-    @staticmethod
-    @input_guard
-    @autocast_custom_fwd
-    def forward(ctx, q, k, wg, chunk, BG):
+@torch.library.custom_op("rola::den", mutates_args=())
+def _den_op(q: torch.Tensor, k: torch.Tensor, wg: torch.Tensor,
+            chunk: int, BG: int) -> typing.List[torch.Tensor]:  # noqa: UP006
+    """Per-state denominator as an opaque custom op; returns [d, Zb] (Zb saved for backward)."""
+    with torch.autocast('cuda', enabled=False):
         B, L, dqk = q.shape
         nc = wg.shape[-1]
         BD = max(16, triton.next_power_of_2(dqk))
         NB = triton.cdiv(nc, BG)
         NCH = triton.cdiv(L, chunk)
         q, k, wg = q.contiguous(), k.contiguous(), wg.contiguous()
-        # Disjoint dual-buffer + host-sum (mirrors the BC-split fwd/bwd): intra writes its own buffer
-        # with plain store, inter atomic-accumulates over feature-blocks into its own (reset_to_zero).
-        # Both feature-tile-autotuned (BD knob → small-SMEM fallback); summed on the host.
         d_intra = torch.zeros(B, L, nc, device=q.device, dtype=torch.float32)
         d_inter = torch.zeros_like(d_intra)
         Zb = torch.empty(B, NB, NCH, BD, BG, device=q.device, dtype=torch.float32)
@@ -1426,27 +1443,36 @@ class _DenFn(torch.autograd.Function):
         sZ = (Zb.stride(0), Zb.stride(1), Zb.stride(2), Zb.stride(3), Zb.stride(4))
         _den_fwd_intra[(B, NB, NCH)](q, k, wg, wg, d_intra, L, dqk, nc, *sq, *sg, *sd,
                                      USE_G=False, BT=chunk, BG=BG)
+
         def grid_inter(meta):
             return (B, NB, triton.cdiv(dqk, meta['BD']))
         _den_fwd_inter[grid_inter](q, k, wg, wg, d_inter, Zb, L, dqk, nc, *sq, *sg, *sd, *sZ,
                                    USE_G=False, BT=chunk, BG=BG, NCH=NCH)
-        d = d_intra + d_inter
-        ctx.save_for_backward(q, k, wg, Zb)
-        ctx.meta = (chunk, BG, BD, NB, NCH)
-        return d
+        return [d_intra + d_inter, Zb]
 
-    @staticmethod
-    @input_guard
-    @autocast_custom_bwd
-    def backward(ctx, gd):
-        q, k, wg, Zb = ctx.saved_tensors
-        chunk, BG, BD, NB, NCH = ctx.meta
+
+@_den_op.register_fake
+def _den_op_fake(q, k, wg, chunk, BG):
+    B, L, dqk = q.shape
+    nc = wg.shape[-1]
+    BD = max(16, triton.next_power_of_2(dqk))
+    NB = triton.cdiv(nc, BG)
+    NCH = triton.cdiv(L, chunk)
+    return [q.new_empty((B, L, nc), dtype=torch.float32),
+            q.new_empty((B, NB, NCH, BD, BG), dtype=torch.float32)]
+
+
+@torch.library.custom_op("rola::den_bwd", mutates_args=())
+def _den_bwd_op(q: torch.Tensor, k: torch.Tensor, wg: torch.Tensor, Zb: torch.Tensor,
+                gd: torch.Tensor, chunk: int, BG: int) -> typing.List[torch.Tensor]:  # noqa: UP006
+    with torch.autocast('cuda', enabled=False):
         B, L, dqk = q.shape
         nc = wg.shape[-1]
-        gd = gd.contiguous().to(q.dtype)   # match input dtype (tl.dot requires same-dtype operands; fp32 accum regardless)
+        BD = max(16, triton.next_power_of_2(dqk))
+        NB = triton.cdiv(nc, BG)
+        NCH = triton.cdiv(L, chunk)
+        gd = gd.contiguous().to(q.dtype)
         dZa = torch.empty_like(Zb)
-        # Scan is d-parallel (register carry, own feature block; Zb/dZa indexed by absolute feature
-        # row so this blocking is independent of the grad's autotuned BD). Grad BD is autotuned.
         BK_scan = min(64, BD)
         ND_scan = triton.cdiv(dqk, BK_scan)
         _den_bwd_scan[(B, NB, ND_scan)](q, gd, dZa, L, dqk, nc,
@@ -1459,19 +1485,43 @@ class _DenFn(torch.autograd.Function):
         _den_grad[(B, NB, NCH)](q, k, wg, gd, Zb, dZa, dq, dk, dw, L, dqk, nc,
                                 q.stride(0), q.stride(1), q.stride(2), gd.stride(0), gd.stride(1), gd.stride(2),
                                 Zb.stride(0), Zb.stride(1), Zb.stride(2), Zb.stride(3), Zb.stride(4),
-                                dq.stride(0), dq.stride(1), dq.stride(2), dq.stride(
-                                    3), dw.stride(0), dw.stride(1), dw.stride(2),
+                                dq.stride(0), dq.stride(1), dq.stride(2), dq.stride(3), dw.stride(0), dw.stride(1), dw.stride(2),
                                 BT=chunk, BG=BG, NCH=NCH)
+        return [dq.sum(1), dk.sum(1), dw]
 
-        def cast(t): return t.to(q.dtype)
-        return cast(dq.sum(1)), cast(dk.sum(1)), cast(dw), None, None
+
+@_den_bwd_op.register_fake
+def _den_bwd_op_fake(q, k, wg, Zb, gd, chunk, BG):
+    B, L, dqk = q.shape
+    nc = wg.shape[-1]
+    f = torch.float32
+    return [q.new_empty((B, L, dqk), dtype=f), q.new_empty((B, L, dqk), dtype=f), q.new_empty((B, L, nc), dtype=f)]
+
+
+def _den_setup(ctx, inputs, output):
+    q, k, wg, chunk, BG = inputs
+    ctx.save_for_backward(q, k, wg, output[1])
+    ctx.chunk = chunk
+    ctx.BG = BG
+
+
+def _den_backward(ctx, grad):
+    q, k, wg, Zb = ctx.saved_tensors
+    grad_d = grad[0] if isinstance(grad, (list, tuple)) else grad   # list-output op: grad is [grad_d, grad_Zb]
+    dq, dk, dw = _den_bwd_op(q, k, wg, Zb, grad_d, ctx.chunk, ctx.BG)
+    def cast(t): return t.to(q.dtype)
+    return cast(dq), cast(dk), cast(dw), None, None
+
+
+_den_op.register_autograd(_den_backward, setup_context=_den_setup)
 
 
 @input_guard
 def rola_perstate_den_triton(q, k, w, chunk=None, BG=16):
     """Per-state denominator on folded [BH,L,*] tensors. Differentiable (Triton fwd + parallel bwd)."""
     chunk = _CHUNK if chunk is None else min(chunk, _CHUNK)
-    return _DenFn.apply(q, k, w, chunk, BG)
+    d, _Zb = _den_op(q, k, w, chunk, BG)
+    return d
 
 
 @triton.autotune(configs=_AT_CFGS, key=_DEN_KEY, **autotune_cache_kwargs)
@@ -1764,7 +1814,6 @@ def _rola_readout(qf, kf, vf, rf, wf, gf, chunk_size):
     return _rola_chunk_core(qf, kf, vf, wf, rf, gf, chunk_size)
 
 
-@torch.compiler.disable
 @input_guard
 def chunk_rola(q, k, v, r, w, g=None, norm='kappa', kappa=None, scale=None, eps=1e-5,
                initial_state=None, output_final_state=False):
