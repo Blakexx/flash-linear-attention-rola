@@ -114,22 +114,17 @@ def _prune_bwd_bd(configs, named_args, **kwargs):
 def _rola_fwd_intra(q_ptr, k_ptr, v_ptr, wg_ptr, rg_ptr, outa_ptr,
                     L, dqk, dv, nc,
                     sq_b, sq_l, sq_d, sv_b, sv_l, sv_d, sg_b, sg_l, sg_c,
-                    soa_b, soa_n, soa_l, soa_v,
+                    soa_b, soa_l, soa_v,
                     BT: tl.constexpr, BK: tl.constexpr, BV: tl.constexpr,
-                    BG: tl.constexpr, ND: tl.constexpr):
-    """Intra-chunk routed readout for one (batch, state-block, chunk). The [BT,BT] content gram is
-    built by looping BK-blocks of the feature dim, so SRAM is bounded by [BT,BK]+[BT,BT] — NOT dqk.
-    Numerator-only (output width dv, BV=next_pow2(dv)); the global denominator is the caller's
-    separate per-state pre-pass.
-    Writes its OWN out_intra buffer (disjoint rows per chunk → plain store), so it is autotunable
-    (num_warps/num_stages pruned by OutOfResources); the inter contribution is a separate buffer."""
+                    BG: tl.constexpr, ND: tl.constexpr, NB: tl.constexpr):
+    """Intra-chunk routed readout for one (batch, chunk) — the nc axis COLLAPSES here:
+    o = (G ⊙ (r·wᵀ) ⊙ causal)·v. Content gram G built ONCE (loop BK-blocks of dqk); the FULL routing
+    gram R is accumulated over state-blocks IN-KERNEL (loop NB), so there is no per-sb HBM grid — the
+    routed sum is done in SRAM and the output is [B,L,dv]. SRAM bounded by [BT,BK]+[BT,BG]+[BT,BT]."""
     b = tl.program_id(0)
-    sb = tl.program_id(1)
-    t = tl.program_id(2)
+    t = tl.program_id(1)
     offs_t = tl.arange(0, BT)
     offs_v = tl.arange(0, BV)
-    offs_c = sb * BG + tl.arange(0, BG)
-    cmask = offs_c < nc
     rows = t * BT + offs_t
     rmask = rows < L
     G = tl.zeros([BT, BT], dtype=tl.float32)
@@ -141,17 +136,21 @@ def _rola_fwd_intra(q_ptr, k_ptr, v_ptr, wg_ptr, rg_ptr, outa_ptr,
         kc = tl.load(k_ptr + b*sq_b + rows[:, None]*sq_l + offs_d[None, :]*sq_d,
                      mask=rmask[:, None] & dmask[None, :], other=0.0)
         G += tl.dot(qc, tl.trans(kc))
-    rgc = tl.load(rg_ptr + b*sg_b + rows[:, None]*sg_l + offs_c[None, :]*sg_c,
-                  mask=rmask[:, None] & cmask[None, :], other=0.0)
-    wgc = tl.load(wg_ptr + b*sg_b + rows[:, None]*sg_l + offs_c[None, :]*sg_c,
-                  mask=rmask[:, None] & cmask[None, :], other=0.0)
+    R = tl.zeros([BT, BT], dtype=tl.float32)
+    for sb in range(NB):
+        offs_c = sb * BG + tl.arange(0, BG)
+        cmask = offs_c < nc
+        rgc = tl.load(rg_ptr + b*sg_b + rows[:, None]*sg_l + offs_c[None, :]*sg_c,
+                      mask=rmask[:, None] & cmask[None, :], other=0.0)
+        wgc = tl.load(wg_ptr + b*sg_b + rows[:, None]*sg_l + offs_c[None, :]*sg_c,
+                      mask=rmask[:, None] & cmask[None, :], other=0.0)
+        R += tl.dot(rgc, tl.trans(wgc))
     vc = tl.load(v_ptr + b*sv_b + rows[:, None]*sv_l + offs_v[None, :]*sv_d,
                  mask=rmask[:, None] & (offs_v[None, :] < dv), other=0.0)
-    R = tl.dot(rgc, tl.trans(wgc))
     causal = (offs_t[:, None] >= offs_t[None, :]) & rmask[:, None] & rmask[None, :]
     A = G * R * causal
     o = tl.dot(A.to(vc.dtype), vc)
-    tl.store(outa_ptr + b*soa_b + sb*soa_n + rows[:, None]*soa_l + offs_v[None, :]*soa_v,
+    tl.store(outa_ptr + b*soa_b + rows[:, None]*soa_l + offs_v[None, :]*soa_v,
              o, mask=rmask[:, None] & (offs_v[None, :] < dv))
 
 
@@ -220,16 +219,19 @@ def _fwd_tiled(q, k, v, wg, rg, chunk, BG, BK=64):
     # Separate intra/inter output buffers (summed after) so each kernel has a non-shared output and is
     # independently autotunable: intra writes disjoint rows (store), inter atomic-accumulates over
     # feature-blocks (reset_to_zero). FLA idiom — the autotuner prunes warps/stages per device.
-    out_intra = torch.zeros(B, NB, L, BV, device=q.device, dtype=torch.float32)
-    out_inter = torch.zeros_like(out_intra)
-    so = (out_intra.stride(0), out_intra.stride(1), out_intra.stride(2), out_intra.stride(3))
+    # Intra collapses nc in-kernel → [B,L,BV] (no per-sb grid). Inter still per-sb [B,NB,L,BV]
+    # (cross-chunk read routing can't collapse), summed after. Different shapes → separate strides.
+    out_intra = torch.zeros(B, L, BV, device=q.device, dtype=torch.float32)
+    out_inter = torch.zeros(B, NB, L, BV, device=q.device, dtype=torch.float32)
+    so_a = (out_intra.stride(0), out_intra.stride(1), out_intra.stride(2))
+    so_e = (out_inter.stride(0), out_inter.stride(1), out_inter.stride(2), out_inter.stride(3))
     base = (q.stride(0), q.stride(1), q.stride(2), v.stride(0), v.stride(1), v.stride(2),
             wg.stride(0), wg.stride(1), wg.stride(2))
-    _rola_fwd_intra[(B, NB, NCH)](q, k, v, wg, rg, out_intra, L, dqk, dv, nc, *base, *so,
-                                  BT=chunk, BK=BK, BV=BV, BG=BG, ND=ND)
-    _rola_fwd_inter[(B, NB, ND)](q, k, v, wg, rg, out_inter, L, dqk, dv, nc, *base, *so,
+    _rola_fwd_intra[(B, NCH)](q, k, v, wg, rg, out_intra, L, dqk, dv, nc, *base, *so_a,
+                              BT=chunk, BK=BK, BV=BV, BG=BG, ND=ND, NB=NB)
+    _rola_fwd_inter[(B, NB, ND)](q, k, v, wg, rg, out_inter, L, dqk, dv, nc, *base, *so_e,
                                  BT=chunk, BK=BK, BVF=BV, BG=BG, NCH=NCH)
-    return (out_intra + out_inter)[..., :dv].sum(1)
+    return out_intra[..., :dv] + out_inter[..., :dv].sum(1)
 
 
 @torch.library.custom_op("rola::readout_rla", mutates_args=())
