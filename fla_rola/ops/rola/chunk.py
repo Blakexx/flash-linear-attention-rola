@@ -427,10 +427,9 @@ class _RoLAGLAFn(torch.autograd.Function):
     @autocast_custom_bwd
     def backward(ctx, dO):
         q, k, v, wg, rg, ld = ctx.saved_tensors
-        g = dO.float()
-        def fl(t): return t.float()
+        g = dO
         dq, dk, dvv, dwg, drg, dld = _bwd_split_gla(
-            fl(q), fl(k), fl(v), fl(wg), fl(rg), fl(ld), g, chunk=_CHUNK)
+            q, k, v, wg, rg, ld, g, chunk=_CHUNK)
         def cast(t): return t.to(q.dtype)
         # forward args order: q, k, v, wg, rg, ld, chunk, BG
         return cast(dq), cast(dk), cast(dvv), cast(dwg), cast(drg), cast(dld), None, None
@@ -500,7 +499,7 @@ def _scan_S(k_ptr, v_ptr, wg_ptr, ld_ptr, Sb_ptr, L, dqk, dv: tl.constexpr, nc,
                      Sflat, mask=dmask[:, None])
             if USE_G:
                 ldc = tl.load(ld_ptr + b*sg_b + rows[:, None]*sg_l + offs_c[None, :]
-                              * sg_c, mask=rmask[:, None] & cmask[None, :], other=0.0)
+                              * sg_c, mask=rmask[:, None] & cmask[None, :], other=0.0).to(tl.float32)
                 a = tl.cumsum(ldc, axis=0)
                 Lam = tl.sum(tl.where(offs_t[:, None] == (BT - 1), a, 0.0), axis=0)
                 w_end = wgc * tl.exp(Lam[None, :] - a)
@@ -550,7 +549,7 @@ def _scan_dS(q_ptr, rg_ptr, ld_ptr, g_ptr, dSa_ptr, L, dqk, dv: tl.constexpr, nc
                      dS, mask=dmask[:, None])
             if USE_G:
                 ldc = tl.load(ld_ptr + b*sg_b + rows[:, None]*sg_l + offs_c[None, :]
-                              * sg_c, mask=rmask[:, None] & cmask[None, :], other=0.0)
+                              * sg_c, mask=rmask[:, None] & cmask[None, :], other=0.0).to(tl.float32)
                 a = tl.cumsum(ldc, axis=0)
                 rt = rgc * tl.exp(a)
                 Lam = tl.sum(tl.where(offs_t[:, None] == (BT - 1), a, 0.0), axis=0)
@@ -838,9 +837,9 @@ def _par_grad_gla_qr(q_ptr, k_ptr, v_ptr, wg_ptr, rg_ptr, ld_ptr, g_ptr, Sb_ptr,
     cmask = offs_c < nc
     rows = t * BT + offs_t
     rmask = rows < L
-    rgc = tl.load(rg_ptr + b*sg_b + rows[:, None]*sg_l + offs_c[None, :]*sg_c, mask=rmask[:, None] & cmask[None, :], other=0.0)
-    wgc = tl.load(wg_ptr + b*sg_b + rows[:, None]*sg_l + offs_c[None, :]*sg_c, mask=rmask[:, None] & cmask[None, :], other=0.0)
-    ldc = tl.load(ld_ptr + b*sg_b + rows[:, None]*sg_l + offs_c[None, :]*sg_c, mask=rmask[:, None] & cmask[None, :], other=0.0)
+    rgc = tl.load(rg_ptr + b*sg_b + rows[:, None]*sg_l + offs_c[None, :]*sg_c, mask=rmask[:, None] & cmask[None, :], other=0.0).to(tl.float32)
+    wgc = tl.load(wg_ptr + b*sg_b + rows[:, None]*sg_l + offs_c[None, :]*sg_c, mask=rmask[:, None] & cmask[None, :], other=0.0).to(tl.float32)
+    ldc = tl.load(ld_ptr + b*sg_b + rows[:, None]*sg_l + offs_c[None, :]*sg_c, mask=rmask[:, None] & cmask[None, :], other=0.0).to(tl.float32)
     a = tl.cumsum(ldc, axis=0)
     ea = tl.exp(a)
     rt = rgc * ea
@@ -851,8 +850,8 @@ def _par_grad_gla_qr(q_ptr, k_ptr, v_ptr, wg_ptr, rg_ptr, ld_ptr, g_ptr, Sb_ptr,
         offs_v = tl.arange(0, BV)
         offs_e = tl.arange(0, BG * BV)
         vmask = offs_v < dv
-        v1 = tl.load(v_ptr + b*sv_b + rows[:, None]*sv_l + offs_v[None, :]*sv_d, mask=rmask[:, None] & vmask[None, :], other=0.0)
-        gc = tl.load(g_ptr + b*sgr_b + rows[:, None]*sgr_l + offs_v[None, :]*sgr_d, mask=rmask[:, None] & vmask[None, :], other=0.0)
+        v1 = tl.load(v_ptr + b*sv_b + rows[:, None]*sv_l + offs_v[None, :]*sv_d, mask=rmask[:, None] & vmask[None, :], other=0.0).to(tl.float32)
+        gc = tl.load(g_ptr + b*sgr_b + rows[:, None]*sgr_l + offs_v[None, :]*sgr_d, mask=rmask[:, None] & vmask[None, :], other=0.0).to(tl.float32)
         P = tl.dot(gc, tl.trans(v1))
         dG = P * D * caus
         rt_g = tl.reshape(rt[:, :, None] * gc[:, None, :], [BT, BG * BV])
@@ -861,8 +860,8 @@ def _par_grad_gla_qr(q_ptr, k_ptr, v_ptr, wg_ptr, rg_ptr, ld_ptr, g_ptr, Sb_ptr,
         for d0b in range(ND):
             offs_d = d0b * BD + tl.arange(0, BD)
             dmask = offs_d < dqk
-            qc = tl.load(q_ptr + b*sq_b + rows[:, None]*sq_l + offs_d[None, :]*sq_d, mask=rmask[:, None] & dmask[None, :], other=0.0)
-            kc = tl.load(k_ptr + b*sq_b + rows[:, None]*sq_l + offs_d[None, :]*sq_d, mask=rmask[:, None] & dmask[None, :], other=0.0)
+            qc = tl.load(q_ptr + b*sq_b + rows[:, None]*sq_l + offs_d[None, :]*sq_d, mask=rmask[:, None] & dmask[None, :], other=0.0).to(tl.float32)
+            kc = tl.load(k_ptr + b*sq_b + rows[:, None]*sq_l + offs_d[None, :]*sq_d, mask=rmask[:, None] & dmask[None, :], other=0.0).to(tl.float32)
             Sb = tl.load(Sb_ptr + b*ssb_b + sb*ssb_n + t*ssb_t + offs_d[:, None]
                          * ssb_d + offs_e[None, :]*ssb_e, mask=dmask[:, None], other=0.0)
             dq_intra = tl.dot(dG.to(kc.dtype), kc)
@@ -880,21 +879,21 @@ def _par_grad_gla_qr(q_ptr, k_ptr, v_ptr, wg_ptr, rg_ptr, ld_ptr, g_ptr, Sb_ptr,
         for vb in range(ND_V):
             offs_v = vb * BV + tl.arange(0, BV)
             vm = offs_v < dv
-            v1 = tl.load(v_ptr + b*sv_b + rows[:, None]*sv_l + offs_v[None, :]*sv_d, mask=rmask[:, None] & vm[None, :], other=0.0)
-            gv = tl.load(g_ptr + b*sgr_b + rows[:, None]*sgr_l + offs_v[None, :]*sgr_d, mask=rmask[:, None] & vm[None, :], other=0.0)
+            v1 = tl.load(v_ptr + b*sv_b + rows[:, None]*sv_l + offs_v[None, :]*sv_d, mask=rmask[:, None] & vm[None, :], other=0.0).to(tl.float32)
+            gv = tl.load(g_ptr + b*sgr_b + rows[:, None]*sgr_l + offs_v[None, :]*sgr_d, mask=rmask[:, None] & vm[None, :], other=0.0).to(tl.float32)
             P += tl.dot(gv, tl.trans(v1))
         dG = P * D * caus
         G = tl.zeros([BT, BT], dtype=tl.float32)
         for d0b in range(ND):
             offs_d = d0b * BD + tl.arange(0, BD)
             dmask = offs_d < dqk
-            qc = tl.load(q_ptr + b*sq_b + rows[:, None]*sq_l + offs_d[None, :]*sq_d, mask=rmask[:, None] & dmask[None, :], other=0.0)
-            kc = tl.load(k_ptr + b*sq_b + rows[:, None]*sq_l + offs_d[None, :]*sq_d, mask=rmask[:, None] & dmask[None, :], other=0.0)
+            qc = tl.load(q_ptr + b*sq_b + rows[:, None]*sq_l + offs_d[None, :]*sq_d, mask=rmask[:, None] & dmask[None, :], other=0.0).to(tl.float32)
+            kc = tl.load(k_ptr + b*sq_b + rows[:, None]*sq_l + offs_d[None, :]*sq_d, mask=rmask[:, None] & dmask[None, :], other=0.0).to(tl.float32)
             dq_d = tl.dot(dG.to(kc.dtype), kc)
             for vb in range(ND_V):
                 offs_v = vb * BV + tl.arange(0, BV)
                 vm = offs_v < dv
-                gv = tl.load(g_ptr + b*sgr_b + rows[:, None]*sgr_l + offs_v[None, :]*sgr_d, mask=rmask[:, None] & vm[None, :], other=0.0)
+                gv = tl.load(g_ptr + b*sgr_b + rows[:, None]*sgr_l + offs_v[None, :]*sgr_d, mask=rmask[:, None] & vm[None, :], other=0.0).to(tl.float32)
                 rt_g = tl.reshape(rt[:, :, None] * gv[:, None, :], [BT, BG * BV])
                 offs_e = tl.reshape(offs_g[:, None] * BVF + offs_v[None, :], [BG * BV])
                 Sb = tl.load(Sb_ptr + b*ssb_b + sb*ssb_n + t*ssb_t + offs_d[:, None]*ssb_d + offs_e[None, :]*ssb_e, mask=dmask[:, None], other=0.0)
@@ -908,13 +907,13 @@ def _par_grad_gla_qr(q_ptr, k_ptr, v_ptr, wg_ptr, rg_ptr, ld_ptr, g_ptr, Sb_ptr,
         for vb in range(ND_V):
             offs_v = vb * BV + tl.arange(0, BV)
             vm = offs_v < dv
-            gv = tl.load(g_ptr + b*sgr_b + rows[:, None]*sgr_l + offs_v[None, :]*sgr_d, mask=rmask[:, None] & vm[None, :], other=0.0)
+            gv = tl.load(g_ptr + b*sgr_b + rows[:, None]*sgr_l + offs_v[None, :]*sgr_d, mask=rmask[:, None] & vm[None, :], other=0.0).to(tl.float32)
             offs_e = tl.reshape(offs_g[:, None] * BVF + offs_v[None, :], [BG * BV])
             QS = tl.zeros([BT, BG * BV], dtype=tl.float32)
             for d0b in range(ND):
                 offs_d = d0b * BD + tl.arange(0, BD)
                 dmask = offs_d < dqk
-                qc = tl.load(q_ptr + b*sq_b + rows[:, None]*sq_l + offs_d[None, :]*sq_d, mask=rmask[:, None] & dmask[None, :], other=0.0)
+                qc = tl.load(q_ptr + b*sq_b + rows[:, None]*sq_l + offs_d[None, :]*sq_d, mask=rmask[:, None] & dmask[None, :], other=0.0).to(tl.float32)
                 Sb = tl.load(Sb_ptr + b*ssb_b + sb*ssb_n + t*ssb_t + offs_d[:, None]*ssb_d + offs_e[None, :]*ssb_e, mask=dmask[:, None], other=0.0)
                 QS += tl.dot(qc, Sb.to(qc.dtype))
             drt_inter += tl.sum(tl.reshape(QS, [BT, BG, BV]) * gv[:, None, :], axis=2)
@@ -949,9 +948,9 @@ def _par_grad_gla_kwv(q_ptr, k_ptr, v_ptr, wg_ptr, rg_ptr, ld_ptr, g_ptr, Sb_ptr
     cmask = offs_c < nc
     rows = t * BT + offs_t
     rmask = rows < L
-    rgc = tl.load(rg_ptr + b*sg_b + rows[:, None]*sg_l + offs_c[None, :]*sg_c, mask=rmask[:, None] & cmask[None, :], other=0.0)
-    wgc = tl.load(wg_ptr + b*sg_b + rows[:, None]*sg_l + offs_c[None, :]*sg_c, mask=rmask[:, None] & cmask[None, :], other=0.0)
-    ldc = tl.load(ld_ptr + b*sg_b + rows[:, None]*sg_l + offs_c[None, :]*sg_c, mask=rmask[:, None] & cmask[None, :], other=0.0)
+    rgc = tl.load(rg_ptr + b*sg_b + rows[:, None]*sg_l + offs_c[None, :]*sg_c, mask=rmask[:, None] & cmask[None, :], other=0.0).to(tl.float32)
+    wgc = tl.load(wg_ptr + b*sg_b + rows[:, None]*sg_l + offs_c[None, :]*sg_c, mask=rmask[:, None] & cmask[None, :], other=0.0).to(tl.float32)
+    ldc = tl.load(ld_ptr + b*sg_b + rows[:, None]*sg_l + offs_c[None, :]*sg_c, mask=rmask[:, None] & cmask[None, :], other=0.0).to(tl.float32)
     a = tl.cumsum(ldc, axis=0)
     ena = tl.exp(-a)
     rt = rgc * tl.exp(a)
@@ -964,8 +963,8 @@ def _par_grad_gla_kwv(q_ptr, k_ptr, v_ptr, wg_ptr, rg_ptr, ld_ptr, g_ptr, Sb_ptr
         offs_v = tl.arange(0, BV)
         offs_e = tl.arange(0, BG * BV)
         vmask = offs_v < dv
-        v1 = tl.load(v_ptr + b*sv_b + rows[:, None]*sv_l + offs_v[None, :]*sv_d, mask=rmask[:, None] & vmask[None, :], other=0.0)
-        gc = tl.load(g_ptr + b*sgr_b + rows[:, None]*sgr_l + offs_v[None, :]*sgr_d, mask=rmask[:, None] & vmask[None, :], other=0.0)
+        v1 = tl.load(v_ptr + b*sv_b + rows[:, None]*sv_l + offs_v[None, :]*sv_d, mask=rmask[:, None] & vmask[None, :], other=0.0).to(tl.float32)
+        gc = tl.load(g_ptr + b*sgr_b + rows[:, None]*sgr_l + offs_v[None, :]*sgr_d, mask=rmask[:, None] & vmask[None, :], other=0.0).to(tl.float32)
         P = tl.dot(gc, tl.trans(v1))
         dG = P * D * caus
         wv1 = tl.reshape(w_end[:, :, None] * v1[:, None, :], [BT, BG * BV])
@@ -975,8 +974,8 @@ def _par_grad_gla_kwv(q_ptr, k_ptr, v_ptr, wg_ptr, rg_ptr, ld_ptr, g_ptr, Sb_ptr
         for d0b in range(ND):
             offs_d = d0b * BD + tl.arange(0, BD)
             dmask = offs_d < dqk
-            qc = tl.load(q_ptr + b*sq_b + rows[:, None]*sq_l + offs_d[None, :]*sq_d, mask=rmask[:, None] & dmask[None, :], other=0.0)
-            kc = tl.load(k_ptr + b*sq_b + rows[:, None]*sq_l + offs_d[None, :]*sq_d, mask=rmask[:, None] & dmask[None, :], other=0.0)
+            qc = tl.load(q_ptr + b*sq_b + rows[:, None]*sq_l + offs_d[None, :]*sq_d, mask=rmask[:, None] & dmask[None, :], other=0.0).to(tl.float32)
+            kc = tl.load(k_ptr + b*sq_b + rows[:, None]*sq_l + offs_d[None, :]*sq_d, mask=rmask[:, None] & dmask[None, :], other=0.0).to(tl.float32)
             Sb = tl.load(Sb_ptr + b*ssb_b + sb*ssb_n + t*ssb_t + offs_d[:, None]*ssb_d + offs_e[None, :]*ssb_e, mask=dmask[:, None], other=0.0)
             dSa = tl.load(dSa_ptr + b*ssb_b + sb*ssb_n + t*ssb_t + offs_d[:, None]*ssb_d + offs_e[None, :]*ssb_e, mask=dmask[:, None], other=0.0)
             dk_intra = tl.dot(tl.trans(dG).to(qc.dtype), qc)
@@ -1000,8 +999,8 @@ def _par_grad_gla_kwv(q_ptr, k_ptr, v_ptr, wg_ptr, rg_ptr, ld_ptr, g_ptr, Sb_ptr
         for vb in range(ND_V):
             offs_v = vb * BV + tl.arange(0, BV)
             vm = offs_v < dv
-            v1 = tl.load(v_ptr + b*sv_b + rows[:, None]*sv_l + offs_v[None, :]*sv_d, mask=rmask[:, None] & vm[None, :], other=0.0)
-            gv = tl.load(g_ptr + b*sgr_b + rows[:, None]*sgr_l + offs_v[None, :]*sgr_d, mask=rmask[:, None] & vm[None, :], other=0.0)
+            v1 = tl.load(v_ptr + b*sv_b + rows[:, None]*sv_l + offs_v[None, :]*sv_d, mask=rmask[:, None] & vm[None, :], other=0.0).to(tl.float32)
+            gv = tl.load(g_ptr + b*sgr_b + rows[:, None]*sgr_l + offs_v[None, :]*sgr_d, mask=rmask[:, None] & vm[None, :], other=0.0).to(tl.float32)
             P += tl.dot(gv, tl.trans(v1))
         dG = P * D * caus
         G = tl.zeros([BT, BT], dtype=tl.float32)
@@ -1009,13 +1008,13 @@ def _par_grad_gla_kwv(q_ptr, k_ptr, v_ptr, wg_ptr, rg_ptr, ld_ptr, g_ptr, Sb_ptr
         for d0b in range(ND):
             offs_d = d0b * BD + tl.arange(0, BD)
             dmask = offs_d < dqk
-            qc = tl.load(q_ptr + b*sq_b + rows[:, None]*sq_l + offs_d[None, :]*sq_d, mask=rmask[:, None] & dmask[None, :], other=0.0)
-            kc = tl.load(k_ptr + b*sq_b + rows[:, None]*sq_l + offs_d[None, :]*sq_d, mask=rmask[:, None] & dmask[None, :], other=0.0)
+            qc = tl.load(q_ptr + b*sq_b + rows[:, None]*sq_l + offs_d[None, :]*sq_d, mask=rmask[:, None] & dmask[None, :], other=0.0).to(tl.float32)
+            kc = tl.load(k_ptr + b*sq_b + rows[:, None]*sq_l + offs_d[None, :]*sq_d, mask=rmask[:, None] & dmask[None, :], other=0.0).to(tl.float32)
             dk_d = tl.dot(tl.trans(dG).to(qc.dtype), qc)
             for vb in range(ND_V):
                 offs_v = vb * BV + tl.arange(0, BV)
                 vm = offs_v < dv
-                v1 = tl.load(v_ptr + b*sv_b + rows[:, None]*sv_l + offs_v[None, :]*sv_d, mask=rmask[:, None] & vm[None, :], other=0.0)
+                v1 = tl.load(v_ptr + b*sv_b + rows[:, None]*sv_l + offs_v[None, :]*sv_d, mask=rmask[:, None] & vm[None, :], other=0.0).to(tl.float32)
                 wv1 = tl.reshape(w_end[:, :, None] * v1[:, None, :], [BT, BG * BV])
                 offs_e = tl.reshape(offs_g[:, None] * BVF + offs_v[None, :], [BG * BV])
                 Sb = tl.load(Sb_ptr + b*ssb_b + sb*ssb_n + t*ssb_t + offs_d[:, None]*ssb_d + offs_e[None, :]*ssb_e, mask=dmask[:, None], other=0.0)
@@ -1032,14 +1031,14 @@ def _par_grad_gla_kwv(q_ptr, k_ptr, v_ptr, wg_ptr, rg_ptr, ld_ptr, g_ptr, Sb_ptr
         for vb in range(ND_V):
             offs_v = vb * BV + tl.arange(0, BV)
             vm = offs_v < dv
-            v1 = tl.load(v_ptr + b*sv_b + rows[:, None]*sv_l + offs_v[None, :]*sv_d, mask=rmask[:, None] & vm[None, :], other=0.0)
-            gv = tl.load(g_ptr + b*sgr_b + rows[:, None]*sgr_l + offs_v[None, :]*sgr_d, mask=rmask[:, None] & vm[None, :], other=0.0)
+            v1 = tl.load(v_ptr + b*sv_b + rows[:, None]*sv_l + offs_v[None, :]*sv_d, mask=rmask[:, None] & vm[None, :], other=0.0).to(tl.float32)
+            gv = tl.load(g_ptr + b*sgr_b + rows[:, None]*sgr_l + offs_v[None, :]*sgr_d, mask=rmask[:, None] & vm[None, :], other=0.0).to(tl.float32)
             offs_e = tl.reshape(offs_g[:, None] * BVF + offs_v[None, :], [BG * BV])
             KS = tl.zeros([BT, BG * BV], dtype=tl.float32)
             for d0b in range(ND):
                 offs_d = d0b * BD + tl.arange(0, BD)
                 dmask = offs_d < dqk
-                kc = tl.load(k_ptr + b*sq_b + rows[:, None]*sq_l + offs_d[None, :]*sq_d, mask=rmask[:, None] & dmask[None, :], other=0.0)
+                kc = tl.load(k_ptr + b*sq_b + rows[:, None]*sq_l + offs_d[None, :]*sq_d, mask=rmask[:, None] & dmask[None, :], other=0.0).to(tl.float32)
                 dSa = tl.load(dSa_ptr + b*ssb_b + sb*ssb_n + t*ssb_t + offs_d[:, None]*ssb_d + offs_e[None, :]*ssb_e, mask=dmask[:, None], other=0.0)
                 KS += tl.dot(kc, dSa.to(kc.dtype))
             KS3 = tl.reshape(KS, [BT, BG, BV])
