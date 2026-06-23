@@ -304,6 +304,13 @@ def rola_rla_triton(q, k, v, r, w, chunk=None, BG=16):
 # ============================================================================
 _GLA_FLOOR = -2.5   # per-token log-decay floor (retention ≥ 8.2%/tok); fp32-safe for BT≤32
 
+# Snapshot-GRANULARITY stride (#1): the backward boundary-state snapshots Sb/dSa are written only every
+# KSNAP chunks (slot = chunk//KSNAP), 1/KSNAP the dominant backward HBM. The grad kernels read the
+# nearest coarse anchor and recompute the ≤KSNAP-1 intervening chunks (a [BD,BG*BV] sub-scan — the
+# SAME working set as the snapshot path, so it fits SMEM at ANY dqk; full register recompute OOM'd
+# because it carried the [dqk_pad,*] feature width). Tunable via ROLA_SNAP_K (default 4 → −75% snaps).
+_SNAP_K = int(os.environ['ROLA_SNAP_K']) if os.environ.get('ROLA_SNAP_K') else 4
+
 
 @triton.autotune(configs=_AT_CFGS, key=_AT_KEY, **autotune_cache_kwargs)
 @triton.jit
@@ -492,11 +499,14 @@ def _scan_S(k_ptr, v_ptr, wg_ptr, ld_ptr, Sb_ptr, L, dqk, dv: tl.constexpr, nc,
             sq_b, sq_l, sq_d, sv_b, sv_l, sv_d, sg_b, sg_l, sg_c,
             ssb_b, ssb_n, ssb_t, ssb_d, ssb_e,
             USE_G: tl.constexpr, BT: tl.constexpr, BD: tl.constexpr, BV: tl.constexpr,
-            BVF: tl.constexpr, BG: tl.constexpr, NCH: tl.constexpr):
+            BVF: tl.constexpr, BG: tl.constexpr, NCH: tl.constexpr, KSNAP: tl.constexpr):
     # Value-OUTER over cdiv(dv,BV) blocks: each block carries its own [BD, BG*BV] state slice, bounding
     # smem+regs by BV (the autotuned value-tile). ND_V==1 (BV==BVF, the fits-everywhere case the
     # autotuner picks on A100 / at d_v<=32) runs ONE full scan == the un-tiled kernel byte-for-byte.
     # Snapshot is full-width BVF (state-major g*BVF+v); a value-block writes the strided e-slice.
+    # SNAPSHOT-GRANULARITY: store the boundary state only at coarse anchors (chunk t with t%KSNAP==0,
+    # into slot t//KSNAP) → 1/KSNAP the snapshot HBM. The grad kernel reads the nearest coarse anchor at
+    # or below t and forward-recomputes chunks [(t//KSNAP)*KSNAP, t) to rebuild the exact boundary at t.
     b = tl.program_id(0)
     sb = tl.program_id(1)
     d0 = tl.program_id(2)                       # feature-block: this program owns Sflat rows [d0*BD:]
@@ -521,8 +531,9 @@ def _scan_S(k_ptr, v_ptr, wg_ptr, ld_ptr, Sb_ptr, L, dqk, dv: tl.constexpr, nc,
                          mask=rmask[:, None] & vmask[None, :], other=0.0).to(tl.float32)
             wgc = tl.load(wg_ptr + b*sg_b + rows[:, None]*sg_l + offs_c[None, :]
                           * sg_c, mask=rmask[:, None] & cmask[None, :], other=0.0).to(tl.float32)
-            tl.store(Sb_ptr + b*ssb_b + sb*ssb_n + t*ssb_t + offs_d[:, None]*ssb_d + offs_e[None, :]*ssb_e,
-                     Sflat, mask=dmask[:, None])
+            if t % KSNAP == 0:
+                tl.store(Sb_ptr + b*ssb_b + sb*ssb_n + (t // KSNAP)*ssb_t
+                         + offs_d[:, None]*ssb_d + offs_e[None, :]*ssb_e, Sflat, mask=dmask[:, None])
             if USE_G:
                 ldc = tl.load(ld_ptr + b*sg_b + rows[:, None]*sg_l + offs_c[None, :]
                               * sg_c, mask=rmask[:, None] & cmask[None, :], other=0.0).to(tl.float32)
@@ -544,8 +555,12 @@ def _scan_dS(q_ptr, rg_ptr, ld_ptr, g_ptr, dSa_ptr, L, dqk, dv: tl.constexpr, nc
              sq_b, sq_l, sq_d, sg_b, sg_l, sg_c, sgr_b, sgr_l, sgr_d,
              ssb_b, ssb_n, ssb_t, ssb_d, ssb_e,
              USE_G: tl.constexpr, BT: tl.constexpr, BD: tl.constexpr, BV: tl.constexpr,
-             BVF: tl.constexpr, BG: tl.constexpr, NCH: tl.constexpr):
+             BVF: tl.constexpr, BG: tl.constexpr, NCH: tl.constexpr, KSNAP: tl.constexpr):
     # value-OUTER (mirror of _scan_S); ND_V==1 == the un-tiled reverse scan byte-for-byte.
+    # SNAPSHOT-GRANULARITY (reverse): dSa[t] = Σ_{t'>t} contrib(t'). Anchor at the TOP of each coarse
+    # block (chunk t with t%KSNAP==KSNAP-1, or the final chunk) into slot t//KSNAP — that holds Σ_{t'>top} = the
+    # state entering the block from above. The grad kernel reads its block's anchor and reverse-
+    # recomputes chunks (t, block_top] to rebuild the exact dSa at t. NSNAP = ceil(NCH/KSNAP).
     b = tl.program_id(0)
     sb = tl.program_id(1)
     d0 = tl.program_id(2)                       # feature-block: this program owns dS rows [d0*BD:]
@@ -571,8 +586,9 @@ def _scan_dS(q_ptr, rg_ptr, ld_ptr, g_ptr, dSa_ptr, L, dqk, dv: tl.constexpr, nc
                           * sg_c, mask=rmask[:, None] & cmask[None, :], other=0.0).to(tl.float32)
             gc = tl.load(g_ptr + b*sgr_b + rows[:, None]*sgr_l + offs_v[None, :]
                          * sgr_d, mask=rmask[:, None] & vmask[None, :], other=0.0).to(tl.float32)
-            tl.store(dSa_ptr + b*ssb_b + sb*ssb_n + t*ssb_t + offs_d[:, None]*ssb_d + offs_e[None, :]*ssb_e,
-                     dS, mask=dmask[:, None])
+            if (t % KSNAP == KSNAP - 1) or (t == NCH - 1):
+                tl.store(dSa_ptr + b*ssb_b + sb*ssb_n + (t // KSNAP)*ssb_t
+                         + offs_d[:, None]*ssb_d + offs_e[None, :]*ssb_e, dS, mask=dmask[:, None])
             if USE_G:
                 ldc = tl.load(ld_ptr + b*sg_b + rows[:, None]*sg_l + offs_c[None, :]
                               * sg_c, mask=rmask[:, None] & cmask[None, :], other=0.0).to(tl.float32)
@@ -587,6 +603,71 @@ def _scan_dS(q_ptr, rg_ptr, ld_ptr, g_ptr, dSa_ptr, L, dqk, dv: tl.constexpr, nc
                 dS += tl.dot(tl.trans(qc), rg_g.to(qc.dtype))
 
 
+# ---------------------------------------------------------------------------------------------------
+# Snapshot-GRANULARITY sub-scan recompute (device helpers, inlined by Triton). Each reconstructs the
+# exact [BD, BG*BV] boundary state at chunk t for ONE feature-block (offs_d) and value-block
+# (offs_v/offs_e), starting from the nearest COARSE snapshot and replaying the ≤KSNAP-1 intervening chunks
+# — the substep working set is exactly [BD, BG*BV], unchanged from the snapshot path, so it fits SMEM
+# at ANY dqk (the whole point: full register recompute carried [dqk_pad,*] and OOM'd; this does not).
+# ---------------------------------------------------------------------------------------------------
+@triton.jit
+def _recompute_S_rla(k_ptr, v_ptr, wg_ptr, Sb_ptr, t, b, sb, L,
+                     sq_b, sq_l, sq_d, sv_b, sv_l, sv_d, sg_b, sg_l, sg_c,
+                     ssb_b, ssb_n, ssb_t, ssb_d, ssb_e,
+                     offs_t, offs_d, dmask, offs_c, cmask, offs_v, vmask, offs_e,
+                     dqk, nc, BT: tl.constexpr, BD: tl.constexpr, BG: tl.constexpr,
+                     BV: tl.constexpr, KSNAP: tl.constexpr):
+    # forward anchor = (t//KSNAP)*KSNAP; replay chunks [t0, t) adding Kᵀ·WV. The loop trip count is the
+    # CONSTEXPR KSNAP (not the runtime t-t0) so Triton unrolls it like the scans — a runtime-bounded
+    # loop blows up codegen. Chunks tt>=t are MASKED off (rmask &= tt < t → zero contribution).
+    t0 = (t // KSNAP) * KSNAP
+    Sflat = tl.load(Sb_ptr + b*ssb_b + sb*ssb_n + (t // KSNAP)*ssb_t
+                    + offs_d[:, None]*ssb_d + offs_e[None, :]*ssb_e, mask=dmask[:, None], other=0.0)
+    for i in range(KSNAP):
+        tt = t0 + i
+        rows = tt * BT + offs_t
+        rmask = (rows < L) & (tt < t)
+        kc = tl.load(k_ptr + b*sq_b + rows[:, None]*sq_l + offs_d[None, :]*sq_d,
+                     mask=rmask[:, None] & dmask[None, :], other=0.0).to(tl.float32)
+        vc = tl.load(v_ptr + b*sv_b + rows[:, None]*sv_l + offs_v[None, :]*sv_d,
+                     mask=rmask[:, None] & vmask[None, :], other=0.0).to(tl.float32)
+        wgc = tl.load(wg_ptr + b*sg_b + rows[:, None]*sg_l + offs_c[None, :]*sg_c,
+                      mask=rmask[:, None] & cmask[None, :], other=0.0).to(tl.float32)
+        WV = tl.reshape(wgc[:, :, None] * vc[:, None, :], [BT, BG * BV])
+        Sflat += tl.dot(tl.trans(kc), WV.to(kc.dtype))
+    return Sflat
+
+
+@triton.jit
+def _recompute_dS_rla(q_ptr, rg_ptr, g_ptr, dSa_ptr, t, b, sb, L,
+                      sq_b, sq_l, sq_d, sg_b, sg_l, sg_c, sgr_b, sgr_l, sgr_d,
+                      ssb_b, ssb_n, ssb_t, ssb_d, ssb_e,
+                      offs_t, offs_d, dmask, offs_c, cmask, offs_v, vmask, offs_e,
+                      dqk, nc, NCH, BT: tl.constexpr, BD: tl.constexpr, BG: tl.constexpr,
+                      BV: tl.constexpr, KSNAP: tl.constexpr):
+    # reverse anchor = top of t's coarse block = min((t//KSNAP)*KSNAP+KSNAP-1, NCH-1); the snapshot at
+    # slot t//KSNAP holds Σ_{t'>top}. Replay chunks (t, top] in REVERSE adding Qᵀ·rg_g → Σ_{t'>t}. Trip
+    # count is the CONSTEXPR KSNAP (unrolled); chunks tt<=t OR tt>top are MASKED off (zero contribution).
+    top = (t // KSNAP) * KSNAP + (KSNAP - 1)
+    if top > NCH - 1:
+        top = NCH - 1
+    dS = tl.load(dSa_ptr + b*ssb_b + sb*ssb_n + (t // KSNAP)*ssb_t
+                 + offs_d[:, None]*ssb_d + offs_e[None, :]*ssb_e, mask=dmask[:, None], other=0.0)
+    for i in range(KSNAP):
+        tt = top - i
+        rows = tt * BT + offs_t
+        rmask = (rows < L) & (tt > t)
+        qc = tl.load(q_ptr + b*sq_b + rows[:, None]*sq_l + offs_d[None, :]*sq_d,
+                     mask=rmask[:, None] & dmask[None, :], other=0.0).to(tl.float32)
+        rgc = tl.load(rg_ptr + b*sg_b + rows[:, None]*sg_l + offs_c[None, :]*sg_c,
+                      mask=rmask[:, None] & cmask[None, :], other=0.0).to(tl.float32)
+        gc = tl.load(g_ptr + b*sgr_b + rows[:, None]*sgr_l + offs_v[None, :]*sgr_d,
+                     mask=rmask[:, None] & vmask[None, :], other=0.0).to(tl.float32)
+        rg_g = tl.reshape(rgc[:, :, None] * gc[:, None, :], [BT, BG * BV])
+        dS += tl.dot(tl.trans(qc), rg_g.to(qc.dtype))
+    return dS
+
+
 @triton.autotune(configs=_BWD_CFGS_BV, key=_AT_KEY,
                  prune_configs_by={'early_config_prune': _prune_bwd}, **autotune_cache_kwargs)
 @triton.jit
@@ -596,7 +677,7 @@ def _par_grad_rla_qr(q_ptr, k_ptr, v_ptr, wg_ptr, rg_ptr, g_ptr, Sb_ptr, dq_ptr,
                      ssb_b, ssb_n, ssb_t, ssb_d, ssb_e,
                      sdq_b, sdq_n, sdq_l, sdq_d, sdr_b, sdr_l, sdr_c,
                      BT: tl.constexpr, BD: tl.constexpr, BV: tl.constexpr, BVF: tl.constexpr,
-                     BG: tl.constexpr, NCH: tl.constexpr):
+                     BG: tl.constexpr, NCH: tl.constexpr, KSNAP: tl.constexpr):
     # D-tiled (BD autotune knob) over the feature axis; V-tiled (BV autotune knob) over the value axis.
     # ND_V==1 (BV==BVF — what the autotuner picks where the full value tile fits) runs the un-tiled fused
     # body byte-for-byte. ND_V>=2 takes the value-OUTER path: P is value-contracted (built first), dq's
@@ -637,12 +718,15 @@ def _par_grad_rla_qr(q_ptr, k_ptr, v_ptr, wg_ptr, rg_ptr, g_ptr, Sb_ptr, dq_ptr,
                          mask=rmask[:, None] & dmask[None, :], other=0.0).to(tl.float32)
             kc = tl.load(k_ptr + b*sq_b + rows[:, None]*sq_l + offs_d[None, :]*sq_d,
                          mask=rmask[:, None] & dmask[None, :], other=0.0).to(tl.float32)
-            Sb = tl.load(Sb_ptr + b*ssb_b + sb*ssb_n + t*ssb_t + offs_d[:, None]
-                         * ssb_d + offs_e[None, :]*ssb_e, mask=dmask[:, None], other=0.0)
+            Sb = _recompute_S_rla(k_ptr, v_ptr, wg_ptr, Sb_ptr, t, b, sb, L,
+                                  sq_b, sq_l, sq_d, sv_b, sv_l, sv_d, sg_b, sg_l, sg_c,
+                                  ssb_b, ssb_n, ssb_t, ssb_d, ssb_e,
+                                  offs_t, offs_d, dmask, offs_c, cmask, offs_v, vmask, offs_e,
+                                  dqk, nc, BT, BD, BG, BV, KSNAP)
             dq_d = tl.dot(coef.to(kc.dtype), kc) + tl.dot(rg_g.to(Sb.dtype), tl.trans(Sb))
             tl.store(dq_ptr + b*sdq_b + sb*sdq_n + rows[:, None]*sdq_l + offs_d[None, :]*sdq_d,
                      dq_d, mask=rmask[:, None] & dmask[None, :])
-            G += tl.dot(qc, tl.trans(kc))
+            G += tl.trans(tl.dot(kc, tl.trans(qc)))   # operand-shared tl.dot miscompile fix (qr)
             QS += tl.dot(qc, Sb.to(qc.dtype))
         dr_intra = tl.dot((causal * G * P).to(wgc.dtype), wgc)
         dr_inter = tl.sum(tl.reshape(QS, [BT, BG, BV]) * gc[:, None, :], axis=2)
@@ -677,12 +761,15 @@ def _par_grad_rla_qr(q_ptr, k_ptr, v_ptr, wg_ptr, rg_ptr, g_ptr, Sb_ptr, dq_ptr,
                              mask=rmask[:, None] & vm[None, :], other=0.0).to(tl.float32)
                 rg_g = tl.reshape(rgc[:, :, None] * gv[:, None, :], [BT, BG * BV])
                 offs_e = tl.reshape(offs_g[:, None] * BVF + offs_v[None, :], [BG * BV])
-                Sb = tl.load(Sb_ptr + b*ssb_b + sb*ssb_n + t*ssb_t + offs_d[:, None]
-                             * ssb_d + offs_e[None, :]*ssb_e, mask=dmask[:, None], other=0.0)
+                Sb = _recompute_S_rla(k_ptr, v_ptr, wg_ptr, Sb_ptr, t, b, sb, L,
+                                      sq_b, sq_l, sq_d, sv_b, sv_l, sv_d, sg_b, sg_l, sg_c,
+                                      ssb_b, ssb_n, ssb_t, ssb_d, ssb_e,
+                                      offs_t, offs_d, dmask, offs_c, cmask, offs_v, vm, offs_e,
+                                      dqk, nc, BT, BD, BG, BV, KSNAP)
                 dq_d += tl.dot(rg_g.to(Sb.dtype), tl.trans(Sb))
             tl.store(dq_ptr + b*sdq_b + sb*sdq_n + rows[:, None]*sdq_l + offs_d[None, :]*sdq_d,
                      dq_d, mask=rmask[:, None] & dmask[None, :])
-            G += tl.dot(qc, tl.trans(kc))
+            G += tl.trans(tl.dot(kc, tl.trans(qc)))   # operand-shared tl.dot miscompile fix (qr)
         # Phase 3: dr = intra (value-summed via P) + inter (value-outer QS per block).
         dr_intra = tl.dot((causal * G * P).to(wgc.dtype), wgc)
         dr_inter = tl.zeros([BT, BG], dtype=tl.float32)
@@ -698,8 +785,11 @@ def _par_grad_rla_qr(q_ptr, k_ptr, v_ptr, wg_ptr, rg_ptr, g_ptr, Sb_ptr, dq_ptr,
                 dmask = offs_d < dqk
                 qc = tl.load(q_ptr + b*sq_b + rows[:, None]*sq_l + offs_d[None, :]*sq_d,
                              mask=rmask[:, None] & dmask[None, :], other=0.0).to(tl.float32)
-                Sb = tl.load(Sb_ptr + b*ssb_b + sb*ssb_n + t*ssb_t + offs_d[:, None]
-                             * ssb_d + offs_e[None, :]*ssb_e, mask=dmask[:, None], other=0.0)
+                Sb = _recompute_S_rla(k_ptr, v_ptr, wg_ptr, Sb_ptr, t, b, sb, L,
+                                      sq_b, sq_l, sq_d, sv_b, sv_l, sv_d, sg_b, sg_l, sg_c,
+                                      ssb_b, ssb_n, ssb_t, ssb_d, ssb_e,
+                                      offs_t, offs_d, dmask, offs_c, cmask, offs_v, vm, offs_e,
+                                      dqk, nc, BT, BD, BG, BV, KSNAP)
                 QS += tl.dot(qc, Sb.to(qc.dtype))
             dr_inter += tl.sum(tl.reshape(QS, [BT, BG, BV]) * gv[:, None, :], axis=2)
         tl.store(dr_ptr + b*sdr_b + rows[:, None]*sdr_l + offs_c[None, :]*sdr_c,
@@ -715,7 +805,7 @@ def _par_grad_rla_kwv(q_ptr, k_ptr, v_ptr, wg_ptr, rg_ptr, g_ptr, dSa_ptr, dk_pt
                       ssb_b, ssb_n, ssb_t, ssb_d, ssb_e,
                       sdk_b, sdk_n, sdk_l, sdk_d, sdw_b, sdw_l, sdw_c, sdv_b, sdv_n, sdv_l, sdv_d,
                       BT: tl.constexpr, BD: tl.constexpr, BV: tl.constexpr, BVF: tl.constexpr,
-                      BG: tl.constexpr, NCH: tl.constexpr):
+                      BG: tl.constexpr, NCH: tl.constexpr, KSNAP: tl.constexpr):
     # D-tiled (BD) over features, V-tiled (BV) over the value axis. ND_V==1 runs the un-tiled fused body
     # byte-for-byte; ND_V>=2 is value-OUTER: P value-contracted, dk/dw value-summed (looped), dv
     # value-indexed (per block), KS rebuilt per value-block. See [[branch-on-structure-not-thresholds]].
@@ -754,8 +844,11 @@ def _par_grad_rla_kwv(q_ptr, k_ptr, v_ptr, wg_ptr, rg_ptr, g_ptr, dSa_ptr, dk_pt
                          mask=rmask[:, None] & dmask[None, :], other=0.0).to(tl.float32)
             kc = tl.load(k_ptr + b*sq_b + rows[:, None]*sq_l + offs_d[None, :]*sq_d,
                          mask=rmask[:, None] & dmask[None, :], other=0.0).to(tl.float32)
-            dSa = tl.load(dSa_ptr + b*ssb_b + sb*ssb_n + t*ssb_t +
-                          offs_d[:, None]*ssb_d + offs_e[None, :]*ssb_e, mask=dmask[:, None], other=0.0)
+            dSa = _recompute_dS_rla(q_ptr, rg_ptr, g_ptr, dSa_ptr, t, b, sb, L,
+                                    sq_b, sq_l, sq_d, sg_b, sg_l, sg_c, sgr_b, sgr_l, sgr_d,
+                                    ssb_b, ssb_n, ssb_t, ssb_d, ssb_e,
+                                    offs_t, offs_d, dmask, offs_c, cmask, offs_v, vmask, offs_e,
+                                    dqk, nc, NCH, BT, BD, BG, BV, KSNAP)
             dk_d = tl.dot(tl.trans(A2).to(qc.dtype), qc) + tl.dot(wg_v1.to(dSa.dtype), tl.trans(dSa))
             tl.store(dk_ptr + b*sdk_b + sb*sdk_n + rows[:, None]*sdk_l + offs_d[None, :]*sdk_d,
                      dk_d, mask=rmask[:, None] & dmask[None, :])
@@ -801,8 +894,11 @@ def _par_grad_rla_kwv(q_ptr, k_ptr, v_ptr, wg_ptr, rg_ptr, g_ptr, dSa_ptr, dk_pt
                              mask=rmask[:, None] & vm[None, :], other=0.0).to(tl.float32)
                 wg_v1 = tl.reshape(wgc[:, :, None] * v1[:, None, :], [BT, BG * BV])
                 offs_e = tl.reshape(offs_g[:, None] * BVF + offs_v[None, :], [BG * BV])
-                dSa = tl.load(dSa_ptr + b*ssb_b + sb*ssb_n + t*ssb_t +
-                              offs_d[:, None]*ssb_d + offs_e[None, :]*ssb_e, mask=dmask[:, None], other=0.0)
+                dSa = _recompute_dS_rla(q_ptr, rg_ptr, g_ptr, dSa_ptr, t, b, sb, L,
+                                        sq_b, sq_l, sq_d, sg_b, sg_l, sg_c, sgr_b, sgr_l, sgr_d,
+                                        ssb_b, ssb_n, ssb_t, ssb_d, ssb_e,
+                                        offs_t, offs_d, dmask, offs_c, cmask, offs_v, vm, offs_e,
+                                        dqk, nc, NCH, BT, BD, BG, BV, KSNAP)
                 dk_d += tl.dot(wg_v1.to(dSa.dtype), tl.trans(dSa))
             tl.store(dk_ptr + b*sdk_b + sb*sdk_n + rows[:, None]*sdk_l + offs_d[None, :]*sdk_d,
                      dk_d, mask=rmask[:, None] & dmask[None, :])
@@ -826,8 +922,11 @@ def _par_grad_rla_kwv(q_ptr, k_ptr, v_ptr, wg_ptr, rg_ptr, g_ptr, dSa_ptr, dk_pt
                 dmask = offs_d < dqk
                 kc = tl.load(k_ptr + b*sq_b + rows[:, None]*sq_l + offs_d[None, :]*sq_d,
                              mask=rmask[:, None] & dmask[None, :], other=0.0).to(tl.float32)
-                dSa = tl.load(dSa_ptr + b*ssb_b + sb*ssb_n + t*ssb_t +
-                              offs_d[:, None]*ssb_d + offs_e[None, :]*ssb_e, mask=dmask[:, None], other=0.0)
+                dSa = _recompute_dS_rla(q_ptr, rg_ptr, g_ptr, dSa_ptr, t, b, sb, L,
+                                        sq_b, sq_l, sq_d, sg_b, sg_l, sg_c, sgr_b, sgr_l, sgr_d,
+                                        ssb_b, ssb_n, ssb_t, ssb_d, ssb_e,
+                                        offs_t, offs_d, dmask, offs_c, cmask, offs_v, vm, offs_e,
+                                        dqk, nc, NCH, BT, BD, BG, BV, KSNAP)
                 KS += tl.dot(kc, dSa.to(kc.dtype))
             KS3 = tl.reshape(KS, [BT, BG, BV])
             dw_wr += tl.sum(KS3 * v1[:, None, :], axis=2)
@@ -1137,7 +1236,9 @@ def _bwd_split_rla(q, k, v, wg, rg, g, chunk=None, BG=16, nb_tile=None):
     BV = max(16, triton.next_power_of_2(dv))
     NB = triton.cdiv(nc, BG)
     NCH = triton.cdiv(L, chunk)
-    nb_tile = _resolve_nb_tile(nb_tile, B, NB, NCH, BD, BV, BG)
+    KSNAP = max(1, min(_SNAP_K, NCH))
+    NSNAP = triton.cdiv(NCH, KSNAP)
+    nb_tile = _resolve_nb_tile(nb_tile, B, NB, NSNAP, BD, BV, BG)
     BK_scan = min(64, BD)
     ND_scan = triton.cdiv(dqk, BK_scan)
     sq = (q.stride(0), q.stride(1), q.stride(2))
@@ -1154,27 +1255,27 @@ def _bwd_split_rla(q, k, v, wg, rg, g, chunk=None, BG=16, nb_tile=None):
         nct = c1 - c0                                                     # this tile's state width
         wg_s, rg_s, dr_s, dw_s = wg[:, :, c0:c1], rg[:, :, c0:c1], dr[:, :, c0:c1], dw[:, :, c0:c1]
         sg = (wg_s.stride(0), wg_s.stride(1), wg_s.stride(2))
-        Sb = torch.empty(B, nbt, NCH, BD, BG * BV, device=q.device, dtype=torch.float32)
+        Sb = torch.empty(B, nbt, NSNAP, BD, BG * BV, device=q.device, dtype=torch.float32)
         dSa = torch.empty_like(Sb)
         dq_t = torch.empty(B, nbt, L, dqk, device=q.device, dtype=torch.float32)
         dk_t = torch.empty_like(dq_t)
         dvo_t = torch.empty(B, nbt, L, BV, device=q.device, dtype=torch.float32)
         sS = (Sb.stride(0), Sb.stride(1), Sb.stride(2), Sb.stride(3), Sb.stride(4))
         _scan_S[(B, nbt, ND_scan)](k, v, wg_s, wg_s, Sb, L, dqk, dv, nct, *sq, *sv, *sg, *sS,
-                                   USE_G=False, BT=chunk, BD=BK_scan, BVF=BV, BG=BG, NCH=NCH)
+                                   USE_G=False, BT=chunk, BD=BK_scan, BVF=BV, BG=BG, NCH=NCH, KSNAP=KSNAP)
         _scan_dS[(B, nbt, ND_scan)](q, rg_s, wg_s, g, dSa, L, dqk, dv, nct, *sq, *sg, *sgr, *sS,
-                                    USE_G=False, BT=chunk, BD=BK_scan, BVF=BV, BG=BG, NCH=NCH)
+                                    USE_G=False, BT=chunk, BD=BK_scan, BVF=BV, BG=BG, NCH=NCH, KSNAP=KSNAP)
         _par_grad_rla_qr[(B, nbt, NCH)](q, k, v, wg_s, rg_s, g, Sb, dq_t, dr_s, L, dqk, dv, nct,
                                         *sq, *sv, *sg, *sgr, *sS,
                                         dq_t.stride(0), dq_t.stride(1), dq_t.stride(2), dq_t.stride(3),
                                         dr_s.stride(0), dr_s.stride(1), dr_s.stride(2),
-                                        BT=chunk, BVF=BV, BG=BG, NCH=NCH)
+                                        BT=chunk, BVF=BV, BG=BG, NCH=NCH, KSNAP=KSNAP)
         _par_grad_rla_kwv[(B, nbt, NCH)](q, k, v, wg_s, rg_s, g, dSa, dk_t, dw_s, dvo_t, L, dqk, dv, nct,
                                          *sq, *sv, *sg, *sgr, *sS,
                                          dk_t.stride(0), dk_t.stride(1), dk_t.stride(2), dk_t.stride(3),
                                          dw_s.stride(0), dw_s.stride(1), dw_s.stride(2),
                                          dvo_t.stride(0), dvo_t.stride(1), dvo_t.stride(2), dvo_t.stride(3),
-                                         BT=chunk, BVF=BV, BG=BG, NCH=NCH)
+                                         BT=chunk, BVF=BV, BG=BG, NCH=NCH, KSNAP=KSNAP)
         dq += dq_t.sum(1)
         dk += dk_t.sum(1)
         dvo += dvo_t.sum(1)
@@ -1218,10 +1319,13 @@ def _bwd_split_gla(q, k, v, wg, rg, ld, g, chunk=None, BG=16, nb_tile=None):
         dk_t = torch.empty_like(dq_t)
         dvo_t = torch.empty(B, nbt, L, BV, device=q.device, dtype=torch.float32)
         sS = (Sb.stride(0), Sb.stride(1), Sb.stride(2), Sb.stride(3), Sb.stride(4))
+        # GLA stays on FULL snapshots (KSNAP=1 → NSNAP==NCH, slot==t): the sanctioned fallback — the GLA
+        # grad kernels read by chunk t directly and the delicate decayed-dLam recompute is not needed.
+        # RLA carries the snapshot-granularity win (the dominant LM-scale backward memory).
         _scan_S[(B, nbt, ND_scan)](k, v, wg_s, ld_s, Sb, L, dqk, dv, nct, *sq, *sv, *sg, *sS,
-                                   USE_G=True, BT=chunk, BD=BK_scan, BVF=BV, BG=BG, NCH=NCH)
+                                   USE_G=True, BT=chunk, BD=BK_scan, BVF=BV, BG=BG, NCH=NCH, KSNAP=1)
         _scan_dS[(B, nbt, ND_scan)](q, rg_s, ld_s, g, dSa, L, dqk, dv, nct, *sq, *sg, *sgr, *sS,
-                                    USE_G=True, BT=chunk, BD=BK_scan, BVF=BV, BG=BG, NCH=NCH)
+                                    USE_G=True, BT=chunk, BD=BK_scan, BVF=BV, BG=BG, NCH=NCH, KSNAP=1)
         _par_grad_gla_qr[(B, nbt, NCH)](q, k, v, wg_s, rg_s, ld_s, g, Sb, dq_t, drg_s, dart_s, L, dqk, dv, nct,
                                         *sq, *sv, *sg, *sgr, *sS,
                                         dq_t.stride(0), dq_t.stride(1), dq_t.stride(2), dq_t.stride(3),
