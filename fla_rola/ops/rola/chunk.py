@@ -249,8 +249,8 @@ class _RoLARLAFn(torch.autograd.Function):
     @autocast_custom_bwd
     def backward(ctx, dO):
         q, k, v, wg, rg = ctx.saved_tensors
-        g = dO.float()
-        qf, kf, vf, wgf, rgf = (t.float() for t in (q, k, v, wg, rg))
+        g = dO
+        qf, kf, vf, wgf, rgf = q, k, v, wg, rg
         dq, dk, dvv, dw, dr = _bwd_split_rla(qf, kf, vf, wgf, rgf, g, chunk=_CHUNK)
         def cast(t): return t.to(q.dtype)
         return cast(dq), cast(dk), cast(dvv), cast(dw), cast(dr), None, None
@@ -491,11 +491,11 @@ def _scan_S(k_ptr, v_ptr, wg_ptr, ld_ptr, Sb_ptr, L, dqk, dv: tl.constexpr, nc,
             rows = t * BT + offs_t
             rmask = rows < L
             kc = tl.load(k_ptr + b*sq_b + rows[:, None]*sq_l + offs_d[None, :]
-                         * sq_d, mask=rmask[:, None] & dmask[None, :], other=0.0)
+                         * sq_d, mask=rmask[:, None] & dmask[None, :], other=0.0).to(tl.float32)
             vc = tl.load(v_ptr + b*sv_b + rows[:, None]*sv_l + offs_v[None, :]*sv_d,
-                         mask=rmask[:, None] & vmask[None, :], other=0.0)
+                         mask=rmask[:, None] & vmask[None, :], other=0.0).to(tl.float32)
             wgc = tl.load(wg_ptr + b*sg_b + rows[:, None]*sg_l + offs_c[None, :]
-                          * sg_c, mask=rmask[:, None] & cmask[None, :], other=0.0)
+                          * sg_c, mask=rmask[:, None] & cmask[None, :], other=0.0).to(tl.float32)
             tl.store(Sb_ptr + b*ssb_b + sb*ssb_n + t*ssb_t + offs_d[:, None]*ssb_d + offs_e[None, :]*ssb_e,
                      Sflat, mask=dmask[:, None])
             if USE_G:
@@ -541,11 +541,11 @@ def _scan_dS(q_ptr, rg_ptr, ld_ptr, g_ptr, dSa_ptr, L, dqk, dv: tl.constexpr, nc
             rows = t * BT + offs_t
             rmask = rows < L
             qc = tl.load(q_ptr + b*sq_b + rows[:, None]*sq_l + offs_d[None, :]
-                         * sq_d, mask=rmask[:, None] & dmask[None, :], other=0.0)
+                         * sq_d, mask=rmask[:, None] & dmask[None, :], other=0.0).to(tl.float32)
             rgc = tl.load(rg_ptr + b*sg_b + rows[:, None]*sg_l + offs_c[None, :]
-                          * sg_c, mask=rmask[:, None] & cmask[None, :], other=0.0)
+                          * sg_c, mask=rmask[:, None] & cmask[None, :], other=0.0).to(tl.float32)
             gc = tl.load(g_ptr + b*sgr_b + rows[:, None]*sgr_l + offs_v[None, :]
-                         * sgr_d, mask=rmask[:, None] & vmask[None, :], other=0.0)
+                         * sgr_d, mask=rmask[:, None] & vmask[None, :], other=0.0).to(tl.float32)
             tl.store(dSa_ptr + b*ssb_b + sb*ssb_n + t*ssb_t + offs_d[:, None]*ssb_d + offs_e[None, :]*ssb_e,
                      dS, mask=dmask[:, None])
             if USE_G:
@@ -588,8 +588,8 @@ def _par_grad_rla_qr(q_ptr, k_ptr, v_ptr, wg_ptr, rg_ptr, g_ptr, Sb_ptr, dq_ptr,
     cmask = offs_c < nc
     rows = t * BT + offs_t
     rmask = rows < L
-    rgc = tl.load(rg_ptr + b*sg_b + rows[:, None]*sg_l + offs_c[None, :]*sg_c, mask=rmask[:, None] & cmask[None, :], other=0.0)
-    wgc = tl.load(wg_ptr + b*sg_b + rows[:, None]*sg_l + offs_c[None, :]*sg_c, mask=rmask[:, None] & cmask[None, :], other=0.0)
+    rgc = tl.load(rg_ptr + b*sg_b + rows[:, None]*sg_l + offs_c[None, :]*sg_c, mask=rmask[:, None] & cmask[None, :], other=0.0).to(tl.float32)
+    wgc = tl.load(wg_ptr + b*sg_b + rows[:, None]*sg_l + offs_c[None, :]*sg_c, mask=rmask[:, None] & cmask[None, :], other=0.0).to(tl.float32)
     causal = (offs_t[:, None] >= offs_t[None, :]) & rmask[:, None] & rmask[None, :]
     Rg = tl.dot(rgc, tl.trans(wgc))
     if ND_V == 1:
@@ -597,9 +597,9 @@ def _par_grad_rla_qr(q_ptr, k_ptr, v_ptr, wg_ptr, rg_ptr, g_ptr, Sb_ptr, dq_ptr,
         offs_e = tl.arange(0, BG * BV)
         vmask = offs_v < dv
         v1 = tl.load(v_ptr + b*sv_b + rows[:, None]*sv_l + offs_v[None, :]*sv_d,
-                     mask=rmask[:, None] & vmask[None, :], other=0.0)
+                     mask=rmask[:, None] & vmask[None, :], other=0.0).to(tl.float32)
         gc = tl.load(g_ptr + b*sgr_b + rows[:, None]*sgr_l + offs_v[None, :]
-                     * sgr_d, mask=rmask[:, None] & vmask[None, :], other=0.0)
+                     * sgr_d, mask=rmask[:, None] & vmask[None, :], other=0.0).to(tl.float32)
         P = tl.dot(gc, tl.trans(v1))
         coef = causal * Rg * P                                          # dq_intra coefficient [BT,BT]
         rg_g = tl.reshape(rgc[:, :, None] * gc[:, None, :], [BT, BG * BV])
@@ -609,9 +609,9 @@ def _par_grad_rla_qr(q_ptr, k_ptr, v_ptr, wg_ptr, rg_ptr, g_ptr, Sb_ptr, dq_ptr,
             offs_d = d0b * BD + tl.arange(0, BD)
             dmask = offs_d < dqk
             qc = tl.load(q_ptr + b*sq_b + rows[:, None]*sq_l + offs_d[None, :]*sq_d,
-                         mask=rmask[:, None] & dmask[None, :], other=0.0)
+                         mask=rmask[:, None] & dmask[None, :], other=0.0).to(tl.float32)
             kc = tl.load(k_ptr + b*sq_b + rows[:, None]*sq_l + offs_d[None, :]*sq_d,
-                         mask=rmask[:, None] & dmask[None, :], other=0.0)
+                         mask=rmask[:, None] & dmask[None, :], other=0.0).to(tl.float32)
             Sb = tl.load(Sb_ptr + b*ssb_b + sb*ssb_n + t*ssb_t + offs_d[:, None]
                          * ssb_d + offs_e[None, :]*ssb_e, mask=dmask[:, None], other=0.0)
             dq_d = tl.dot(coef.to(kc.dtype), kc) + tl.dot(rg_g.to(Sb.dtype), tl.trans(Sb))
@@ -630,9 +630,9 @@ def _par_grad_rla_qr(q_ptr, k_ptr, v_ptr, wg_ptr, rg_ptr, g_ptr, Sb_ptr, dq_ptr,
             offs_v = vb * BV + tl.arange(0, BV)
             vm = offs_v < dv
             v1 = tl.load(v_ptr + b*sv_b + rows[:, None]*sv_l + offs_v[None, :]*sv_d,
-                         mask=rmask[:, None] & vm[None, :], other=0.0)
+                         mask=rmask[:, None] & vm[None, :], other=0.0).to(tl.float32)
             gv = tl.load(g_ptr + b*sgr_b + rows[:, None]*sgr_l + offs_v[None, :]*sgr_d,
-                         mask=rmask[:, None] & vm[None, :], other=0.0)
+                         mask=rmask[:, None] & vm[None, :], other=0.0).to(tl.float32)
             P += tl.dot(gv, tl.trans(v1))
         coef = causal * Rg * P
         # Phase 2: dq = intra (coef·k) + inter (Σ_vb rg_g_vb · Sb_vbᵀ, value-summed); also accumulate G.
@@ -641,15 +641,15 @@ def _par_grad_rla_qr(q_ptr, k_ptr, v_ptr, wg_ptr, rg_ptr, g_ptr, Sb_ptr, dq_ptr,
             offs_d = d0b * BD + tl.arange(0, BD)
             dmask = offs_d < dqk
             qc = tl.load(q_ptr + b*sq_b + rows[:, None]*sq_l + offs_d[None, :]*sq_d,
-                         mask=rmask[:, None] & dmask[None, :], other=0.0)
+                         mask=rmask[:, None] & dmask[None, :], other=0.0).to(tl.float32)
             kc = tl.load(k_ptr + b*sq_b + rows[:, None]*sq_l + offs_d[None, :]*sq_d,
-                         mask=rmask[:, None] & dmask[None, :], other=0.0)
+                         mask=rmask[:, None] & dmask[None, :], other=0.0).to(tl.float32)
             dq_d = tl.dot(coef.to(kc.dtype), kc)
             for vb in range(ND_V):
                 offs_v = vb * BV + tl.arange(0, BV)
                 vm = offs_v < dv
                 gv = tl.load(g_ptr + b*sgr_b + rows[:, None]*sgr_l + offs_v[None, :]*sgr_d,
-                             mask=rmask[:, None] & vm[None, :], other=0.0)
+                             mask=rmask[:, None] & vm[None, :], other=0.0).to(tl.float32)
                 rg_g = tl.reshape(rgc[:, :, None] * gv[:, None, :], [BT, BG * BV])
                 offs_e = tl.reshape(offs_g[:, None] * BVF + offs_v[None, :], [BG * BV])
                 Sb = tl.load(Sb_ptr + b*ssb_b + sb*ssb_n + t*ssb_t + offs_d[:, None]
@@ -665,14 +665,14 @@ def _par_grad_rla_qr(q_ptr, k_ptr, v_ptr, wg_ptr, rg_ptr, g_ptr, Sb_ptr, dq_ptr,
             offs_v = vb * BV + tl.arange(0, BV)
             vm = offs_v < dv
             gv = tl.load(g_ptr + b*sgr_b + rows[:, None]*sgr_l + offs_v[None, :]*sgr_d,
-                         mask=rmask[:, None] & vm[None, :], other=0.0)
+                         mask=rmask[:, None] & vm[None, :], other=0.0).to(tl.float32)
             offs_e = tl.reshape(offs_g[:, None] * BVF + offs_v[None, :], [BG * BV])
             QS = tl.zeros([BT, BG * BV], dtype=tl.float32)
             for d0b in range(ND):
                 offs_d = d0b * BD + tl.arange(0, BD)
                 dmask = offs_d < dqk
                 qc = tl.load(q_ptr + b*sq_b + rows[:, None]*sq_l + offs_d[None, :]*sq_d,
-                             mask=rmask[:, None] & dmask[None, :], other=0.0)
+                             mask=rmask[:, None] & dmask[None, :], other=0.0).to(tl.float32)
                 Sb = tl.load(Sb_ptr + b*ssb_b + sb*ssb_n + t*ssb_t + offs_d[:, None]
                              * ssb_d + offs_e[None, :]*ssb_e, mask=dmask[:, None], other=0.0)
                 QS += tl.dot(qc, Sb.to(qc.dtype))
@@ -705,8 +705,8 @@ def _par_grad_rla_kwv(q_ptr, k_ptr, v_ptr, wg_ptr, rg_ptr, g_ptr, dSa_ptr, dk_pt
     cmask = offs_c < nc
     rows = t * BT + offs_t
     rmask = rows < L
-    rgc = tl.load(rg_ptr + b*sg_b + rows[:, None]*sg_l + offs_c[None, :]*sg_c, mask=rmask[:, None] & cmask[None, :], other=0.0)
-    wgc = tl.load(wg_ptr + b*sg_b + rows[:, None]*sg_l + offs_c[None, :]*sg_c, mask=rmask[:, None] & cmask[None, :], other=0.0)
+    rgc = tl.load(rg_ptr + b*sg_b + rows[:, None]*sg_l + offs_c[None, :]*sg_c, mask=rmask[:, None] & cmask[None, :], other=0.0).to(tl.float32)
+    wgc = tl.load(wg_ptr + b*sg_b + rows[:, None]*sg_l + offs_c[None, :]*sg_c, mask=rmask[:, None] & cmask[None, :], other=0.0).to(tl.float32)
     causal = (offs_t[:, None] >= offs_t[None, :]) & rmask[:, None] & rmask[None, :]
     Rg = tl.dot(rgc, tl.trans(wgc))
     if ND_V == 1:
@@ -714,9 +714,9 @@ def _par_grad_rla_kwv(q_ptr, k_ptr, v_ptr, wg_ptr, rg_ptr, g_ptr, dSa_ptr, dk_pt
         offs_e = tl.arange(0, BG * BV)
         vmask = offs_v < dv
         v1 = tl.load(v_ptr + b*sv_b + rows[:, None]*sv_l + offs_v[None, :]*sv_d,
-                     mask=rmask[:, None] & vmask[None, :], other=0.0)
+                     mask=rmask[:, None] & vmask[None, :], other=0.0).to(tl.float32)
         gc = tl.load(g_ptr + b*sgr_b + rows[:, None]*sgr_l + offs_v[None, :]
-                     * sgr_d, mask=rmask[:, None] & vmask[None, :], other=0.0)
+                     * sgr_d, mask=rmask[:, None] & vmask[None, :], other=0.0).to(tl.float32)
         P = tl.dot(gc, tl.trans(v1))
         A2 = Rg * P * causal                                            # dk_intra coef [BT,BT]
         wg_v1 = tl.reshape(wgc[:, :, None] * v1[:, None, :], [BT, BG * BV])
@@ -726,9 +726,9 @@ def _par_grad_rla_kwv(q_ptr, k_ptr, v_ptr, wg_ptr, rg_ptr, g_ptr, dSa_ptr, dk_pt
             offs_d = d0b * BD + tl.arange(0, BD)
             dmask = offs_d < dqk
             qc = tl.load(q_ptr + b*sq_b + rows[:, None]*sq_l + offs_d[None, :]*sq_d,
-                         mask=rmask[:, None] & dmask[None, :], other=0.0)
+                         mask=rmask[:, None] & dmask[None, :], other=0.0).to(tl.float32)
             kc = tl.load(k_ptr + b*sq_b + rows[:, None]*sq_l + offs_d[None, :]*sq_d,
-                         mask=rmask[:, None] & dmask[None, :], other=0.0)
+                         mask=rmask[:, None] & dmask[None, :], other=0.0).to(tl.float32)
             dSa = tl.load(dSa_ptr + b*ssb_b + sb*ssb_n + t*ssb_t +
                           offs_d[:, None]*ssb_d + offs_e[None, :]*ssb_e, mask=dmask[:, None], other=0.0)
             dk_d = tl.dot(tl.trans(A2).to(qc.dtype), qc) + tl.dot(wg_v1.to(dSa.dtype), tl.trans(dSa))
@@ -754,9 +754,9 @@ def _par_grad_rla_kwv(q_ptr, k_ptr, v_ptr, wg_ptr, rg_ptr, g_ptr, dSa_ptr, dk_pt
             offs_v = vb * BV + tl.arange(0, BV)
             vm = offs_v < dv
             v1 = tl.load(v_ptr + b*sv_b + rows[:, None]*sv_l + offs_v[None, :]*sv_d,
-                         mask=rmask[:, None] & vm[None, :], other=0.0)
+                         mask=rmask[:, None] & vm[None, :], other=0.0).to(tl.float32)
             gv = tl.load(g_ptr + b*sgr_b + rows[:, None]*sgr_l + offs_v[None, :]*sgr_d,
-                         mask=rmask[:, None] & vm[None, :], other=0.0)
+                         mask=rmask[:, None] & vm[None, :], other=0.0).to(tl.float32)
             P += tl.dot(gv, tl.trans(v1))
         A2 = Rg * P * causal
         # Phase 2: dk = intra (A2ᵀ·q) + inter (Σ_vb wg_v1_vb · dSa_vbᵀ); accumulate G.
@@ -765,15 +765,15 @@ def _par_grad_rla_kwv(q_ptr, k_ptr, v_ptr, wg_ptr, rg_ptr, g_ptr, dSa_ptr, dk_pt
             offs_d = d0b * BD + tl.arange(0, BD)
             dmask = offs_d < dqk
             qc = tl.load(q_ptr + b*sq_b + rows[:, None]*sq_l + offs_d[None, :]*sq_d,
-                         mask=rmask[:, None] & dmask[None, :], other=0.0)
+                         mask=rmask[:, None] & dmask[None, :], other=0.0).to(tl.float32)
             kc = tl.load(k_ptr + b*sq_b + rows[:, None]*sq_l + offs_d[None, :]*sq_d,
-                         mask=rmask[:, None] & dmask[None, :], other=0.0)
+                         mask=rmask[:, None] & dmask[None, :], other=0.0).to(tl.float32)
             dk_d = tl.dot(tl.trans(A2).to(qc.dtype), qc)
             for vb in range(ND_V):
                 offs_v = vb * BV + tl.arange(0, BV)
                 vm = offs_v < dv
                 v1 = tl.load(v_ptr + b*sv_b + rows[:, None]*sv_l + offs_v[None, :]*sv_d,
-                             mask=rmask[:, None] & vm[None, :], other=0.0)
+                             mask=rmask[:, None] & vm[None, :], other=0.0).to(tl.float32)
                 wg_v1 = tl.reshape(wgc[:, :, None] * v1[:, None, :], [BT, BG * BV])
                 offs_e = tl.reshape(offs_g[:, None] * BVF + offs_v[None, :], [BG * BV])
                 dSa = tl.load(dSa_ptr + b*ssb_b + sb*ssb_n + t*ssb_t +
@@ -791,16 +791,16 @@ def _par_grad_rla_kwv(q_ptr, k_ptr, v_ptr, wg_ptr, rg_ptr, g_ptr, dSa_ptr, dk_pt
             offs_v = vb * BV + tl.arange(0, BV)
             vm = offs_v < dv
             v1 = tl.load(v_ptr + b*sv_b + rows[:, None]*sv_l + offs_v[None, :]*sv_d,
-                         mask=rmask[:, None] & vm[None, :], other=0.0)
+                         mask=rmask[:, None] & vm[None, :], other=0.0).to(tl.float32)
             gv = tl.load(g_ptr + b*sgr_b + rows[:, None]*sgr_l + offs_v[None, :]*sgr_d,
-                         mask=rmask[:, None] & vm[None, :], other=0.0)
+                         mask=rmask[:, None] & vm[None, :], other=0.0).to(tl.float32)
             offs_e = tl.reshape(offs_g[:, None] * BVF + offs_v[None, :], [BG * BV])
             KS = tl.zeros([BT, BG * BV], dtype=tl.float32)
             for d0b in range(ND):
                 offs_d = d0b * BD + tl.arange(0, BD)
                 dmask = offs_d < dqk
                 kc = tl.load(k_ptr + b*sq_b + rows[:, None]*sq_l + offs_d[None, :]*sq_d,
-                             mask=rmask[:, None] & dmask[None, :], other=0.0)
+                             mask=rmask[:, None] & dmask[None, :], other=0.0).to(tl.float32)
                 dSa = tl.load(dSa_ptr + b*ssb_b + sb*ssb_n + t*ssb_t +
                               offs_d[:, None]*ssb_d + offs_e[None, :]*ssb_e, mask=dmask[:, None], other=0.0)
                 KS += tl.dot(kc, dSa.to(kc.dtype))
