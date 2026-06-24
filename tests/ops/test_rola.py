@@ -1154,3 +1154,79 @@ def test_gla_compile_grad_noise(norm):
     grads = [rel(a, b) for a, b in zip(gc, ge)]
     assert rel(oc, oe) < 5e-3, f'{norm} fwd noise {rel(oc, oe):.2e}'
     assert max(grads) < 5e-3, f'{norm} grad noise {grads}'
+
+
+# ============================================================================
+# V1 (#30): GLA in-kernel-routed numerator forward — the [L,nc]-free fused routed GLA. The decayed
+# routed forward (`_routed_fwd_tiled(ld=...)`) matches the naive GLA oracle on tree-materialized gates
+# (rel at the GLA fp32 decay floor), flat/square/tree, and never allocates a [*,L,nc] routed-gate buffer
+# (ld is an INPUT, not an allocation). USE_G=False (ld=None) is byte-identical to the RLA routed fwd.
+# ============================================================================
+@pytest.mark.parametrize('D,b', [(1, 16), (2, 4), (4, 2)])
+def test_gla_routed_fwd_faithful(D, b):
+    """Routed GLA numerator forward == naive_rola_gla oracle (on the tree-materialized gates), the
+    [L,nc]-free fused readout faithful to the explicit-gate math. flat/square/tree."""
+    if device != 'cuda':
+        pytest.skip('RoLA Triton kernels require CUDA')
+    from fla_rola.ops.rola.naive import naive_rola_gla
+    nc = b ** D
+    BH, L, dqk, dv, dm = 2, 64, 16, 32, 24
+    g_ = torch.Generator(device=device).manual_seed(0)
+
+    def mk(*s, f=False):
+        x = torch.randn(*s, device=device, generator=g_)
+        return torch.nn.functional.elu(x) + 1.0 if f else x
+    q, k = mk(BH, L, dqk, f=True), mk(BH, L, dqk, f=True)
+    v, h = mk(BH, L, dv), mk(BH, L, dm)
+    Wr = torch.randn(D, dm, b, device=device, generator=g_) * 0.4
+    Ww = torch.randn(D, dm, b, device=device, generator=g_) * 0.4
+    ld = (-torch.rand(BH, L, nc, device=device, generator=g_) * 0.5).clamp(min=-2.5)
+    sel = C._build_sel(D, b, nc, device)
+    o_routed = C._routed_fwd_tiled(q, k, v, h, Wr, Ww, D, b, sel, chunk=L, BG=16, ld=ld)
+    r, w = C._tree_gates_torch(h, Wr, Ww, D, b)
+
+    def unf(t):
+        return t.view(BH, L, 1, -1)
+    o_naive = naive_rola_gla(unf(q), unf(k), unf(v), unf(w), unf(r), unf(ld), normalized=False).view(BH, L, dv)
+    rel = ((o_routed - o_naive).norm() / (o_naive.norm() + 1e-9)).item()
+    assert rel < 1e-2, f'D={D} b={b} routed-GLA-fwd vs naive rel {rel:.2e}'
+
+
+def test_gla_routed_fwd_no_LNC_materialization():
+    """The fused routed GLA numerator never allocates a [*,L,nc] routed read/write GATE buffer (ld is a
+    passed INPUT, not an allocation). d_model != nc != L so any [*,L,nc] alloc is unambiguous."""
+    if device != 'cuda':
+        pytest.skip('RoLA Triton kernels require CUDA')
+    D, b, nc = 2, 3, 9
+    BH, L, dqk, dv, dm = 2, 96, 16, 24, 40
+    g_ = torch.Generator(device=device).manual_seed(0)
+
+    def mk(*s, f=False):
+        x = torch.randn(*s, device=device, generator=g_)
+        return torch.nn.functional.elu(x) + 1.0 if f else x
+    q, k = mk(BH, L, dqk, f=True), mk(BH, L, dqk, f=True)
+    v, h = mk(BH, L, dv), mk(BH, L, dm)
+    Wr = torch.randn(D, dm, b, device=device, generator=g_) * 0.4
+    Ww = torch.randn(D, dm, b, device=device, generator=g_) * 0.4
+    ld = (-torch.rand(BH, L, nc, device=device, generator=g_) * 0.5).clamp(min=-2.5)
+    sel = C._build_sel(D, b, nc, device)
+    # warm the kernel (cold Triton autotune itself calls torch.empty for its bench buffers) BEFORE the
+    # allocation watch, so the watch only sees the steady-state launch's buffers.
+    C._routed_fwd_tiled(q, k, v, h, Wr, Ww, D, b, sel, chunk=32, BG=16, ld=ld)
+    hits = []
+    real_zeros, real_empty = torch.zeros, torch.empty
+
+    def watch(fn):
+        def w(*a, **kw):
+            t = fn(*a, **kw)
+            sh = tuple(t.shape)
+            if L in sh and nc in sh:
+                hits.append(sh)
+            return t
+        return w
+    torch.zeros, torch.empty = watch(real_zeros), watch(real_empty)
+    try:
+        C._routed_fwd_tiled(q, k, v, h, Wr, Ww, D, b, sel, chunk=32, BG=16, ld=ld)
+    finally:
+        torch.zeros, torch.empty = real_zeros, real_empty
+    assert not hits, f'[*,L={L},nc={nc}] routed-gate buffer(s) materialized: {hits}'
