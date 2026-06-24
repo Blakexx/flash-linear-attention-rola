@@ -52,6 +52,20 @@ def _is_called_from_fla():
     return False
 
 
+def _poison(result):
+    """Fill a scratch tensor with NaN. Skip requires_grad leaves: inductor's lazy init (e.g. pad_mm)
+    allocates grad-leaf scratch via torch.empty, and an in-place fill_ on a leaf-that-requires-grad
+    raises — so with torch.compile defaulted on, poisoning those would break compilation, not catch a
+    real uninitialized-read bug. (Those tensors are inductor's, not fla buffers.)"""
+    if result.requires_grad:
+        return result
+    if result.is_floating_point():
+        result.fill_(float('nan'))
+    elif result.is_complex():
+        result.fill_(complex(float('nan'), float('nan')))
+    return result
+
+
 def _guarded_empty(*args, **kwargs):
     """Create a tensor filled with NaN instead of uninitialized values."""
     dtype = kwargs.get('dtype') or torch.get_default_dtype()
@@ -62,14 +76,7 @@ def _guarded_empty(*args, **kwargs):
     if is_compiling() or not _is_called_from_fla():
         return _ORIGINAL_EMPTY(*args, **kwargs)
 
-    result = _ORIGINAL_EMPTY(*args, **kwargs)
-
-    if result.is_floating_point():
-        result.fill_(float('nan'))
-    elif result.is_complex():
-        result.fill_(complex(float('nan'), float('nan')))
-
-    return result
+    return _poison(_ORIGINAL_EMPTY(*args, **kwargs))
 
 
 def _guarded_empty_like(input, **kwargs):
@@ -84,14 +91,7 @@ def _guarded_empty_like(input, **kwargs):
     if not (dtype.is_floating_point or dtype.is_complex):
         return _ORIGINAL_EMPTY_LIKE(input, **kwargs)
 
-    result = _ORIGINAL_EMPTY_LIKE(input, **kwargs)
-
-    if result.is_floating_point():
-        result.fill_(float('nan'))
-    elif result.is_complex():
-        result.fill_(complex(float('nan'), float('nan')))
-
-    return result
+    return _poison(_ORIGINAL_EMPTY_LIKE(input, **kwargs))
 
 
 def _guarded_new_empty(self, *args, **kwargs):
@@ -106,14 +106,7 @@ def _guarded_new_empty(self, *args, **kwargs):
     if not (dtype.is_floating_point or dtype.is_complex):
         return _ORIGINAL_NEW_EMPTY(self, *args, **kwargs)
 
-    result = _ORIGINAL_NEW_EMPTY(self, *args, **kwargs)
-
-    if result.is_floating_point():
-        result.fill_(float('nan'))
-    elif result.is_complex():
-        result.fill_(complex(float('nan'), float('nan')))
-
-    return result
+    return _poison(_ORIGINAL_NEW_EMPTY(self, *args, **kwargs))
 
 
 @pytest.fixture(scope="function", autouse=True)
