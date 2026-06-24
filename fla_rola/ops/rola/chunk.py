@@ -820,13 +820,19 @@ def rola_rla_routed_triton(q, k, v, h, Wr, Ww, D, b, chunk=None, BG=16):
 
 
 @triton.jit
-def _kappa_rescale(r_tile, d_tile, kap, cmask, PER_STATE: tl.constexpr, EPS: tl.constexpr):
-    """r_tilde = r*(d+eps)^(-kappa) (kappa) | r/(d+eps) (per_state). Transient [BT,BC]."""
-    de = d_tile + EPS
-    if PER_STATE:
-        rt = r_tile / de
+def _kappa_rescale(r_tile, d_tile, kap, cmask, GLOBAL: tl.constexpr,
+                   PER_STATE: tl.constexpr, EPS: tl.constexpr):
+    """r_tilde = r (global) | r/(d+eps) (per_state) | r*(d+eps)^(-kappa) (kappa). Transient [BT,BC].
+    `global` is `kappa` without the rescale — the den D_i=Σ_c r^c d^c is still reduced over c by the
+    caller; only the per-state read-gate rescale is skipped."""
+    if GLOBAL:
+        rt = r_tile
     else:
-        rt = r_tile * tl.exp(-kap[:, None] * tl.log(de))
+        de = d_tile + EPS
+        if PER_STATE:
+            rt = r_tile / de
+        else:
+            rt = r_tile * tl.exp(-kap[:, None] * tl.log(de))
     return tl.where(cmask[None, :], rt, 0.0)
 
 
@@ -838,11 +844,11 @@ def _kappa_fwd_chunk(h_ptr, q_ptr, k_ptr, v_ptr, wr_ptr, ww_ptr, sel_ptr, kap_pt
                      swr_lvl, swr_d, swr_b, sww_lvl, sww_d, sww_b, ssel_lvl, ssel_b, ssel_c,
                      ssv_b, ssv_c, ssv_k, ssv_v, ssd_b, ssd_c, ssd_k,
                      snm_b, snm_l, snm_v, sdn_b, sdn_l,
-                     PER_STATE: tl.constexpr, EPS: tl.constexpr,
+                     GLOBAL: tl.constexpr, PER_STATE: tl.constexpr, EPS: tl.constexpr,
                      D: tl.constexpr, b: tl.constexpr, BB: tl.constexpr,
                      BT: tl.constexpr, BK: tl.constexpr, BV: tl.constexpr, BD: tl.constexpr,
                      BC: tl.constexpr, NCBLK: tl.constexpr, ND: tl.constexpr, NDM: tl.constexpr):
-    """Fused kappa/per_state chunk: builds r,w,d,r_tilde transiently per nc-block, accumulates num +
+    """Fused global/kappa/per_state chunk: builds r,w,d,r_tilde transiently per nc-block, accumulates num +
     den, carries Sval[k,v] AND Sden[k] across chunks. One program per batch. Mirrors the proto chunk
     kernel + the den pre-pass, with the read gate rescaled by the transient per-state den."""
     pid_b = tl.program_id(0)
@@ -882,7 +888,7 @@ def _kappa_fwd_chunk(h_ptr, q_ptr, k_ptr, v_ptr, wr_ptr, ww_ptr, sel_ptr, kap_pt
         d_inter = tl.dot(qc, tl.trans(sden2).to(qc.dtype))                          # [BT,BC]
         d_intra = tl.dot((G * causal).to(w_tile.dtype), w_tile)
         d_tile = tl.where(cmask[None, :], d_intra + d_inter, 0.0)
-        rt_tile = _kappa_rescale(r_tile, d_tile, kap, cmask, PER_STATE, EPS)
+        rt_tile = _kappa_rescale(r_tile, d_tile, kap, cmask, GLOBAL, PER_STATE, EPS)
         # numerator intra: A = G⊙(r̃·wᵀ)⊙causal; o_num += A·v.
         Rg = tl.dot(rt_tile, tl.trans(w_tile))
         A = G * Rg * causal
@@ -905,8 +911,8 @@ def _kappa_fwd_chunk(h_ptr, q_ptr, k_ptr, v_ptr, wr_ptr, ww_ptr, sel_ptr, kap_pt
     tl.store(den_ptr + pid_b*sdn_b + rows*sdn_l, o_den, mask=rmask)
 
 
-def _kappa_routed_fwd(q, k, v, h, Wr, Ww, kap, D, b, sel, chunk, per_state, eps):
-    """Fused kappa/per_state tree-routed forward. Returns (num[B,L,BV], den[B,L]) and the per-chunk
+def _kappa_routed_fwd(q, k, v, h, Wr, Ww, kap, D, b, sel, chunk, global_norm, per_state, eps):
+    """Fused global/kappa/per_state tree-routed forward. Returns (num[B,L,BV], den[B,L]) and the per-chunk
     pre-state snapshots (Sval, Sden) the backward needs. No [L,nc] gate/den/r̃ buffer is allocated."""
     B, L, dqk = q.shape
     dv = v.shape[-1]
@@ -927,8 +933,8 @@ def _kappa_routed_fwd(q, k, v, h, Wr, Ww, kap, D, b, sel, chunk, per_state, eps)
     den = torch.zeros(B, L, device=q.device, dtype=torch.float32)
     snap_val = torch.zeros(B, NCH, nc, dqk, dv, device=q.device, dtype=torch.float32)
     snap_den = torch.zeros(B, NCH, nc, dqk, device=q.device, dtype=torch.float32)
-    common = dict(PER_STATE=per_state, EPS=eps, D=D, b=b, BB=BB, BT=chunk, BK=BK, BV=BV, BD=BD,
-                  BC=BC, NCBLK=NCBLK, ND=ND, NDM=NDM, num_warps=4, num_stages=1)
+    common = dict(GLOBAL=global_norm, PER_STATE=per_state, EPS=eps, D=D, b=b, BB=BB, BT=chunk,
+                  BK=BK, BV=BV, BD=BD, BC=BC, NCBLK=NCBLK, ND=ND, NDM=NDM, num_warps=4, num_stages=1)
     for c in range(NCH):
         snap_val[:, c].copy_(Sval)
         snap_den[:, c].copy_(Sden)
@@ -948,9 +954,15 @@ def _kappa_routed_fwd(q, k, v, h, Wr, Ww, kap, D, b, sel, chunk, per_state, eps)
 
 @triton.jit
 def _kappa_rescale_bwd(drt_tile, r_tile, d_tile, kap, cmask,
-                       PER_STATE: tl.constexpr, EPS: tl.constexpr):
+                       GLOBAL: tl.constexpr, PER_STATE: tl.constexpr, EPS: tl.constexpr):
     """Backprop r_tilde = rescale(r, d, kappa). Given d(r_tilde) returns d(r), d(d), and the per-token
-    d(kappa) contribution (summed over c). r_tilde = r*(d+eps)^(-kappa) | r/(d+eps). Transient."""
+    d(kappa) contribution (summed over c). r_tilde = r (global) | r/(d+eps) (per_state) |
+    r*(d+eps)^(-kappa) (kappa). global: r_tilde=r so dr=drt, dd=0, dkap=0 (no rescale path)."""
+    if GLOBAL:
+        dr = tl.where(cmask[None, :], drt_tile, 0.0)
+        dd = dr * 0.0
+        dkap = tl.zeros([drt_tile.shape[0]], dtype=tl.float32)
+        return dr, dd, dkap
     de = d_tile + EPS
     if PER_STATE:
         inv = 1.0 / de
@@ -1037,7 +1049,7 @@ def _kappa_bwd_read(h_ptr, q_ptr, k_ptr, v_ptr, wr_ptr, ww_ptr, sel_ptr, kap_ptr
                     swr_lvl, swr_d, swr_b, sww_lvl, sww_d, sww_b, ssel_lvl, ssel_b, ssel_c,
                     ssv_b, ssv_k, ssv_v, ssd_b, ssd_k,
                     sdo_b, sdo_l, sdo_v, sdd_b, sdd_l, sgd_b, sgd_t, sgd_c,
-                    PER_STATE: tl.constexpr, EPS: tl.constexpr,
+                    GLOBAL: tl.constexpr, PER_STATE: tl.constexpr, EPS: tl.constexpr,
                     D: tl.constexpr, b: tl.constexpr, BB: tl.constexpr,
                     BT: tl.constexpr, BK: tl.constexpr, BV: tl.constexpr, BD: tl.constexpr,
                     BC: tl.constexpr, NCBLK: tl.constexpr, ND: tl.constexpr, NDM: tl.constexpr):
@@ -1090,11 +1102,7 @@ def _kappa_bwd_read(h_ptr, q_ptr, k_ptr, v_ptr, wr_ptr, ww_ptr, sel_ptr, kap_ptr
         d_inter = tl.dot(qc, tl.trans(sden2).to(qc.dtype))
         d_intra = tl.dot((G * causal).to(w_tile.dtype), w_tile)
         d_tile = tl.where(cmask[None, :], d_intra + d_inter, 0.0)
-        de = d_tile + EPS
-        if PER_STATE:
-            rt_tile = tl.where(cmask[None, :], r_tile / de, 0.0)
-        else:
-            rt_tile = tl.where(cmask[None, :], r_tile * tl.exp(-kap[:, None] * tl.log(de)), 0.0)
+        rt_tile = _kappa_rescale(r_tile, d_tile, kap, cmask, GLOBAL, PER_STATE, EPS)
         drt = dden[:, None] * d_tile          # d(r_tilde) from den
         dd = dden[:, None] * rt_tile          # d(d) from den
         # num intra: A=G*Rg*causal ; o_num += A v.  dA = (dnum@v^T)⊙causal.
@@ -1117,7 +1125,8 @@ def _kappa_bwd_read(h_ptr, q_ptr, k_ptr, v_ptr, wr_ptr, ww_ptr, sel_ptr, kap_ptr
         tl.store(dsval_ptr + pid_b*ssv_b + ck[:, None]*ssv_k + offs_v[None, :]*ssv_v,
                  dSval + tl.dot(tl.trans(rq).to(dnum.dtype), dnum), mask=ckmask[:, None] & vmask[None, :])
         # rescale bwd.
-        dr_resc, dd_resc, dkap_c = _kappa_rescale_bwd(drt, r_tile, d_tile, kap, cmask, PER_STATE, EPS)
+        dr_resc, dd_resc, dkap_c = _kappa_rescale_bwd(drt, r_tile, d_tile, kap, cmask,
+                                                      GLOBAL, PER_STATE, EPS)
         dd += dd_resc
         dkap_acc += dkap_c
         # d bwd: d = (G*causal) w + q.Sden_j.
@@ -1143,8 +1152,8 @@ def _kappa_bwd_read(h_ptr, q_ptr, k_ptr, v_ptr, wr_ptr, ww_ptr, sel_ptr, kap_ptr
 
 
 def _kappa_routed_bwd(q, k, v, h, Wr, Ww, kap, snap_val, snap_den, dnum, dden,
-                      D, b, sel, chunk, per_state, eps):
-    """Reverse chunk-scan backward for the fused kappa/per_state path. Carries dSval,dSden adjoints;
+                      D, b, sel, chunk, global_norm, per_state, eps):
+    """Reverse chunk-scan backward for the fused global/kappa/per_state path. Carries dSval,dSden adjoints;
     recomputes r,w,d,r_tilde transiently per chunk; folds the [BT,nc] gate-grads into dWr,dWw,dh.
     Returns dq,dk,dv,dh,dWr,dWw,dkappa (all fp32). No [L,nc] buffer is ever allocated."""
     B, L, d_model = h.shape
@@ -1188,8 +1197,9 @@ def _kappa_routed_bwd(q, k, v, h, Wr, Ww, kap, snap_val, snap_den, dnum, dden,
     sGD = (gdr.stride(0), gdr.stride(1), gdr.stride(2))
     state_common = dict(D=D, b=b, BB=BB, BT=chunk, BK=BK, BV=BV, BD=BD, BC=BC, NCBLK=NCBLK, NDM=NDM,
                         num_warps=4, num_stages=1)
-    read_common = dict(PER_STATE=per_state, EPS=eps, D=D, b=b, BB=BB, BT=chunk, BK=BK, BV=BV, BD=BD,
-                       BC=BC, NCBLK=NCBLK, ND=ND, NDM=NDM, num_warps=4, num_stages=1)
+    read_common = dict(GLOBAL=global_norm, PER_STATE=per_state, EPS=eps, D=D, b=b, BB=BB, BT=chunk,
+                       BK=BK, BV=BV, BD=BD, BC=BC, NCBLK=NCBLK, ND=ND, NDM=NDM,
+                       num_warps=4, num_stages=1)
     fold_common = dict(D=D, b=b, BB=BB, BT=chunk, BC=BC, BD=BD, NCBLK=NCBLK, NDM=NDM,
                        num_warps=4, num_stages=1)
     for c in reversed(range(NCH)):
@@ -1227,14 +1237,16 @@ class _RoLARoutedKappaFn(torch.autograd.Function):
     @staticmethod
     @input_guard
     @autocast_custom_fwd
-    def forward(ctx, q, k, v, h, Wr, Ww, kap, D, b, chunk, per_state, eps):
+    def forward(ctx, q, k, v, h, Wr, Ww, kap, D, b, chunk, global_norm, per_state, eps):
         chunk = _CHUNK_FWD if chunk is None else min(chunk, _CHUNK_FWD)
         nc = b ** D
         sel = _build_sel(D, b, nc, q.device)
         q, k, v, h, Wr, Ww, kap = (x.contiguous() for x in (q, k, v, h, Wr, Ww, kap))
-        num, den, _sv, _sd = _kappa_routed_fwd(q, k, v, h, Wr, Ww, kap, D, b, sel, chunk, per_state, eps)
+        num, den, _sv, _sd = _kappa_routed_fwd(q, k, v, h, Wr, Ww, kap, D, b, sel, chunk,
+                                               global_norm, per_state, eps)
         ctx.save_for_backward(q, k, v, h, Wr, Ww, kap)
-        ctx.D, ctx.b, ctx.chunk, ctx.per_state, ctx.eps = D, b, chunk, per_state, eps
+        ctx.D, ctx.b, ctx.chunk = D, b, chunk
+        ctx.global_norm, ctx.per_state, ctx.eps = global_norm, per_state, eps
         return num.to(q.dtype), den.to(q.dtype)
 
     @staticmethod
@@ -1242,7 +1254,8 @@ class _RoLARoutedKappaFn(torch.autograd.Function):
     @autocast_custom_bwd
     def backward(ctx, dnum, dden):
         q, k, v, h, Wr, Ww, kap = ctx.saved_tensors
-        D, b, chunk, per_state, eps = ctx.D, ctx.b, ctx.chunk, ctx.per_state, ctx.eps
+        D, b, chunk = ctx.D, ctx.b, ctx.chunk
+        global_norm, per_state, eps = ctx.global_norm, ctx.per_state, ctx.eps
         # recompute the per-chunk pre-state snapshots (fp-parity with the fwd scan). The backward runs
         # fp32 operands (deep-Hadamard jacobian precision floor) → ~2x SMEM vs the bf16 fwd, so cap the
         # backward chunk at _CHUNK (the all-backwards device constant); the chunked scan is chunk-size
@@ -1255,21 +1268,22 @@ class _RoLARoutedKappaFn(torch.autograd.Function):
         chunk = min(chunk, _KAPPA_BWD_CHUNK)
         q, k, v, h, Wr, Ww, kap = (x.float().contiguous() for x in (q, k, v, h, Wr, Ww, kap))
         _num, _den, snap_val, snap_den = _kappa_routed_fwd(
-            q, k, v, h, Wr, Ww, kap, D, b, sel, chunk, per_state, eps)
+            q, k, v, h, Wr, Ww, kap, D, b, sel, chunk, global_norm, per_state, eps)
         dq, dk, dv, dh, dWr, dWw, dkap = _kappa_routed_bwd(
             q, k, v, h, Wr, Ww, kap, snap_val, snap_den, dnum.float(), dden.float(),
-            D, b, sel, chunk, per_state, eps)
+            D, b, sel, chunk, global_norm, per_state, eps)
         q0 = ctx.saved_tensors[0]
         return (dq.to(q0.dtype), dk.to(q0.dtype), dv.to(q0.dtype), dh.to(q0.dtype),
                 dWr.to(Wr.dtype), dWw.to(Ww.dtype), dkap.to(q0.dtype),
-                None, None, None, None, None)
+                None, None, None, None, None, None)
 
 
-def _kappa_routed_readout(qf, kf, vf, hf, Wr, Ww, kapf, D, b, chunk_size, per_state, eps):
-    """Fused kappa/per_state tree-routed readout returning (num[BH,L,V], den[BH,L,1]), differentiable.
-    kapf:[BH,L,1]. CUDA only (the eager fallback stays in the public entry)."""
+def _kappa_routed_readout(qf, kf, vf, hf, Wr, Ww, kapf, D, b, chunk_size, global_norm, per_state, eps):
+    """Fused global/kappa/per_state tree-routed readout returning (num[BH,L,V], den[BH,L,1]),
+    differentiable. kapf:[BH,L,1]. CUDA only (the eager fallback stays in the public entry)."""
     kap = kapf.reshape(qf.shape[0], qf.shape[1]).contiguous()    # [BH,L]
-    num, den = _RoLARoutedKappaFn.apply(qf, kf, vf, hf, Wr, Ww, kap, D, b, chunk_size, per_state, eps)
+    num, den = _RoLARoutedKappaFn.apply(qf, kf, vf, hf, Wr, Ww, kap, D, b, chunk_size,
+                                        global_norm, per_state, eps)
     return num, den.unsqueeze(-1)
 
 
@@ -3215,29 +3229,27 @@ def chunk_rola_routed(q, k, v, h, Wr, Ww, D, b, norm='kappa', kappa=None, scale=
     # never materializes any [L,nc] gate / den / r̃ buffer — the production normalization, IN-KERNEL.
     # Differentiable end-to-end (fused router-grad fold + dκ); the un-divided (num, den) come back and
     # the divide is plain torch. 'global' keeps r̃=r so it stays the in-kernel numerator + den pre-pass.
-    if norm in ('kappa', 'per_state') and qf.is_cuda:
+    if norm in ('global', 'kappa', 'per_state') and qf.is_cuda:
+        # `global` is `kappa` with the rescale skipped (r̃=r): same in-kernel den machinery (the carried
+        # Sden^c den state + transient [BT,nc] d), den D_i=Σ_c r^c d^c, never a [L,nc] gate/den/r̃ buffer.
         kapf = fold(kappa) if norm == 'kappa' else qf.new_ones(qf.shape[0], qf.shape[1], 1)
         num, den = _kappa_routed_readout(qf, kf, vf, hf, Wr, Ww, kapf.to(compute_dtype), D, b,
-                                         chunk_size, per_state=(norm == 'per_state'), eps=eps)
+                                         chunk_size, global_norm=(norm == 'global'),
+                                         per_state=(norm == 'per_state'), eps=eps)
         return unfold(num.float() / (den.float() + eps)).to(v.dtype)
 
-    # 'global' (and the CPU/capability fallback for all normalized norms): the per-state den pre-pass on
-    # explicit gates + the in-kernel ('global') or eager-core (fallback) numerator.
+    # CPU/capability fallback (qf not on CUDA) for all normalized norms: the per-state den pre-pass on
+    # explicit gates + the eager-core numerator. ALL CUDA normalized norms (incl. 'global') route through
+    # the fused in-kernel den path above, so `_tree_gates_torch` is never on the production CUDA path.
     rf, wf = _tree_gates_torch(hf, Wr, Ww, D, b)
     rf, wf = rf.to(compute_dtype), wf.to(compute_dtype)
-    if qf.is_cuda:
-        d = rola_perstate_den_triton(qf, kf, wf)
-    else:
-        d = _perstate_den_torch(qf, kf, wf, None, chunk_size, eps)
+    d = _perstate_den_torch(qf, kf, wf, None, chunk_size, eps)
     if norm == 'kappa':
         rf_scaled = (rf * (d + eps).pow(-fold(kappa).to(d.dtype))).to(compute_dtype)
     elif norm == 'per_state':
         rf_scaled = (rf / (d + eps)).to(compute_dtype)
     else:  # global
         rf_scaled = rf
-    if norm == 'global':
-        num = _rola_routed_readout(qf, kf, vf, hf, Wr, Ww, D, b, chunk_size)
-    else:
-        num = _rola_chunk_core(qf, kf, vf, wf, rf_scaled, None, chunk_size)
+    num = _rola_chunk_core(qf, kf, vf, wf, rf_scaled, None, chunk_size)
     den = (rf_scaled * d).sum(-1, keepdim=True)
     return unfold(num / (den + eps)).to(v.dtype)
