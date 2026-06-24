@@ -872,3 +872,110 @@ def test_routed_bwd_nonpow2_dv(path, D, b, dv):
     rels = {n: _relmax(a.float(), b.float()) for n, a, b in zip(names, gf, ge)}
     assert _relmax(of.float(), oe.float()) < 1e-2, f'out {_relmax(of.float(), oe.float()):.2e}'
     assert all(r < 1e-2 for r in rels.values()), f'grads {rels}'
+
+
+# ============================================================================
+# OPTIONAL ROUTING BIAS (`chunk_rola_routed(..., b_r=, b_w=)`): affine softmax(h·W + b) in the fused
+# tree-routing — gives the routing a non-uniform prior (conversion init). Validates (1) the biased
+# forward matches an explicit softmax(h·W+b) reference, (2) all grads incl db_r/db_w match autograd,
+# (3) bias=None reproduces the no-bias path EXACTLY (backward-compat). flat/square/tree, all norms,
+# non-pow2 dv. The [L,nc] gates AND their grads are never materialized in the biased path either.
+# ============================================================================
+def _bias_norm_ref(q, k, v, h, Wr, Ww, kappa, D, b, norm, scale, b_r, b_w):
+    """fp64 explicit-gate reference for the biased routed readout (softmax(h·W + b)), all norms."""
+    B, T, H, _ = q.shape
+
+    def fold(t):
+        return t.permute(0, 2, 1, 3).reshape(B * H, T, t.shape[-1])
+
+    def unfold(t):
+        return t.view(B, H, T, -1).permute(0, 2, 1, 3).contiguous()
+    qf, kf, vf, hf = fold(q) * scale, fold(k), fold(v), fold(h)
+    # explicit tree gates WITH the per-level bias added before the softmax.
+    fr = torch.stack([torch.softmax(hf @ Wr[i] + b_r[i], -1) for i in range(D)], 0)
+    fw = torch.stack([torch.softmax(hf @ Ww[i] + b_w[i], -1) for i in range(D)], 0)
+    rc, wc = [], []
+    for leaf in range(b ** D):
+        digs = [(leaf // (b ** (D - 1 - i))) % b for i in range(D)]
+        rr, ww = fr[0][..., digs[0]], fw[0][..., digs[0]]
+        for i in range(1, D):
+            rr, ww = rr * fr[i][..., digs[i]], ww * fw[i][..., digs[i]]
+        rc.append(rr)
+        wc.append(ww)
+    rf, wf = torch.stack(rc, -1), torch.stack(wc, -1)
+    G = qf @ kf.transpose(-1, -2)
+    caus = torch.tril(torch.ones(T, T, device=q.device, dtype=qf.dtype))
+    d = (G * caus) @ wf
+    if norm == 'per_state':
+        rt = rf / (d + EPS)
+    elif norm == 'kappa':
+        rt = rf * (d + EPS).pow(-fold(kappa))
+    else:  # raw / global keep r̃ = r
+        rt = rf
+    num = (G * (rt @ wf.transpose(-1, -2)) * caus) @ vf
+    if norm == 'raw':
+        return unfold(num)               # un-normalized numerator
+    den = (rt * d).sum(-1, keepdim=True)
+    return unfold(num / (den + EPS))
+
+
+@pytest.mark.parametrize('norm', ['raw', 'global', 'per_state', 'kappa'])
+@pytest.mark.parametrize('D,b', [(1, 16), (2, 4), (4, 2)])   # flat, square(nc=16), tree(nc=16)
+@pytest.mark.parametrize('dv', [16, 24])                      # pow2 + non-pow2 (BV=32)
+def test_routed_bias_fwd_bwd(norm, D, b, dv):
+    """Biased routing softmax(h·W+b): forward matches an explicit-gate fp64 reference and ALL grads
+    (dq,dk,dv,dh,dWr,dWw,db_r,db_w[,dkappa]) match autograd of that reference < 1e-2."""
+    if device != 'cuda':
+        pytest.skip('RoLA Triton kernels require CUDA')
+    B, H, T, Kd, dm = 2, 2, 64, 16, 24
+    scale = Kd ** -0.5
+    g = torch.Generator(device=device).manual_seed(0)
+
+    def mk(*s, f=False):
+        x = torch.randn(*s, device=device, dtype=torch.float64, generator=g)
+        return ((torch.nn.functional.elu(x) + 1.0) if f else x).requires_grad_()
+    q, k = mk(B, T, H, Kd, f=True), mk(B, T, H, Kd, f=True)
+    v, h = mk(B, T, H, dv), mk(B, T, H, dm)
+    Wr = (torch.randn(D, dm, b, device=device, dtype=torch.float64, generator=g) * 0.4).requires_grad_()
+    Ww = (torch.randn(D, dm, b, device=device, dtype=torch.float64, generator=g) * 0.4).requires_grad_()
+    b_r = (torch.randn(D, b, device=device, dtype=torch.float64, generator=g) * 0.7).requires_grad_()
+    b_w = (torch.randn(D, b, device=device, dtype=torch.float64, generator=g) * 0.7).requires_grad_()
+    kappa = (torch.rand(B, T, H, 1, device=device, dtype=torch.float64, generator=g) * 0.5 + 0.5).requires_grad_()
+    go = torch.randn(B, T, H, dv, device=device, dtype=torch.float64, generator=g)
+    sel = [q, k, v, h, Wr, Ww, b_r, b_w] + ([kappa] if norm == 'kappa' else [])
+    of = C.chunk_rola_routed(q.float(), k.float(), v.float(), h.float(), Wr.float(), Ww.float(), D, b,
+                             norm=norm, kappa=(kappa.float() if norm == 'kappa' else None),
+                             scale=scale, b_r=b_r.float(), b_w=b_w.float())
+    gf = torch.autograd.grad(of, sel, go.float())
+    oe = _bias_norm_ref(q, k, v, h, Wr, Ww, kappa, D, b, norm, scale, b_r, b_w)
+    ge = torch.autograd.grad(oe, sel, go)
+    names = ['q', 'k', 'v', 'h', 'Wr', 'Ww', 'b_r', 'b_w'] + (['kappa'] if norm == 'kappa' else [])
+    rels = {n: _relmax(a.float(), c.float()) for n, a, c in zip(names, gf, ge)}
+    assert _relmax(of.float(), oe.float()) < 1e-2, f'out {_relmax(of.float(), oe.float()):.2e}'
+    assert all(r < 1e-2 for r in rels.values()), f'grads {rels}'
+
+
+@pytest.mark.parametrize('norm', ['raw', 'global', 'per_state', 'kappa'])
+@pytest.mark.parametrize('D,b', [(1, 16), (2, 4), (4, 2)])
+def test_routed_bias_none_backcompat(norm, D, b):
+    """b_r/b_w=None reproduces the no-bias path EXACTLY (forward bit-identical), so adding the optional
+    bias is backward-compatible. fp32 + bf16, all norms, flat/square/tree."""
+    if device != 'cuda':
+        pytest.skip('RoLA Triton kernels require CUDA')
+    B, H, T, Kd, dm, dv = 2, 2, 64, 16, 24, 16
+    scale = Kd ** -0.5
+    g = torch.Generator(device=device).manual_seed(0)
+    for dt in (torch.float32, torch.bfloat16):
+        def mk(*s, f=False):
+            x = torch.randn(*s, device=device, dtype=dt, generator=g)
+            return (torch.nn.functional.elu(x) + 1.0) if f else x
+        q, k = mk(B, T, H, Kd, f=True), mk(B, T, H, Kd, f=True)
+        v, h = mk(B, T, H, dv), mk(B, T, H, dm)
+        Wr = torch.randn(D, dm, b, device=device, dtype=dt, generator=g) * 0.4
+        Ww = torch.randn(D, dm, b, device=device, dtype=dt, generator=g) * 0.4
+        kappa = torch.rand(B, T, H, 1, device=device, dtype=dt, generator=g) * 0.5 + 0.5
+        kw = dict(norm=norm, kappa=(kappa if norm == 'kappa' else None), scale=scale)
+        o_implicit = C.chunk_rola_routed(q, k, v, h, Wr, Ww, D, b, **kw)
+        o_explicit = C.chunk_rola_routed(q, k, v, h, Wr, Ww, D, b, b_r=None, b_w=None, **kw)
+        diff = (o_implicit.float() - o_explicit.float()).abs().max().item()
+        assert diff == 0.0, f'{norm} {dt} bias=None not bit-identical: {diff}'
