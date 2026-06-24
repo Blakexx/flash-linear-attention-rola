@@ -698,25 +698,17 @@ def _bwd_inter_read_kernel(
     so_b, so_l, so_v, sg_b, sg_t, sg_c, sbr_lvl, sbr_b, sbw_lvl, sbw_b,
     D: tl.constexpr, b: tl.constexpr, BB: tl.constexpr,
     BT: tl.constexpr, BK: tl.constexpr, BV: tl.constexpr, BD: tl.constexpr,
-    BC: tl.constexpr, NCBLK: tl.constexpr, NDM: tl.constexpr,
+    BC: tl.constexpr, NCBLK: tl.constexpr, ND: tl.constexpr, NDM: tl.constexpr,
     HAS_BIAS: tl.constexpr,
 ):
     pid_b = tl.program_id(0)
+    ND_V = (dv + BV - 1) // BV       # value-blocks (BV is the value TILE; ND_V==1 ⇒ the un-tiled kernel)
     offs_t = tl.arange(0, BT)
-    offs_v = tl.arange(0, BV)
-    offs_k = tl.arange(0, BK)
     offs_bb = tl.arange(0, BB)
     offs_c = tl.arange(0, BC)
     bmask = offs_bb < b
-    vmask = offs_v < dv
-    kmask = offs_k < dqk
     rows = t_start + offs_t
     rmask = rows < L
-    qc = tl.load(q_ptr + pid_b * sq_b + rows[:, None] * sq_l + offs_k[None, :] * sq_d,
-                 mask=rmask[:, None] & kmask[None, :], other=0.0)
-    doc = tl.load(do_ptr + pid_b * so_b + rows[:, None] * so_l + offs_v[None, :] * so_v,
-                  mask=rmask[:, None] & vmask[None, :], other=0.0)
-    dq_acc = tl.zeros([BT, BK], dtype=tl.float32)
     for cb in range(NCBLK):
         cols = cb * BC + offs_c
         cmask = cols < nc
@@ -726,26 +718,41 @@ def _bwd_inter_read_kernel(
                                         ssel_lvl, ssel_b, ssel_c,
                                         br_ptr, bw_ptr, sbr_lvl, sbr_b, sbw_lvl, sbw_b,
                                         D, BT, BB, BC, BD, NDM, HAS_BIAS)
-        ckv = tl.reshape(cols[:, None] * dqk + offs_k[None, :], [BC * BK])
-        ckmask = tl.reshape(cmask[:, None] & kmask[None, :], [BC * BK])
-        s_flat = tl.load(s_ptr + pid_b * ss_b + ckv[:, None] * ss_k + offs_v[None, :] * ss_v,
-                         mask=ckmask[:, None] & vmask[None, :], other=0.0)
-        M = tl.dot(doc, tl.trans(s_flat).to(doc.dtype))  # [BT, BC*BK]
-        Mr = tl.reshape(M, [BT, BC, BK])
-        dr_inter = tl.sum(Mr * qc[:, None, :], axis=2)
+        # dr[BT,BC] sums over dqk → accumulate across BK-feature-blocks; dq[BT,BK] is per-block (offs_k).
+        # M=do·s_flatᵀ is value-contracted → sum over vb; the dS_read store is per (BK,value)-block. The
+        # [BC*BK,BV] s_flat slice stays bounded by BK·BV; rq[BT,BC*BK] is value-free, reused across vb.
+        dr_inter = tl.zeros([BT, BC], dtype=tl.float32)
+        for d0 in range(ND):
+            offs_k = d0 * BK + tl.arange(0, BK)
+            kmask = offs_k < dqk
+            qc = tl.load(q_ptr + pid_b * sq_b + rows[:, None] * sq_l + offs_k[None, :] * sq_d,
+                         mask=rmask[:, None] & kmask[None, :], other=0.0)
+            ckv = tl.reshape(cols[:, None] * dqk + offs_k[None, :], [BC * BK])
+            ckmask = tl.reshape(cmask[:, None] & kmask[None, :], [BC * BK])
+            rq = tl.reshape(r_tile[:, :, None] * qc[:, None, :], [BT, BC * BK])
+            M = tl.zeros([BT, BC * BK], dtype=tl.float32)
+            for vb in range(ND_V):
+                offs_v = vb * BV + tl.arange(0, BV)
+                vmask = offs_v < dv
+                doc = tl.load(do_ptr + pid_b * so_b + rows[:, None] * so_l + offs_v[None, :] * so_v,
+                              mask=rmask[:, None] & vmask[None, :], other=0.0)
+                s_flat = tl.load(s_ptr + pid_b * ss_b + ckv[:, None] * ss_k + offs_v[None, :] * ss_v,
+                                 mask=ckmask[:, None] & vmask[None, :], other=0.0)
+                M += tl.dot(doc, tl.trans(s_flat).to(doc.dtype))  # [BT, BC*BK]
+                # dS_read[c,k,v] = sum_t r[t,c] q[t,k] do[t,v]; accumulate into ds (adjoint of S_j).
+                dS_read = tl.dot(tl.trans(rq).to(doc.dtype), doc)  # [BC*BK, BV]
+                dS_in = tl.load(ds_ptr + pid_b * ss_b + ckv[:, None] * ss_k + offs_v[None, :] * ss_v,
+                                mask=ckmask[:, None] & vmask[None, :], other=0.0)
+                tl.store(ds_ptr + pid_b * ss_b + ckv[:, None] * ss_k + offs_v[None, :] * ss_v,
+                         dS_in + dS_read, mask=ckmask[:, None] & vmask[None, :])
+            Mr = tl.reshape(M, [BT, BC, BK])
+            dr_inter += tl.sum(Mr * qc[:, None, :], axis=2)
+            dq_acc = tl.sum(Mr * r_tile[:, :, None], axis=1)
+            tl.atomic_add(dq_ptr + pid_b * sq_b + rows[:, None] * sq_l + offs_k[None, :] * sq_d,
+                          dq_acc, mask=rmask[:, None] & kmask[None, :])
         dr_tile = tl.where(cmask[None, :], dr_inter, 0.0)
-        dq_acc += tl.sum(Mr * r_tile[:, :, None], axis=1)
-        # dS_read[c,k,v] = sum_t r[t,c] q[t,k] do[t,v]; accumulate into ds buffer (adjoint of S_j).
-        rq = tl.reshape(r_tile[:, :, None] * qc[:, None, :], [BT, BC * BK])
-        dS_read = tl.dot(tl.trans(rq).to(doc.dtype), doc)  # [BC*BK, BV]
-        dS_in = tl.load(ds_ptr + pid_b * ss_b + ckv[:, None] * ss_k + offs_v[None, :] * ss_v,
-                        mask=ckmask[:, None] & vmask[None, :], other=0.0)
-        tl.store(ds_ptr + pid_b * ss_b + ckv[:, None] * ss_k + offs_v[None, :] * ss_v,
-                 dS_in + dS_read, mask=ckmask[:, None] & vmask[None, :])
         tl.store(gdr_ptr + pid_b * sg_b + offs_t[:, None] * sg_t + cols[None, :] * sg_c,
                  dr_tile, mask=rmask[:, None] & cmask[None, :])
-    tl.atomic_add(dq_ptr + pid_b * sq_b + rows[:, None] * sq_l + offs_k[None, :] * sq_d,
-                  dq_acc, mask=rmask[:, None] & kmask[None, :])
 
 
 # ============ INTER state-update backward (dw, dk, dv; uses ds = adjoint of S_{j+1}) ============
@@ -761,26 +768,17 @@ def _bwd_inter_state_kernel(
     sg_b, sg_t, sg_c, sbr_lvl, sbr_b, sbw_lvl, sbw_b,
     D: tl.constexpr, b: tl.constexpr, BB: tl.constexpr,
     BT: tl.constexpr, BK: tl.constexpr, BV: tl.constexpr, BD: tl.constexpr,
-    BC: tl.constexpr, NCBLK: tl.constexpr, NDM: tl.constexpr,
+    BC: tl.constexpr, NCBLK: tl.constexpr, ND: tl.constexpr, NDM: tl.constexpr,
     HAS_BIAS: tl.constexpr,
 ):
     pid_b = tl.program_id(0)
+    ND_V = (dv + BV - 1) // BV       # value-blocks (BV is the value TILE; ND_V==1 ⇒ the un-tiled kernel)
     offs_t = tl.arange(0, BT)
-    offs_v = tl.arange(0, BV)
-    offs_k = tl.arange(0, BK)
     offs_bb = tl.arange(0, BB)
     offs_c = tl.arange(0, BC)
     bmask = offs_bb < b
-    vmask = offs_v < dv
-    kmask = offs_k < dqk
     rows = t_start + offs_t
     rmask = rows < L
-    kc = tl.load(k_ptr + pid_b * sq_b + rows[:, None] * sq_l + offs_k[None, :] * sq_d,
-                 mask=rmask[:, None] & kmask[None, :], other=0.0)
-    vc = tl.load(v_ptr + pid_b * sv_b + rows[:, None] * sv_l + offs_v[None, :] * sv_d,
-                 mask=rmask[:, None] & vmask[None, :], other=0.0)
-    dk_acc = tl.zeros([BT, BK], dtype=tl.float32)
-    dv_acc = tl.zeros([BT, BV], dtype=tl.float32)
     for cb in range(NCBLK):
         cols = cb * BC + offs_c
         cmask = cols < nc
@@ -790,23 +788,38 @@ def _bwd_inter_state_kernel(
                                         ssel_lvl, ssel_b, ssel_c,
                                         br_ptr, bw_ptr, sbr_lvl, sbr_b, sbw_lvl, sbw_b,
                                         D, BT, BB, BC, BD, NDM, HAS_BIAS)
-        ckv = tl.reshape(cols[:, None] * dqk + offs_k[None, :], [BC * BK])
-        ckmask = tl.reshape(cmask[:, None] & kmask[None, :], [BC * BK])
-        dS_in = tl.load(ds_ptr + pid_b * ss_b + ckv[:, None] * ss_k + offs_v[None, :] * ss_v,
-                        mask=ckmask[:, None] & vmask[None, :], other=0.0)
-        N = tl.dot(vc, tl.trans(dS_in).to(vc.dtype))  # [BT, BC*BK]
-        Nr = tl.reshape(N, [BT, BC, BK])
-        dw_inter = tl.sum(Nr * kc[:, None, :], axis=2)
+        # dw[BT,BC] sums over dqk → accumulate across BK-feature-blocks; dk[BT,BK] per-block (offs_k); dv
+        # [BT,BV] per value-block (offs_v, atomic). N=v·dSᵀ value-contracted → sum over vb; the [BC*BK,BV]
+        # dS slice stays bounded by BK·BV. w_tile[BT,BC] / wk[BT,BC*BK] are value-free, reused across vb.
+        dw_inter = tl.zeros([BT, BC], dtype=tl.float32)
+        for d0 in range(ND):
+            offs_k = d0 * BK + tl.arange(0, BK)
+            kmask = offs_k < dqk
+            kc = tl.load(k_ptr + pid_b * sq_b + rows[:, None] * sq_l + offs_k[None, :] * sq_d,
+                         mask=rmask[:, None] & kmask[None, :], other=0.0)
+            ckv = tl.reshape(cols[:, None] * dqk + offs_k[None, :], [BC * BK])
+            ckmask = tl.reshape(cmask[:, None] & kmask[None, :], [BC * BK])
+            wk = tl.reshape(w_tile[:, :, None] * kc[:, None, :], [BT, BC * BK])
+            N = tl.zeros([BT, BC * BK], dtype=tl.float32)
+            for vb in range(ND_V):
+                offs_v = vb * BV + tl.arange(0, BV)
+                vmask = offs_v < dv
+                vc = tl.load(v_ptr + pid_b * sv_b + rows[:, None] * sv_l + offs_v[None, :] * sv_d,
+                             mask=rmask[:, None] & vmask[None, :], other=0.0)
+                dS_in = tl.load(ds_ptr + pid_b * ss_b + ckv[:, None] * ss_k + offs_v[None, :] * ss_v,
+                                mask=ckmask[:, None] & vmask[None, :], other=0.0)
+                N += tl.dot(vc, tl.trans(dS_in).to(vc.dtype))  # [BT, BC*BK]
+                dv_vb = tl.dot(wk.to(dS_in.dtype), dS_in)
+                tl.atomic_add(dv_ptr + pid_b * sv_b + rows[:, None] * sv_l + offs_v[None, :] * sv_d,
+                              dv_vb, mask=rmask[:, None] & vmask[None, :])
+            Nr = tl.reshape(N, [BT, BC, BK])
+            dw_inter += tl.sum(Nr * kc[:, None, :], axis=2)
+            dk_acc = tl.sum(Nr * w_tile[:, :, None], axis=1)
+            tl.atomic_add(dk_ptr + pid_b * sq_b + rows[:, None] * sq_l + offs_k[None, :] * sq_d,
+                          dk_acc, mask=rmask[:, None] & kmask[None, :])
         dw_tile = tl.where(cmask[None, :], dw_inter, 0.0)
-        dk_acc += tl.sum(Nr * w_tile[:, :, None], axis=1)
-        wk = tl.reshape(w_tile[:, :, None] * kc[:, None, :], [BT, BC * BK])
-        dv_acc += tl.dot(wk.to(dS_in.dtype), dS_in)
         tl.store(gdw_ptr + pid_b * sg_b + offs_t[:, None] * sg_t + cols[None, :] * sg_c,
                  dw_tile, mask=rmask[:, None] & cmask[None, :])
-    tl.atomic_add(dk_ptr + pid_b * sq_b + rows[:, None] * sq_l + offs_k[None, :] * sq_d,
-                  dk_acc, mask=rmask[:, None] & kmask[None, :])
-    tl.atomic_add(dv_ptr + pid_b * sv_b + rows[:, None] * sv_l + offs_v[None, :] * sv_d,
-                  dv_acc, mask=rmask[:, None] & vmask[None, :])
 
 
 # ============ FOLD kernel: gate-grad tiles [BT,nc] -> dWr,dWw,dh (router-grad fold) ============
@@ -902,7 +915,7 @@ def tree_routed_chunked_bwd(h, q, k, v, Wr, Ww, do, states, D, b, chunk=64, b_r=
     fold_common = dict(D=D, b=b, BB=BB, BT=chunk, BC=BC, BD=BD, NCBLK=NCBLK, NDM=NDM,
                        HAS_BIAS=has_bias, num_warps=4, num_stages=1)
     inter_common = dict(D=D, b=b, BB=BB, BT=chunk, BK=BK, BV=BV, BD=BD, BC=BC,
-                        NCBLK=NCBLK, NDM=NDM, HAS_BIAS=has_bias, num_warps=4, num_stages=1)
+                        NCBLK=NCBLK, ND=ND, NDM=NDM, HAS_BIAS=has_bias, num_warps=4, num_stages=1)
     for c in reversed(range(NCH)):
         Sj = states[c].contiguous()
         # state-update bwd FIRST: it reads dS = adjoint of S_{j+1} (before readout folds dS_read in).
