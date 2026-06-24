@@ -1614,21 +1614,15 @@ def _recompute_S_rla(k_ptr, v_ptr, wg_ptr, Sb_ptr, t, b, sb, L,
                      sq_b, sq_l, sq_d, sv_b, sv_l, sv_d, sg_b, sg_l, sg_c,
                      ssb_b, ssb_n, ssb_t, ssb_d, ssb_e,
                      offs_t, offs_d, dmask, offs_c, cmask, offs_v, vmask, offs_e,
-                     dqk, nc, ksnap_rt, BT: tl.constexpr, BD: tl.constexpr, BG: tl.constexpr,
+                     dqk, nc, BT: tl.constexpr, BD: tl.constexpr, BG: tl.constexpr,
                      BV: tl.constexpr, KSNAP: tl.constexpr):
-    # forward anchor = (t//KSNAP)*KSNAP; replay chunks [t0, t) adding Kᵀ·WV. The replay trip count is the
-    # RUNTIME ksnap_rt (== KSNAP value, passed non-constexpr) so Triton does NOT unroll the heavy body —
-    # de-unrolling shrinks the LLVM IR / cold-compile (the GLA decay-replay body is huge unrolled). The
-    # masks (tt < t, rmask) are already runtime so the body is correct at a runtime trip count. KSNAP stays
-    # constexpr only for the snapshot anchor arithmetic (t//KSNAP). Chunks tt>=t are MASKED (rmask &= tt<t).
+    # forward anchor = (t//KSNAP)*KSNAP; replay chunks [t0, t) adding Kᵀ·WV. The loop trip count is the
+    # CONSTEXPR KSNAP (not the runtime t-t0) so Triton unrolls it like the scans — a runtime-bounded
+    # loop blows up codegen. Chunks tt>=t are MASKED off (rmask &= tt < t → zero contribution).
     t0 = (t // KSNAP) * KSNAP
     Sflat = tl.load(Sb_ptr + b*ssb_b + sb*ssb_n + (t // KSNAP)*ssb_t
                     + offs_d[:, None]*ssb_d + offs_e[None, :]*ssb_e, mask=dmask[:, None], other=0.0)
-    # tl.range(num_stages=1, loop_unroll_factor=1): NO software-pipelining (the loop-carried [BD,BG*BV]
-    # accumulator must stay single-buffered or pipelining multiplies SMEM → OutOfResources at the kernel's
-    # autotuned num_stages) and NO unroll (the whole compile-time point). The autotune num_stages still
-    # pipelines the main fused body; only this replay loop is pinned single-stage.
-    for i in tl.range(ksnap_rt, num_stages=1, loop_unroll_factor=1):
+    for i in range(KSNAP):
         tt = t0 + i
         rows = tt * BT + offs_t
         rmask = (rows < L) & (tt < t)
@@ -1648,18 +1642,17 @@ def _recompute_dS_rla(q_ptr, rg_ptr, g_ptr, dSa_ptr, t, b, sb, L,
                       sq_b, sq_l, sq_d, sg_b, sg_l, sg_c, sgr_b, sgr_l, sgr_d,
                       ssb_b, ssb_n, ssb_t, ssb_d, ssb_e,
                       offs_t, offs_d, dmask, offs_c, cmask, offs_v, vmask, offs_e,
-                      dqk, nc, NCH, ksnap_rt, BT: tl.constexpr, BD: tl.constexpr, BG: tl.constexpr,
+                      dqk, nc, NCH, BT: tl.constexpr, BD: tl.constexpr, BG: tl.constexpr,
                       BV: tl.constexpr, KSNAP: tl.constexpr):
     # reverse anchor = top of t's coarse block = min((t//KSNAP)*KSNAP+KSNAP-1, NCH-1); the snapshot at
-    # slot t//KSNAP holds Σ_{t'>top}. Replay chunks (t, top] in REVERSE adding Qᵀ·rg_g → Σ_{t'>t}. Replay
-    # trip count is the RUNTIME ksnap_rt (de-unrolled, see _recompute_S_rla); chunks tt<=t OR tt>top MASKED.
+    # slot t//KSNAP holds Σ_{t'>top}. Replay chunks (t, top] in REVERSE adding Qᵀ·rg_g → Σ_{t'>t}. Trip
+    # count is the CONSTEXPR KSNAP (unrolled); chunks tt<=t OR tt>top are MASKED off (zero contribution).
     top = (t // KSNAP) * KSNAP + (KSNAP - 1)
     if top > NCH - 1:
         top = NCH - 1
     dS = tl.load(dSa_ptr + b*ssb_b + sb*ssb_n + (t // KSNAP)*ssb_t
                  + offs_d[:, None]*ssb_d + offs_e[None, :]*ssb_e, mask=dmask[:, None], other=0.0)
-    # single-stage, non-unrolled replay (see _recompute_S_rla): de-unroll without pipelining the SMEM carry.
-    for i in tl.range(ksnap_rt, num_stages=1, loop_unroll_factor=1):
+    for i in range(KSNAP):
         tt = top - i
         rows = tt * BT + offs_t
         rmask = (rows < L) & (tt > t)
@@ -1683,17 +1676,14 @@ def _recompute_S_gla(k_ptr, v_ptr, wg_ptr, ld_ptr, Sb_ptr, t, b, sb, L,
                      sq_b, sq_l, sq_d, sv_b, sv_l, sv_d, sg_b, sg_l, sg_c,
                      ssb_b, ssb_n, ssb_t, ssb_d, ssb_e,
                      offs_t, offs_d, dmask, offs_c, cmask, offs_v, vmask, offs_e,
-                     dqk, nc, ksnap_rt, BT: tl.constexpr, BD: tl.constexpr, BG: tl.constexpr,
+                     dqk, nc, BT: tl.constexpr, BD: tl.constexpr, BG: tl.constexpr,
                      BV: tl.constexpr, KSNAP: tl.constexpr):
     # forward anchor = (t//KSNAP)*KSNAP (boundary state ENTERING that chunk); replay chunks [t0, t)
-    # ascending applying Sflat = decvec*Sflat + Kᵀ·WV. Replay trip count is RUNTIME ksnap_rt (de-unrolled —
-    # the unrolled decay-replay body here is the 40-min GLA compile outlier).
+    # ascending applying Sflat = decvec*Sflat + Kᵀ·WV. Trip count is CONSTEXPR KSNAP (unrolled).
     t0 = (t // KSNAP) * KSNAP
     Sflat = tl.load(Sb_ptr + b*ssb_b + sb*ssb_n + (t // KSNAP)*ssb_t
                     + offs_d[:, None]*ssb_d + offs_e[None, :]*ssb_e, mask=dmask[:, None], other=0.0)
-    # single-stage, non-unrolled replay (see _recompute_S_rla). GLA's decay-replay body is the heaviest —
-    # the de-unroll matters most here; num_stages=1 keeps the SMEM carry single-buffered.
-    for i in tl.range(ksnap_rt, num_stages=1, loop_unroll_factor=1):
+    for i in range(KSNAP):
         tt = t0 + i
         rows = tt * BT + offs_t
         rmask = (rows < L) & (tt < t)
@@ -1719,17 +1709,16 @@ def _recompute_dS_gla(q_ptr, rg_ptr, ld_ptr, g_ptr, dSa_ptr, t, b, sb, L,
                       sq_b, sq_l, sq_d, sg_b, sg_l, sg_c, sgr_b, sgr_l, sgr_d,
                       ssb_b, ssb_n, ssb_t, ssb_d, ssb_e,
                       offs_t, offs_d, dmask, offs_c, cmask, offs_v, vmask, offs_e,
-                      dqk, nc, NCH, ksnap_rt, BT: tl.constexpr, BD: tl.constexpr, BG: tl.constexpr,
+                      dqk, nc, NCH, BT: tl.constexpr, BD: tl.constexpr, BG: tl.constexpr,
                       BV: tl.constexpr, KSNAP: tl.constexpr):
     # reverse anchor = top of t's coarse block (slot holds Σ_{t'>top}); replay chunks (t, top] in REVERSE
-    # applying dS = decvec*dS + Qᵀ·rt_g → Σ_{t'>t}. Replay trip count RUNTIME ksnap_rt; tt<=t OR tt>top MASKED.
+    # applying dS = decvec*dS + Qᵀ·rt_g → Σ_{t'>t}. Trip count CONSTEXPR KSNAP; tt<=t OR tt>top MASKED.
     top = (t // KSNAP) * KSNAP + (KSNAP - 1)
     if top > NCH - 1:
         top = NCH - 1
     dS = tl.load(dSa_ptr + b*ssb_b + sb*ssb_n + (t // KSNAP)*ssb_t
                  + offs_d[:, None]*ssb_d + offs_e[None, :]*ssb_e, mask=dmask[:, None], other=0.0)
-    # single-stage, non-unrolled replay (see _recompute_S_rla).
-    for i in tl.range(ksnap_rt, num_stages=1, loop_unroll_factor=1):
+    for i in range(KSNAP):
         tt = top - i
         rows = tt * BT + offs_t
         rmask = (rows < L) & (tt > t)
@@ -1754,7 +1743,7 @@ def _recompute_dS_gla(q_ptr, rg_ptr, ld_ptr, g_ptr, dSa_ptr, t, b, sb, L,
                  prune_configs_by={'early_config_prune': _prune_bwd}, **autotune_cache_kwargs)
 @triton.jit
 def _par_grad_rla_qr(q_ptr, k_ptr, v_ptr, wg_ptr, rg_ptr, g_ptr, Sb_ptr, dq_ptr, dr_ptr,
-                     L, dqk: tl.constexpr, dv: tl.constexpr, nc, ksnap_rt,
+                     L, dqk: tl.constexpr, dv: tl.constexpr, nc,
                      sq_b, sq_l, sq_d, sv_b, sv_l, sv_d, sg_b, sg_l, sg_c, sgr_b, sgr_l, sgr_d,
                      ssb_b, ssb_n, ssb_t, ssb_d, ssb_e,
                      sdq_b, sdq_n, sdq_l, sdq_d, sdr_b, sdr_l, sdr_c,
@@ -1804,7 +1793,7 @@ def _par_grad_rla_qr(q_ptr, k_ptr, v_ptr, wg_ptr, rg_ptr, g_ptr, Sb_ptr, dq_ptr,
                                   sq_b, sq_l, sq_d, sv_b, sv_l, sv_d, sg_b, sg_l, sg_c,
                                   ssb_b, ssb_n, ssb_t, ssb_d, ssb_e,
                                   offs_t, offs_d, dmask, offs_c, cmask, offs_v, vmask, offs_e,
-                                  dqk, nc, ksnap_rt, BT, BD, BG, BV, KSNAP)
+                                  dqk, nc, BT, BD, BG, BV, KSNAP)
             dq_d = tl.dot(coef.to(kc.dtype), kc) + tl.dot(rg_g.to(Sb.dtype), tl.trans(Sb))
             tl.store(dq_ptr + b*sdq_b + sb*sdq_n + rows[:, None]*sdq_l + offs_d[None, :]*sdq_d,
                      dq_d, mask=rmask[:, None] & dmask[None, :])
@@ -1847,7 +1836,7 @@ def _par_grad_rla_qr(q_ptr, k_ptr, v_ptr, wg_ptr, rg_ptr, g_ptr, Sb_ptr, dq_ptr,
                                       sq_b, sq_l, sq_d, sv_b, sv_l, sv_d, sg_b, sg_l, sg_c,
                                       ssb_b, ssb_n, ssb_t, ssb_d, ssb_e,
                                       offs_t, offs_d, dmask, offs_c, cmask, offs_v, vm, offs_e,
-                                      dqk, nc, ksnap_rt, BT, BD, BG, BV, KSNAP)
+                                      dqk, nc, BT, BD, BG, BV, KSNAP)
                 dq_d += tl.dot(rg_g.to(Sb.dtype), tl.trans(Sb))
             tl.store(dq_ptr + b*sdq_b + sb*sdq_n + rows[:, None]*sdq_l + offs_d[None, :]*sdq_d,
                      dq_d, mask=rmask[:, None] & dmask[None, :])
@@ -1871,7 +1860,7 @@ def _par_grad_rla_qr(q_ptr, k_ptr, v_ptr, wg_ptr, rg_ptr, g_ptr, Sb_ptr, dq_ptr,
                                       sq_b, sq_l, sq_d, sv_b, sv_l, sv_d, sg_b, sg_l, sg_c,
                                       ssb_b, ssb_n, ssb_t, ssb_d, ssb_e,
                                       offs_t, offs_d, dmask, offs_c, cmask, offs_v, vm, offs_e,
-                                      dqk, nc, ksnap_rt, BT, BD, BG, BV, KSNAP)
+                                      dqk, nc, BT, BD, BG, BV, KSNAP)
                 QS += tl.dot(qc, Sb.to(qc.dtype))
             dr_inter += tl.sum(tl.reshape(QS, [BT, BG, BV]) * gv[:, None, :], axis=2)
         tl.store(dr_ptr + b*sdr_b + rows[:, None]*sdr_l + offs_c[None, :]*sdr_c,
@@ -1882,7 +1871,7 @@ def _par_grad_rla_qr(q_ptr, k_ptr, v_ptr, wg_ptr, rg_ptr, g_ptr, Sb_ptr, dq_ptr,
                  prune_configs_by={'early_config_prune': _prune_bwd}, **autotune_cache_kwargs)
 @triton.jit
 def _par_grad_rla_kwv(q_ptr, k_ptr, v_ptr, wg_ptr, rg_ptr, g_ptr, dSa_ptr, dk_ptr, dw_ptr, dv_ptr,
-                      L, dqk: tl.constexpr, dv: tl.constexpr, nc, ksnap_rt,
+                      L, dqk: tl.constexpr, dv: tl.constexpr, nc,
                       sq_b, sq_l, sq_d, sv_b, sv_l, sv_d, sg_b, sg_l, sg_c, sgr_b, sgr_l, sgr_d,
                       ssb_b, ssb_n, ssb_t, ssb_d, ssb_e,
                       sdk_b, sdk_n, sdk_l, sdk_d, sdw_b, sdw_l, sdw_c, sdv_b, sdv_n, sdv_l, sdv_d,
@@ -1930,7 +1919,7 @@ def _par_grad_rla_kwv(q_ptr, k_ptr, v_ptr, wg_ptr, rg_ptr, g_ptr, dSa_ptr, dk_pt
                                     sq_b, sq_l, sq_d, sg_b, sg_l, sg_c, sgr_b, sgr_l, sgr_d,
                                     ssb_b, ssb_n, ssb_t, ssb_d, ssb_e,
                                     offs_t, offs_d, dmask, offs_c, cmask, offs_v, vmask, offs_e,
-                                    dqk, nc, NCH, ksnap_rt, BT, BD, BG, BV, KSNAP)
+                                    dqk, nc, NCH, BT, BD, BG, BV, KSNAP)
             dk_d = tl.dot(tl.trans(A2).to(qc.dtype), qc) + tl.dot(wg_v1.to(dSa.dtype), tl.trans(dSa))
             tl.store(dk_ptr + b*sdk_b + sb*sdk_n + rows[:, None]*sdk_l + offs_d[None, :]*sdk_d,
                      dk_d, mask=rmask[:, None] & dmask[None, :])
@@ -1980,7 +1969,7 @@ def _par_grad_rla_kwv(q_ptr, k_ptr, v_ptr, wg_ptr, rg_ptr, g_ptr, dSa_ptr, dk_pt
                                         sq_b, sq_l, sq_d, sg_b, sg_l, sg_c, sgr_b, sgr_l, sgr_d,
                                         ssb_b, ssb_n, ssb_t, ssb_d, ssb_e,
                                         offs_t, offs_d, dmask, offs_c, cmask, offs_v, vm, offs_e,
-                                        dqk, nc, NCH, ksnap_rt, BT, BD, BG, BV, KSNAP)
+                                        dqk, nc, NCH, BT, BD, BG, BV, KSNAP)
                 dk_d += tl.dot(wg_v1.to(dSa.dtype), tl.trans(dSa))
             tl.store(dk_ptr + b*sdk_b + sb*sdk_n + rows[:, None]*sdk_l + offs_d[None, :]*sdk_d,
                      dk_d, mask=rmask[:, None] & dmask[None, :])
@@ -2008,7 +1997,7 @@ def _par_grad_rla_kwv(q_ptr, k_ptr, v_ptr, wg_ptr, rg_ptr, g_ptr, dSa_ptr, dk_pt
                                         sq_b, sq_l, sq_d, sg_b, sg_l, sg_c, sgr_b, sgr_l, sgr_d,
                                         ssb_b, ssb_n, ssb_t, ssb_d, ssb_e,
                                         offs_t, offs_d, dmask, offs_c, cmask, offs_v, vm, offs_e,
-                                        dqk, nc, NCH, ksnap_rt, BT, BD, BG, BV, KSNAP)
+                                        dqk, nc, NCH, BT, BD, BG, BV, KSNAP)
                 KS += tl.dot(kc, dSa.to(kc.dtype))
             KS3 = tl.reshape(KS, [BT, BG, BV])
             dw_wr += tl.sum(KS3 * v1[:, None, :], axis=2)
@@ -2025,7 +2014,7 @@ def _par_grad_rla_kwv(q_ptr, k_ptr, v_ptr, wg_ptr, rg_ptr, g_ptr, dSa_ptr, dk_pt
 @triton.jit
 def _par_grad_gla_qr(q_ptr, k_ptr, v_ptr, wg_ptr, rg_ptr, ld_ptr, g_ptr, Sb_ptr,
                      dq_ptr, drg_ptr, dart_ptr,
-                     L, dqk: tl.constexpr, dv: tl.constexpr, nc, ksnap_rt,
+                     L, dqk: tl.constexpr, dv: tl.constexpr, nc,
                      sq_b, sq_l, sq_d, sv_b, sv_l, sv_d, sg_b, sg_l, sg_c, sgr_b, sgr_l, sgr_d,
                      ssb_b, ssb_n, ssb_t, ssb_d, ssb_e,
                      sdq_b, sdq_n, sdq_l, sdq_d, sdr_b, sdr_l, sdr_c, sda_b, sda_l, sda_c,
@@ -2073,7 +2062,7 @@ def _par_grad_gla_qr(q_ptr, k_ptr, v_ptr, wg_ptr, rg_ptr, ld_ptr, g_ptr, Sb_ptr,
                                   sq_b, sq_l, sq_d, sv_b, sv_l, sv_d, sg_b, sg_l, sg_c,
                                   ssb_b, ssb_n, ssb_t, ssb_d, ssb_e,
                                   offs_t, offs_d, dmask, offs_c, cmask, offs_v, vmask, offs_e,
-                                  dqk, nc, ksnap_rt, BT, BD, BG, BV, KSNAP)
+                                  dqk, nc, BT, BD, BG, BV, KSNAP)
             dq_intra = tl.dot(dG.to(kc.dtype), kc)
             dq_inter = tl.dot(rt_g.to(Sb.dtype), tl.trans(Sb))
             tl.store(dq_ptr + b*sdq_b + sb*sdq_n + rows[:, None]*sdq_l + offs_d[None, :]*sdq_d,
@@ -2110,7 +2099,7 @@ def _par_grad_gla_qr(q_ptr, k_ptr, v_ptr, wg_ptr, rg_ptr, ld_ptr, g_ptr, Sb_ptr,
                                       sq_b, sq_l, sq_d, sv_b, sv_l, sv_d, sg_b, sg_l, sg_c,
                                       ssb_b, ssb_n, ssb_t, ssb_d, ssb_e,
                                       offs_t, offs_d, dmask, offs_c, cmask, offs_v, vm, offs_e,
-                                      dqk, nc, ksnap_rt, BT, BD, BG, BV, KSNAP)
+                                      dqk, nc, BT, BD, BG, BV, KSNAP)
                 dq_d += tl.dot(rt_g.to(Sb.dtype), tl.trans(Sb))
             tl.store(dq_ptr + b*sdq_b + sb*sdq_n + rows[:, None]*sdq_l + offs_d[None, :]*sdq_d,
                      dq_d, mask=rmask[:, None] & dmask[None, :])
@@ -2132,7 +2121,7 @@ def _par_grad_gla_qr(q_ptr, k_ptr, v_ptr, wg_ptr, rg_ptr, ld_ptr, g_ptr, Sb_ptr,
                                       sq_b, sq_l, sq_d, sv_b, sv_l, sv_d, sg_b, sg_l, sg_c,
                                       ssb_b, ssb_n, ssb_t, ssb_d, ssb_e,
                                       offs_t, offs_d, dmask, offs_c, cmask, offs_v, vm, offs_e,
-                                      dqk, nc, ksnap_rt, BT, BD, BG, BV, KSNAP)
+                                      dqk, nc, BT, BD, BG, BV, KSNAP)
                 QS += tl.dot(qc, Sb.to(qc.dtype))
             drt_inter += tl.sum(tl.reshape(QS, [BT, BG, BV]) * gv[:, None, :], axis=2)
         drt = drt_intra + drt_inter
@@ -2145,7 +2134,7 @@ def _par_grad_gla_qr(q_ptr, k_ptr, v_ptr, wg_ptr, rg_ptr, ld_ptr, g_ptr, Sb_ptr,
 @triton.jit
 def _par_grad_gla_kwv(q_ptr, k_ptr, v_ptr, wg_ptr, rg_ptr, ld_ptr, g_ptr, Sb_ptr, dSa_ptr, dart_ptr,
                       dk_ptr, dwg_ptr, dv_ptr, dld_ptr,
-                      L, dqk: tl.constexpr, dv: tl.constexpr, nc, ksnap_rt,
+                      L, dqk: tl.constexpr, dv: tl.constexpr, nc,
                       sq_b, sq_l, sq_d, sv_b, sv_l, sv_d, sg_b, sg_l, sg_c, sgr_b, sgr_l, sgr_d,
                       ssb_b, ssb_n, ssb_t, ssb_d, ssb_e,
                       sdk_b, sdk_n, sdk_l, sdk_d, sdw_b, sdw_l, sdw_c, sdv_b, sdv_n, sdv_l, sdv_d,
@@ -2198,12 +2187,12 @@ def _par_grad_gla_kwv(q_ptr, k_ptr, v_ptr, wg_ptr, rg_ptr, ld_ptr, g_ptr, Sb_ptr
                                   sq_b, sq_l, sq_d, sv_b, sv_l, sv_d, sg_b, sg_l, sg_c,
                                   ssb_b, ssb_n, ssb_t, ssb_d, ssb_e,
                                   offs_t, offs_d, dmask, offs_c, cmask, offs_v, vmask, offs_e,
-                                  dqk, nc, ksnap_rt, BT, BD, BG, BV, KSNAP)
+                                  dqk, nc, BT, BD, BG, BV, KSNAP)
             dSa = _recompute_dS_gla(q_ptr, rg_ptr, ld_ptr, g_ptr, dSa_ptr, t, b, sb, L,
                                     sq_b, sq_l, sq_d, sg_b, sg_l, sg_c, sgr_b, sgr_l, sgr_d,
                                     ssb_b, ssb_n, ssb_t, ssb_d, ssb_e,
                                     offs_t, offs_d, dmask, offs_c, cmask, offs_v, vmask, offs_e,
-                                    dqk, nc, NCH, ksnap_rt, BT, BD, BG, BV, KSNAP)
+                                    dqk, nc, NCH, BT, BD, BG, BV, KSNAP)
             dk_intra = tl.dot(tl.trans(dG).to(qc.dtype), qc)
             dk_KV = tl.dot(wv1.to(dSa.dtype), tl.trans(dSa))
             tl.store(dk_ptr + b*sdk_b + sb*sdk_n + rows[:, None]*sdk_l + offs_d[None, :]*sdk_d,
@@ -2247,12 +2236,12 @@ def _par_grad_gla_kwv(q_ptr, k_ptr, v_ptr, wg_ptr, rg_ptr, ld_ptr, g_ptr, Sb_ptr
                                       sq_b, sq_l, sq_d, sv_b, sv_l, sv_d, sg_b, sg_l, sg_c,
                                       ssb_b, ssb_n, ssb_t, ssb_d, ssb_e,
                                       offs_t, offs_d, dmask, offs_c, cmask, offs_v, vm, offs_e,
-                                      dqk, nc, ksnap_rt, BT, BD, BG, BV, KSNAP)
+                                      dqk, nc, BT, BD, BG, BV, KSNAP)
                 dSa = _recompute_dS_gla(q_ptr, rg_ptr, ld_ptr, g_ptr, dSa_ptr, t, b, sb, L,
                                         sq_b, sq_l, sq_d, sg_b, sg_l, sg_c, sgr_b, sgr_l, sgr_d,
                                         ssb_b, ssb_n, ssb_t, ssb_d, ssb_e,
                                         offs_t, offs_d, dmask, offs_c, cmask, offs_v, vm, offs_e,
-                                        dqk, nc, NCH, ksnap_rt, BT, BD, BG, BV, KSNAP)
+                                        dqk, nc, NCH, BT, BD, BG, BV, KSNAP)
                 dk_d += tl.dot(wv1.to(dSa.dtype), tl.trans(dSa))
                 ZdZ += tl.sum(tl.sum(tl.reshape(Sb * dSa, [BD, BG, BV]), axis=2), axis=0)
             tl.store(dk_ptr + b*sdk_b + sb*sdk_n + rows[:, None]*sdk_l + offs_d[None, :]*sdk_d,
@@ -2277,7 +2266,7 @@ def _par_grad_gla_kwv(q_ptr, k_ptr, v_ptr, wg_ptr, rg_ptr, ld_ptr, g_ptr, Sb_ptr
                                         sq_b, sq_l, sq_d, sg_b, sg_l, sg_c, sgr_b, sgr_l, sgr_d,
                                         ssb_b, ssb_n, ssb_t, ssb_d, ssb_e,
                                         offs_t, offs_d, dmask, offs_c, cmask, offs_v, vm, offs_e,
-                                        dqk, nc, NCH, ksnap_rt, BT, BD, BG, BV, KSNAP)
+                                        dqk, nc, NCH, BT, BD, BG, BV, KSNAP)
                 KS += tl.dot(kc, dSa.to(kc.dtype))
             KS3 = tl.reshape(KS, [BT, BG, BV])
             dw_end += tl.sum(KS3 * v1[:, None, :], axis=2)
@@ -2378,12 +2367,12 @@ def _bwd_split_rla(q, k, v, wg, rg, g, chunk=None, BG=16, nb_tile=None):
                                    USE_G=False, BT=chunk, BD=BK_scan, BVF=BV, BG=BG, NCH=NCH, KSNAP=KSNAP)
         _scan_dS[(B, nbt, ND_scan)](q, rg_s, wg_s, g, dSa, L, dqk, dv, nct, *sq, *sg, *sgr, *sS,
                                     USE_G=False, BT=chunk, BD=BK_scan, BVF=BV, BG=BG, NCH=NCH, KSNAP=KSNAP)
-        _par_grad_rla_qr[(B, nbt, NCH)](q, k, v, wg_s, rg_s, g, Sb, dq_t, dr_s, L, dqk, dv, nct, int(KSNAP),
+        _par_grad_rla_qr[(B, nbt, NCH)](q, k, v, wg_s, rg_s, g, Sb, dq_t, dr_s, L, dqk, dv, nct,
                                         *sq, *sv, *sg, *sgr, *sS,
                                         dq_t.stride(0), dq_t.stride(1), dq_t.stride(2), dq_t.stride(3),
                                         dr_s.stride(0), dr_s.stride(1), dr_s.stride(2),
                                         BT=chunk, BVF=BV, BG=BG, NCH=NCH, KSNAP=KSNAP)
-        _par_grad_rla_kwv[(B, nbt, NCH)](q, k, v, wg_s, rg_s, g, dSa, dk_t, dw_s, dvo_t, L, dqk, dv, nct, int(KSNAP),
+        _par_grad_rla_kwv[(B, nbt, NCH)](q, k, v, wg_s, rg_s, g, dSa, dk_t, dw_s, dvo_t, L, dqk, dv, nct,
                                          *sq, *sv, *sg, *sgr, *sS,
                                          dk_t.stride(0), dk_t.stride(1), dk_t.stride(2), dk_t.stride(3),
                                          dw_s.stride(0), dw_s.stride(1), dw_s.stride(2),
@@ -2441,14 +2430,14 @@ def _bwd_split_gla(q, k, v, wg, rg, ld, g, chunk=None, BG=16, nb_tile=None):
                                    USE_G=True, BT=chunk, BD=BK_scan, BVF=BV, BG=BG, NCH=NCH, KSNAP=KSNAP)
         _scan_dS[(B, nbt, ND_scan)](q, rg_s, ld_s, g, dSa, L, dqk, dv, nct, *sq, *sg, *sgr, *sS,
                                     USE_G=True, BT=chunk, BD=BK_scan, BVF=BV, BG=BG, NCH=NCH, KSNAP=KSNAP)
-        _par_grad_gla_qr[(B, nbt, NCH)](q, k, v, wg_s, rg_s, ld_s, g, Sb, dq_t, drg_s, dart_s, L, dqk, dv, nct, int(KSNAP),
+        _par_grad_gla_qr[(B, nbt, NCH)](q, k, v, wg_s, rg_s, ld_s, g, Sb, dq_t, drg_s, dart_s, L, dqk, dv, nct,
                                         *sq, *sv, *sg, *sgr, *sS,
                                         dq_t.stride(0), dq_t.stride(1), dq_t.stride(2), dq_t.stride(3),
                                         drg_s.stride(0), drg_s.stride(1), drg_s.stride(2),
                                         dart_s.stride(0), dart_s.stride(1), dart_s.stride(2),
                                         BT=chunk, BVF=BV, BG=BG, NCH=NCH, KSNAP=KSNAP)
         _par_grad_gla_kwv[(B, nbt, NCH)](q, k, v, wg_s, rg_s, ld_s, g, Sb, dSa, dart_s, dk_t, dwg_s, dvo_t, dld_s,
-                                         L, dqk, dv, nct, int(KSNAP), *sq, *sv, *sg, *sgr, *sS,
+                                         L, dqk, dv, nct, *sq, *sv, *sg, *sgr, *sS,
                                          dk_t.stride(0), dk_t.stride(1), dk_t.stride(2), dk_t.stride(3),
                                          dwg_s.stride(0), dwg_s.stride(1), dwg_s.stride(2),
                                          dvo_t.stride(0), dvo_t.stride(1), dvo_t.stride(2), dvo_t.stride(3),
