@@ -293,6 +293,249 @@ def rola_rla_triton(q, k, v, r, w, chunk=None, BG=16):
 
 
 # ============================================================================
+# In-kernel TREE-ROUTING forward (RLA). FORWARD ONLY.
+#
+# Productionizes the validated prototype `proto_tree_routing.py`: instead of taking PRECOMPUTED gates
+# r,w ∈ [L,nc] and forming R = r·wᵀ, the routing gram is built IN-KERNEL from the hidden state h and the
+# per-level router weights Wr,Ww ∈ [D, d_model, b] (b^D = nc), never materializing the [L,nc] gates.
+#
+# This is a SOURCE SWAP, not a new pipeline: the inner machinery is the *same* production RLA forward
+# (`_rola_fwd_intra` collapse-intra over state-blocks, `_rola_fwd_inter` NB-fused inter scan, the same
+# autotune configs, the same BG state-block SMEM-tiling). The ONLY change is the block that produced the
+# [BT,BG] routing tiles:  `tl.load(rg/wg)`  →  `_build_rw_tile` (per-level softmax factors gathered to
+# the BG state-block via one-hot Sel maps). The reconstructed gate tiles live transiently in SRAM at the
+# state-block width BG; the dominant [L,nc] gate tensor is never allocated.
+#
+# The factorization (proven in the prototype, validated <1e-2 vs autograd):
+#   r[:, c] = Π_lvl softmax(h·Wr[lvl])[:, digit_lvl(c)],   R = r·wᵀ = ⊙_lvl (fr_lvl·fw_lvlᵀ)
+# with the per-level [BT,b] softmax factors fr,fw gathered to the nc-leaf block by Sel[lvl][b, nc].
+#
+# BACKWARD (router-grad fold dWr,dWw,d_h) IS THE NEXT PHASE — NOT attempted here. The clean seam: this
+# entry is a plain forward (no autograd.Function); a `_RoLARoutedFn` mirroring the prototype's
+# `_TreeRoutedFn` (forward returns per-chunk state snapshots, backward drives the fold kernels — already
+# written and validated in proto_tree_routing.py: `_bwd_intra_kernel`, `_bwd_inter_*`, `_fold_*`) wraps
+# this forward. The forward below leaves all the hooks: it builds the SAME `sel` map the bwd needs and
+# routes through the SAME [BT,BG] factor reconstruction the fold recomputes.
+# ============================================================================
+
+
+def _build_sel(D, b, nc, device):
+    """One-hot level→leaf selection maps Sel[lvl][d, leaf] = 1 iff digit_lvl(leaf)==d (big-endian
+    base-b digits, matching the prototype's _digits ordering). Tiny [D,b,nc] constant — reconstructs
+    the [BT,nc] gate tile from the [BT,b] per-level factors IN-KERNEL. Carries NO sequence dimension,
+    so it is NOT the [L,nc] gate; identical to proto_tree_routing._build_sel."""
+    sel = torch.zeros(D, b, nc, device=device, dtype=torch.float32)
+    for leaf in range(nc):
+        digs = [(leaf // (b ** (D - 1 - i))) % b for i in range(D)]
+        for i, d in enumerate(digs):
+            sel[i, d, leaf] = 1.0
+    return sel
+
+
+@triton.jit
+def _build_rw_tile(h_ptr, wr_ptr, ww_ptr, sel_ptr, offs_c, cmask,
+                   bn, rows, rmask, offs_bb, bmask, d_model,
+                   sh_b, sh_l, sh_d, swr_lvl, swr_d, swr_b, sww_lvl, sww_d, sww_b,
+                   ssel_lvl, ssel_b, ssel_c,
+                   D: tl.constexpr, BT: tl.constexpr, BB: tl.constexpr,
+                   BG: tl.constexpr, BD: tl.constexpr, NDM: tl.constexpr):
+    """Build the [BT, BG] read/write routing tiles for ONE state-block (the BG-wide nc slice offs_c),
+    IN-KERNEL from h + Wr,Ww — the production stand-in for `tl.load(rg/wg)`. Ports the prototype's
+    in-kernel factor construction (proto_tree_routing._build_factors), with the tile width = the
+    production state-block BG (not the prototype's BC). For each level: logits = h·W (loop BD-blocks of
+    d_model so any d_model fits SMEM), softmax over the b branches (pad cols masked to -inf → vanish),
+    then gather the [BT,b] factor to the BG leaves of THIS block via the one-hot Sel slice and Hadamard-
+    accumulate. r_tile,w_tile are returned masked to cmask (nc-tail cols → 0). Transient SRAM, [BT,BG]."""
+    r_tile = tl.full([BT, BG], 1.0, dtype=tl.float32)
+    w_tile = tl.full([BT, BG], 1.0, dtype=tl.float32)
+    for lvl in range(D):
+        lr = tl.zeros([BT, BB], dtype=tl.float32)
+        lw = tl.zeros([BT, BB], dtype=tl.float32)
+        for dm in range(NDM):
+            offs_dm = dm * BD + tl.arange(0, BD)
+            mmask = offs_dm < d_model
+            hc = tl.load(h_ptr + bn * sh_b + rows[:, None] * sh_l + offs_dm[None, :] * sh_d,
+                         mask=rmask[:, None] & mmask[None, :], other=0.0)
+            wr = tl.load(wr_ptr + lvl * swr_lvl + offs_dm[:, None] * swr_d + offs_bb[None, :] * swr_b,
+                         mask=mmask[:, None] & bmask[None, :], other=0.0)
+            ww = tl.load(ww_ptr + lvl * sww_lvl + offs_dm[:, None] * sww_d + offs_bb[None, :] * sww_b,
+                         mask=mmask[:, None] & bmask[None, :], other=0.0)
+            lr += tl.dot(hc, wr)
+            lw += tl.dot(hc, ww)
+        neg = tl.full([BT, BB], float('-inf'), dtype=tl.float32)
+        lr = tl.where(bmask[None, :], lr, neg)
+        lw = tl.where(bmask[None, :], lw, neg)
+        er = tl.exp(lr - tl.max(lr, axis=1)[:, None])
+        ew = tl.exp(lw - tl.max(lw, axis=1)[:, None])
+        fr = er / tl.sum(er, axis=1)[:, None]   # [BT, BB] read-gate level factor
+        fw = ew / tl.sum(ew, axis=1)[:, None]   # [BT, BB] write-gate level factor
+        sel = tl.load(sel_ptr + lvl * ssel_lvl + offs_bb[:, None] * ssel_b + offs_c[None, :] * ssel_c,
+                      mask=bmask[:, None] & cmask[None, :], other=0.0)   # [BB, BG] one-hot
+        r_tile *= tl.dot(fr, sel)
+        w_tile *= tl.dot(fw, sel)
+    r_tile = tl.where(cmask[None, :], r_tile, 0.0)
+    w_tile = tl.where(cmask[None, :], w_tile, 0.0)
+    return r_tile, w_tile
+
+
+@triton.autotune(configs=_AT_CFGS, key=_AT_KEY, **autotune_cache_kwargs)
+@triton.jit
+def _rola_routed_fwd_intra(q_ptr, k_ptr, v_ptr, h_ptr, wr_ptr, ww_ptr, sel_ptr, outa_ptr,
+                           L, dqk, dv, nc, d_model,
+                           sq_b, sq_l, sq_d, sv_b, sv_l, sv_d,
+                           sh_b, sh_l, sh_d, swr_lvl, swr_d, swr_b, sww_lvl, sww_d, sww_b,
+                           ssel_lvl, ssel_b, ssel_c, soa_b, soa_l, soa_v,
+                           D: tl.constexpr, bb_: tl.constexpr, BB: tl.constexpr,
+                           BT: tl.constexpr, BK: tl.constexpr, BV: tl.constexpr,
+                           BG: tl.constexpr, BD: tl.constexpr,
+                           ND: tl.constexpr, NB: tl.constexpr, NDM: tl.constexpr):
+    """TREE-ROUTED intra: byte-for-byte the production `_rola_fwd_intra` collapse-intra — content gram G
+    built ONCE, the full routing gram R accumulated over state-blocks IN-KERNEL, A=G⊙R⊙causal, o=A·v —
+    with the ONLY change being R's source: each state-block's [BT,BG] r/w tiles are BUILT from h+Wr,Ww via
+    `_build_rw_tile` instead of `tl.load(rg/wg)`. nc collapses; output is [B,L,dv]."""
+    b = tl.program_id(0)
+    t = tl.program_id(1)
+    offs_t = tl.arange(0, BT)
+    offs_v = tl.arange(0, BV)
+    offs_bb = tl.arange(0, BB)
+    bmask = offs_bb < bb_
+    rows = t * BT + offs_t
+    rmask = rows < L
+    G = tl.zeros([BT, BT], dtype=tl.float32)
+    for d0 in range(ND):
+        offs_d = d0 * BK + tl.arange(0, BK)
+        dmask = offs_d < dqk
+        qc = tl.load(q_ptr + b*sq_b + rows[:, None]*sq_l + offs_d[None, :]*sq_d,
+                     mask=rmask[:, None] & dmask[None, :], other=0.0)
+        kc = tl.load(k_ptr + b*sq_b + rows[:, None]*sq_l + offs_d[None, :]*sq_d,
+                     mask=rmask[:, None] & dmask[None, :], other=0.0)
+        G += tl.dot(qc, tl.trans(kc))
+    R = tl.zeros([BT, BT], dtype=tl.float32)
+    for sb in range(NB):
+        offs_c = sb * BG + tl.arange(0, BG)
+        cmask = offs_c < nc
+        rgc, wgc = _build_rw_tile(h_ptr, wr_ptr, ww_ptr, sel_ptr, offs_c, cmask,
+                                  b, rows, rmask, offs_bb, bmask, d_model,
+                                  sh_b, sh_l, sh_d, swr_lvl, swr_d, swr_b, sww_lvl, sww_d, sww_b,
+                                  ssel_lvl, ssel_b, ssel_c, D, BT, BB, BG, BD, NDM)
+        R += tl.dot(rgc.to(tl.float32), tl.trans(wgc))
+    vc = tl.load(v_ptr + b*sv_b + rows[:, None]*sv_l + offs_v[None, :]*sv_d,
+                 mask=rmask[:, None] & (offs_v[None, :] < dv), other=0.0)
+    causal = (offs_t[:, None] >= offs_t[None, :]) & rmask[:, None] & rmask[None, :]
+    A = G * R * causal
+    o = tl.dot(A.to(vc.dtype), vc)
+    tl.store(outa_ptr + b*soa_b + rows[:, None]*soa_l + offs_v[None, :]*soa_v,
+             o, mask=rmask[:, None] & (offs_v[None, :] < dv))
+
+
+@triton.autotune(configs=_SCAN_CFGS, key=_AT_KEY, reset_to_zero=['outa_ptr'],
+                 prune_configs_by={'early_config_prune': _prune_bv}, **autotune_cache_kwargs)
+@triton.jit
+def _rola_routed_fwd_inter(q_ptr, k_ptr, v_ptr, h_ptr, wr_ptr, ww_ptr, sel_ptr, outa_ptr,
+                           L, dqk, dv: tl.constexpr, nc, d_model,
+                           sq_b, sq_l, sq_d, sv_b, sv_l, sv_d,
+                           sh_b, sh_l, sh_d, swr_lvl, swr_d, swr_b, sww_lvl, sww_d, sww_b,
+                           ssel_lvl, ssel_b, ssel_c, soa_b, soa_n, soa_l, soa_v,
+                           D: tl.constexpr, bb_: tl.constexpr, BB: tl.constexpr,
+                           BT: tl.constexpr, BK: tl.constexpr, BV: tl.constexpr,
+                           BVF: tl.constexpr, BG: tl.constexpr, BD: tl.constexpr,
+                           NCH: tl.constexpr, NDM: tl.constexpr):
+    """TREE-ROUTED inter: byte-for-byte the production `_rola_fwd_inter` NB-fused inter scan — one
+    (batch, state-block, FEATURE-block) carries Sd[BK, BG*BV] across chunks, o_inter atomic-accumulated
+    into the shared [B,L,dv] buffer, value-OUTER over cdiv(dv,BV) — with the ONLY change being the read/
+    write gate source: the [BT,BG] rgc/wgc tiles are BUILT from h+Wr,Ww via `_build_rw_tile` instead of
+    `tl.load(rg/wg)`. Same state scan, same SMEM bound (BK + value-tile BV), same autotune/reset_to_zero."""
+    b = tl.program_id(0)
+    sb = tl.program_id(1)
+    d0 = tl.program_id(2)
+    ND_V = (dv + BV - 1) // BV
+    offs_t = tl.arange(0, BT)
+    offs_d = d0 * BK + tl.arange(0, BK)
+    dmask = offs_d < dqk
+    offs_bb = tl.arange(0, BB)
+    bmask = offs_bb < bb_
+    offs_c = sb * BG + tl.arange(0, BG)
+    cmask = offs_c < nc
+    for vb in range(ND_V):
+        offs_v = vb * BV + tl.arange(0, BV)
+        vmask = offs_v < dv
+        Sd = tl.zeros([BK, BG * BV], dtype=tl.float32)
+        for t in range(NCH):
+            rows = t * BT + offs_t
+            rmask = rows < L
+            qc = tl.load(q_ptr + b*sq_b + rows[:, None]*sq_l + offs_d[None, :]*sq_d,
+                         mask=rmask[:, None] & dmask[None, :], other=0.0)
+            rgc, wgc = _build_rw_tile(h_ptr, wr_ptr, ww_ptr, sel_ptr, offs_c, cmask,
+                                      b, rows, rmask, offs_bb, bmask, d_model,
+                                      sh_b, sh_l, sh_d, swr_lvl, swr_d, swr_b, sww_lvl, sww_d, sww_b,
+                                      ssel_lvl, ssel_b, ssel_c, D, BT, BB, BG, BD, NDM)
+            P = tl.dot(qc, Sd.to(qc.dtype))
+            P3 = tl.reshape(P, [BT, BG, BV])
+            o_inter = tl.sum(P3 * rgc[:, :, None], axis=1)
+            tl.atomic_add(outa_ptr + b*soa_b + rows[:, None]*soa_l + offs_v[None, :]*soa_v,
+                          o_inter, mask=rmask[:, None] & vmask[None, :])
+            kc = tl.load(k_ptr + b*sq_b + rows[:, None]*sq_l + offs_d[None, :]*sq_d,
+                         mask=rmask[:, None] & dmask[None, :], other=0.0)
+            vc = tl.load(v_ptr + b*sv_b + rows[:, None]*sv_l + offs_v[None, :]*sv_d,
+                         mask=rmask[:, None] & vmask[None, :], other=0.0)
+            WV = tl.reshape(wgc[:, :, None] * vc[:, None, :], [BT, BG * BV])
+            Sd += tl.dot(tl.trans(kc), WV.to(kc.dtype))
+
+
+def _routed_fwd_tiled(q, k, v, h, Wr, Ww, D, b, sel, chunk, BG, BK=64):
+    """D-tiled numerator-only tree-routed forward — the routed twin of `_fwd_tiled`. Identical
+    intra/inter dispatch (separate buffers, intra store / inter atomic reset_to_zero, value-tiling), with
+    the routing gram source swapped to (h, Wr, Ww) via the routed kernels. Returns [B,L,dv] at
+    BV=next_pow2(dv); the [L,nc] gates are never allocated."""
+    B, L, dqk = q.shape
+    dv = v.shape[-1]
+    d_model = h.shape[-1]
+    nc = b ** D
+    BV = max(16, triton.next_power_of_2(dv))
+    BK = min(BK, max(16, triton.next_power_of_2(dqk)))
+    BD = max(16, triton.next_power_of_2(d_model))
+    BB = max(16, triton.next_power_of_2(b))
+    ND = triton.cdiv(dqk, BK)
+    NB = triton.cdiv(nc, BG)
+    NCH = triton.cdiv(L, chunk)
+    NDM = triton.cdiv(d_model, BD)
+    q, k, v, h, Wr, Ww = [x.contiguous() for x in (q, k, v, h, Wr, Ww)]
+    out_intra = torch.zeros(B, L, BV, device=q.device, dtype=torch.float32)
+    out_inter = torch.zeros(B, L, BV, device=q.device, dtype=torch.float32)
+    so_a = (out_intra.stride(0), out_intra.stride(1), out_intra.stride(2))
+    so_e = (out_inter.stride(0), 0, out_inter.stride(1), out_inter.stride(2))
+    base = (q.stride(0), q.stride(1), q.stride(2), v.stride(0), v.stride(1), v.stride(2))
+    route = (h.stride(0), h.stride(1), h.stride(2),
+             Wr.stride(0), Wr.stride(1), Wr.stride(2), Ww.stride(0), Ww.stride(1), Ww.stride(2),
+             sel.stride(0), sel.stride(1), sel.stride(2))
+    _rola_routed_fwd_intra[(B, NCH)](q, k, v, h, Wr, Ww, sel, out_intra, L, dqk, dv, nc, d_model,
+                                     *base, *route, *so_a,
+                                     D=D, bb_=b, BB=BB, BT=chunk, BK=BK, BV=BV, BG=BG, BD=BD,
+                                     ND=ND, NB=NB, NDM=NDM)
+    _rola_routed_fwd_inter[(B, NB, ND)](q, k, v, h, Wr, Ww, sel, out_inter, L, dqk, dv, nc, d_model,
+                                        *base, *route, *so_e,
+                                        D=D, bb_=b, BB=BB, BT=chunk, BK=BK, BVF=BV, BG=BG, BD=BD,
+                                        NCH=NCH, NDM=NDM)
+    return out_intra[..., :dv] + out_inter[..., :dv]
+
+
+@input_guard
+def rola_rla_routed_triton(q, k, v, h, Wr, Ww, D, b, chunk=None, BG=16):
+    """Un-normalized TREE-ROUTED RLA readout via Triton — the in-kernel-routing twin of
+    `rola_rla_triton`. The routing gram is built IN-KERNEL from the hidden state h + per-level router
+    weights Wr,Ww ∈ [D,d_model,b] (b^D=nc); the [L,nc] gates are never materialized. FORWARD ONLY (a
+    plain readout — the differentiable router-grad fold is the next phase; see the module header seam).
+
+    q,k:[BH,L,K]  v:[BH,L,V]  h:[BH,L,d_model]  Wr,Ww:[D,d_model,b].  Returns [BH,L,V] at BV=next_pow2(V).
+    Flat (D=1, b=nc) is the fused equivalent of `rola_rla_triton(q,k,v,r,w)` with r,w the D=1 router's
+    explicit softmax gates."""
+    chunk = _CHUNK_FWD if chunk is None else min(chunk, _CHUNK_FWD)
+    nc = b ** D
+    sel = _build_sel(D, b, nc, q.device)
+    return _routed_fwd_tiled(q, k, v, h, Wr, Ww, D, b, sel, chunk=chunk, BG=BG)
+
+
+# ============================================================================
 # Scalar-gated RoLA-GLA Triton kernels (shared-gram + per-state scalar decay).
 #
 # Decay is absorbed chunk-LOCALLY (rt=rg·e^a, wt=wg·e^{-a}, a=cumsum(ld)) so the effective weight
@@ -2127,3 +2370,119 @@ def _final_state(kf, vf, wf, gf, B, H):
         wgt = wgt * (G[:, -1:, :] - G).exp()
     state = torch.einsum('btc,btd,bte->bcde', wgt, kf.float(), v1)      # [BH, nc, K, V+1]
     return state.view(B, H * state.shape[1], state.shape[2], state.shape[3])
+
+
+# ============================================================================
+# `chunk_rola_routed` — public TREE-ROUTED entry point (FORWARD ONLY).
+#
+# The in-kernel-routing counterpart of `chunk_rola`: instead of precomputed gates r,w it takes the
+# hidden state h + per-level router weights Wr,Ww and builds the routing gram IN-KERNEL (the [L,nc]
+# gates are never materialized). Flat (D=1, b=nc) is the strict fused equivalent of `chunk_rola`'s
+# precomputed-gate path with r,w the D=1 router's explicit softmax gates — confirming this is a
+# generalization that reuses the real RLA kernel.
+#
+# FORWARD ONLY: this returns a plain (non-autograd) routed readout. The differentiable router-grad fold
+# (dWr,dWw,d_h, the [BT,nc] gate-grads consumed in-kernel) is the explicit NEXT PHASE — the validated
+# backward kernels already live in proto_tree_routing.py (`_bwd_intra_kernel`, `_bwd_inter_*`,
+# `_fold_*`); wrapping this forward in a `_RoLARoutedFn` (mirroring proto's `_TreeRoutedFn`) is the seam.
+# RLA only here (g=None); the GLA (scalar-decay) routed twin is a further extension.
+# ============================================================================
+
+
+def _tree_gates_torch(hf, Wr, Ww, D, b):
+    """Build the EXPLICIT folded [BH,T,nc] read/write gates from (h, Wr, Ww) the way the tree
+    factorizes — r[...,leaf] = Π_lvl softmax(h·Wr[lvl])[..., digit_lvl(leaf)]. This is the MATERIALIZED
+    path the routed kernel avoids; used here only for (a) the normalized-norm den pre-pass and (b) the
+    flat-equivalence validation reference (identical math to proto_tree_routing._flat_gates_from_tree)."""
+    nc = b ** D
+    fr = torch.stack([torch.softmax(hf @ Wr[i].to(hf.dtype), dim=-1) for i in range(D)], 0)  # [D,BH,T,b]
+    fw = torch.stack([torch.softmax(hf @ Ww[i].to(hf.dtype), dim=-1) for i in range(D)], 0)
+    r = torch.ones(*hf.shape[:-1], nc, device=hf.device, dtype=fr.dtype)
+    w = torch.ones(*hf.shape[:-1], nc, device=hf.device, dtype=fw.dtype)
+    for leaf in range(nc):
+        digs = [(leaf // (b ** (D - 1 - i))) % b for i in range(D)]
+        for i, d in enumerate(digs):
+            r[..., leaf] = r[..., leaf] * fr[i, ..., d]
+            w[..., leaf] = w[..., leaf] * fw[i, ..., d]
+    return r, w
+
+
+def _rola_routed_readout(qf, kf, vf, hf, Wr, Ww, D, b, chunk_size):
+    """Folded tree-routed numerator-only readout. CUDA → in-kernel routed Triton kernels (gates never
+    materialized); else → eager core on explicit gates (capability fallback)."""
+    if qf.is_cuda:
+        return rola_rla_routed_triton(qf, kf, vf, hf, Wr, Ww, D, b, chunk=chunk_size)
+    r, w = _tree_gates_torch(hf, Wr, Ww, D, b)
+    return _rola_chunk_core(qf, kf, vf, w, r, None, chunk_size)
+
+
+@input_guard
+def chunk_rola_routed(q, k, v, h, Wr, Ww, D, b, norm='kappa', kappa=None, scale=None, eps=1e-5):
+    """TREE-ROUTED RoLA (in-kernel routing) readout with built-in normalization. FORWARD ONLY.
+
+    Args:
+        q, k:  φ-mapped queries/keys [B, T, H, K].
+        v:     values [B, T, H, V].
+        h:     pre-routing hidden state [B, T, H, d_model] (the router lives in the kernel).
+        Wr,Ww: per-level read/write router weights [D, d_model, b]  (b^D = nc).
+        D, b:  tree depth and branching (flat: D=1,b=nc; square: D=2,b=√nc; tree: b=2).
+        norm:  'raw' | 'global' | 'per_state' | 'kappa'.
+        kappa: per-token exponent [B,T,H,1] (required for norm='kappa').
+        scale: query scale (default 1/sqrt(K)).
+    Returns:
+        Normalized readout [B, T, H, V] ('raw' returns the un-normalized numerator). The [L,nc] gates
+        are NEVER materialized in the readout's routing gram.
+    """
+    if norm not in _NORMS:
+        raise ValueError(f"norm must be one of {_NORMS}, got {norm!r}")
+    if norm == 'kappa' and kappa is None:
+        raise ValueError("norm='kappa' requires a per-token `kappa` exponent tensor [B,T,H,1]")
+    B, T, H, K = q.shape
+    if scale is None:
+        scale = K ** -0.5
+    chunk_size = min(64, max(16, triton.next_power_of_2(T)))
+
+    def fold(t):
+        return t.permute(0, 2, 1, 3).reshape(B * H, T, t.shape[-1])
+
+    def unfold(t):
+        return t.view(B, H, T, -1).permute(0, 2, 1, 3).contiguous()
+
+    compute_dtype = torch.get_autocast_dtype('cuda') if torch.is_autocast_enabled() else q.dtype
+
+    def foldc(t):
+        return fold(t).to(compute_dtype)
+
+    qf, kf, vf, hf = foldc(q) * scale, foldc(k), foldc(v), foldc(h)
+    Wr = Wr.to(compute_dtype)
+    Ww = Ww.to(compute_dtype)
+
+    if norm == 'raw':
+        return unfold(_rola_routed_readout(qf, kf, vf, hf, Wr, Ww, D, b, chunk_size)).to(v.dtype)
+
+    # Normalized norms need the per-state den pre-pass, which is keyed on the WRITE gate w. The
+    # readout's routing gram stays in-kernel (gates never materialized); only the den pre-pass uses the
+    # explicit gates (a separate, smaller pass). This is the forward-only recipe — the routed den
+    # pre-pass is a follow-up alongside the backward.
+    rf, wf = _tree_gates_torch(hf, Wr, Ww, D, b)
+    rf, wf = rf.to(compute_dtype), wf.to(compute_dtype)
+    if qf.is_cuda:
+        d = rola_perstate_den_triton(qf, kf, wf)
+    else:
+        d = _perstate_den_torch(qf, kf, wf, None, chunk_size, eps)
+    if norm == 'kappa':
+        rf_scaled = (rf * (d + eps).pow(-fold(kappa).to(d.dtype))).to(compute_dtype)
+    elif norm == 'per_state':
+        rf_scaled = (rf / (d + eps)).to(compute_dtype)
+    else:  # global
+        rf_scaled = rf
+    # The read-gate rescale (kappa/per_state) is a per-(token,state) factor that does NOT factorize
+    # through the tree, so the rescaled-read readout falls back to the explicit-gate core. The IN-KERNEL
+    # routing claim holds for the 'raw'/'global' numerator (unscaled read gate); 'global' keeps r̃=r so
+    # it stays fully in-kernel (gates never materialized in its readout gram).
+    if norm == 'global':
+        num = _rola_routed_readout(qf, kf, vf, hf, Wr, Ww, D, b, chunk_size)
+    else:
+        num = _rola_chunk_core(qf, kf, vf, wf, rf_scaled, None, chunk_size)
+    den = (rf_scaled * d).sum(-1, keepdim=True)
+    return unfold(num / (den + eps)).to(v.dtype)
