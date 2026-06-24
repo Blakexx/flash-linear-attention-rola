@@ -686,9 +686,13 @@ def _rola_rla_routed_bwd(q, k, v, h, Wr, Ww, do, D, b, chunk, BG):
     # per-chunk pre-state snapshots (the recurrent STATE, not gates) for the reverse-scan — recomputed
     # here at the SAME fp32 router precision as the fold, so fwd/bwd routing is bit-consistent.
     snap = _routed_snapshots(q, k, v, h, Wr, Ww, D, b, sel, chunk, BG)
-    dq = torch.zeros(B, L, BK, device=q.device, dtype=torch.float32)
-    dk = torch.zeros(B, L, BK, device=q.device, dtype=torch.float32)
-    dvv = torch.zeros(B, L, BV, device=q.device, dtype=torch.float32)
+    # dvv/dq/dk are written by the fold kernels at v's / q's row strides (sv_l=v.stride(1)=dv,
+    # sq_l=q.stride(1)=dqk), so they MUST be allocated at the TRUE dv/dqk width (NOT padded BV/BK) or
+    # the row layout corrupts for non-pow2 dv/dqk (e.g. dv=24→BV=32). The in-kernel [BT,BV]/[BT,BK]
+    # accumulators store only the masked :dv/:dqk lanes (vmask/kmask). Mirrors `_kappa_routed_bwd`.
+    dq = torch.zeros(B, L, dqk, device=q.device, dtype=torch.float32)
+    dk = torch.zeros(B, L, dqk, device=q.device, dtype=torch.float32)
+    dvv = torch.zeros(B, L, dv, device=q.device, dtype=torch.float32)
     dh = torch.zeros(B, L, d_model, device=q.device, dtype=torch.float32)
     dWr = torch.zeros(D, d_model, b, device=q.device, dtype=torch.float32)
     dWw = torch.zeros(D, d_model, b, device=q.device, dtype=torch.float32)
