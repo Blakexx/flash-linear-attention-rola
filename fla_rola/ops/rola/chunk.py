@@ -841,13 +841,20 @@ def _routed_snapshots(q, k, v, h, Wr, Ww, D, b, sel, chunk, BG, br=None, bw=None
     return snap
 
 
-def _rola_rla_routed_bwd(q, k, v, h, Wr, Ww, do, D, b, chunk, BG, b_r=None, b_w=None):
+def _rola_rla_routed_bwd(q, k, v, h, Wr, Ww, do, D, b, chunk, BG, b_r=None, b_w=None, ld=None):
     """Tree-routed RLA backward at the PRODUCTION state-block width BC=BG. Drives the validated proto
     fold kernels: one intra launch (dq,dk,dv-intra + dr,dw-intra fold) and a sequential reverse state-
     adjoint scan over chunks (state-update bwd → readout bwd → router-grad fold). The gate-grads dr,dw
     live only as transient [B,chunk,nc] scratch (gdr/gdw), OVERWRITTEN each chunk — never [L,nc]. With an
     optional routing bias b_r/b_w ∈ [D,b], also folds db_r/db_w (transient, never [L,nc]). Returns
-    dq,dk,dv,d_h,dWr,dWw (and db_r,db_w when biased) — all fp32."""
+    dq,dk,dv,d_h,dWr,dWw (and db_r,db_w when biased) — all fp32.
+
+    USE_G (GLA, #30): optional per-state log-decay ld:[B,L,nc] → the decayed routed backward — the proto
+    kernels use the DECAYED gates (rt=r·eᵃ, w_end=w·e^{Λ−a}), the running dS adjoint is decayed by e^Λ
+    between the state-bwd and read-bwd halves (the reverse of the forward's decvec carry), and a persistent
+    gda[B,L,nc] buffer collects the per-token log-decay adjoints (dart/da_wt/da_wend/dlam) which the driver
+    reverse-cumsums (intra-chunk) into dld. ld=None is byte-identical to the RLA path (USE_G=False)."""
+    use_g = ld is not None
     B, L, d_model = h.shape
     dqk = q.shape[-1]
     dv = v.shape[-1]
@@ -885,9 +892,13 @@ def _rola_rla_routed_bwd(q, k, v, h, Wr, Ww, do, D, b, chunk, BG, b_r=None, b_w=
         chunk = min(chunk, _KAPPA_BWD_CHUNK)
     NCH = triton.cdiv(L, chunk)
     sel = _build_sel(D, b, nc, q.device)
+    # ld:[B,L,nc] (GLA) clamped to the fp32 decay floor; RLA passes a zero stub the kernels skip (USE_G=False).
+    ld = (ld.float().clamp(min=_GLA_FLOOR).contiguous() if use_g else q.new_zeros(B, L, nc))
+    sgl = (ld.stride(0), ld.stride(1), ld.stride(2))
     # per-chunk pre-state snapshots (the recurrent STATE, not gates) for the reverse-scan — recomputed
     # here at the SAME fp32 router precision as the fold, so fwd/bwd routing is bit-consistent.
-    snap = _routed_snapshots(q, k, v, h, Wr, Ww, D, b, sel, chunk, BG, br, bw, has_bias)
+    snap = _routed_snapshots(q, k, v, h, Wr, Ww, D, b, sel, chunk, BG, br, bw, has_bias,
+                             ld=(ld if use_g else None))
     # dvv/dq/dk are written by the fold kernels at v's / q's row strides (sv_l=v.stride(1)=dv,
     # sq_l=q.stride(1)=dqk), so they MUST be allocated at the TRUE dv/dqk width (NOT padded BV/BK) or
     # the row layout corrupts for non-pow2 dv/dqk (e.g. dv=24→BV=32). The in-kernel [BT,BV]/[BT,BK]
@@ -900,48 +911,64 @@ def _rola_rla_routed_bwd(q, k, v, h, Wr, Ww, do, D, b, chunk, BG, b_r=None, b_w=
     dWw = torch.zeros(D, d_model, b, device=q.device, dtype=torch.float32)
     dbr = torch.zeros(D, b, device=q.device, dtype=torch.float32)   # routing-bias grads [D,b] (transient fold)
     dbw = torch.zeros(D, b, device=q.device, dtype=torch.float32)
+    # gda[B,L,nc]: persistent per-token log-decay adjoint accumulator (USE_G) — the intra kernel writes
+    # its da-pieces over all chunks (parallel), the inter kernels add theirs per chunk; reverse-cumsummed
+    # per chunk into dld at the end. RLA leaves it zero (a 1-col stub) and dld is unused.
+    gda = torch.zeros(B, L, nc, device=q.device, dtype=torch.float32) if use_g \
+        else q.new_zeros(B, 1, 1)
+    sga = (gda.stride(0), gda.stride(1), gda.stride(2))
     common = dict(D=D, b=b, BB=BB, BT=chunk, BK=BK_full, BV=BVO, BD=BD, BC=BC,
                   NCBLK=NCBLK, ND=triton.cdiv(dqk, BK_full), NDM=NDM, HAS_BIAS=has_bias,
-                  num_warps=4, num_stages=1)
+                  USE_G=use_g, num_warps=4, num_stages=1)
     _proto_bwd_intra[(B, NCH)](
-        h, q, k, v, Wr, Ww, sel, do, dq, dk, dvv, dh, dWr, dWw,
+        h, q, k, v, Wr, Ww, sel, ld, do, dq, dk, dvv, dh, dWr, dWw, gda,
         br, bw, dbr, dbw,
         L, d_model, dqk, dv, nc,
         h.stride(0), h.stride(1), h.stride(2), q.stride(0), q.stride(1), q.stride(2),
         v.stride(0), v.stride(1), v.stride(2),
         Wr.stride(0), Wr.stride(1), Wr.stride(2), Ww.stride(0), Ww.stride(1), Ww.stride(2),
-        sel.stride(0), sel.stride(1), sel.stride(2),
+        sel.stride(0), sel.stride(1), sel.stride(2), *sgl, *sga,
         do.stride(0), do.stride(1), do.stride(2), dh.stride(0), dh.stride(1), dh.stride(2),
         *sbias,
         **common)
     dS = torch.zeros(B, nc, dqk, dv, device=q.device, dtype=torch.float32)
     gdr = torch.zeros(B, chunk, nc, device=q.device, dtype=torch.float32)   # transient, OVERWRITTEN/chunk
     gdw = torch.zeros(B, chunk, nc, device=q.device, dtype=torch.float32)
+    dld = torch.zeros(B, L, nc, device=q.device, dtype=torch.float32) if use_g else None
     fold_common = dict(D=D, b=b, BB=BB, BT=chunk, BC=BC, BD=BD, NCBLK=NCBLK, NDM=NDM,
                        HAS_BIAS=has_bias, num_warps=4, num_stages=1)
     inter_common = dict(D=D, b=b, BB=BB, BT=chunk, BK=BK, BV=BV, BD=BD, BC=BC,
-                        NCBLK=NCBLK, ND=ND, NDM=NDM, HAS_BIAS=has_bias, num_warps=4, num_stages=1)
+                        NCBLK=NCBLK, ND=ND, NDM=NDM, HAS_BIAS=has_bias, USE_G=use_g,
+                        num_warps=4, num_stages=1)
     for c in reversed(range(NCH)):
         Sj = snap[:, c].contiguous()
+        # state-bwd reads dS = adjoint S_{j+1} (pre-decvec) → dk,dv,gdw + (USE_G) the carry/w_end da-pieces.
         _proto_bwd_inter_state[(B,)](
-            h, k, v, Wr, Ww, sel, dS, dk, dvv, gdw, br, bw,
+            h, k, v, Wr, Ww, sel, ld, Sj, dS, dk, dvv, gdw, gda, br, bw,
             L, d_model, dqk, dv, nc, c * chunk,
             h.stride(0), h.stride(1), h.stride(2), q.stride(0), q.stride(1), q.stride(2),
             v.stride(0), v.stride(1), v.stride(2),
             Wr.stride(0), Wr.stride(1), Wr.stride(2), Ww.stride(0), Ww.stride(1), Ww.stride(2),
-            sel.stride(0), sel.stride(1), sel.stride(2),
+            sel.stride(0), sel.stride(1), sel.stride(2), *sgl,
             dS.stride(0), dS.stride(1), dS.stride(2), dS.stride(3),
-            gdr.stride(0), gdr.stride(1), gdr.stride(2), *sbias,
+            gdr.stride(0), gdr.stride(1), gdr.stride(2), *sga, *sbias,
             **inter_common)
+        if use_g:
+            # decay the running dS adjoint by decvec=e^{Λ_c} (per state, broadcast over dqk×dv) — the
+            # reverse of the forward's state carry S_{j+1}=e^Λ S_j + ΔS. Must run AFTER state-bwd reads
+            # the S_{j+1} adjoint (and its ZdZ) and BEFORE read-bwd folds dS_read → adjoint S_j.
+            rows = slice(c * chunk, min(c * chunk + chunk, L))
+            Lam_c = ld[:, rows].sum(dim=1)                          # [B,nc] chunk-total per state
+            dS = dS * torch.exp(Lam_c)[:, :, None, None]
         _proto_bwd_inter_read[(B,)](
-            h, q, Wr, Ww, sel, Sj, dS, do, dq, gdr, br, bw,
+            h, q, Wr, Ww, sel, ld, Sj, dS, do, dq, gdr, gda, br, bw,
             L, d_model, dqk, dv, nc, c * chunk,
             h.stride(0), h.stride(1), h.stride(2), q.stride(0), q.stride(1), q.stride(2),
             Wr.stride(0), Wr.stride(1), Wr.stride(2), Ww.stride(0), Ww.stride(1), Ww.stride(2),
-            sel.stride(0), sel.stride(1), sel.stride(2),
+            sel.stride(0), sel.stride(1), sel.stride(2), *sgl,
             Sj.stride(0), Sj.stride(1), Sj.stride(2), Sj.stride(3),
             do.stride(0), do.stride(1), do.stride(2),
-            gdr.stride(0), gdr.stride(1), gdr.stride(2), *sbias,
+            gdr.stride(0), gdr.stride(1), gdr.stride(2), *sga, *sbias,
             **inter_common)
         _proto_fold[(B,)](
             h, Wr, Ww, sel, gdr, gdw, dh, dWr, dWw, br, bw, dbr, dbw,
@@ -952,8 +979,20 @@ def _rola_rla_routed_bwd(q, k, v, h, Wr, Ww, do, D, b, chunk, BG, b_r=None, b_w=
             gdr.stride(0), gdr.stride(1), gdr.stride(2), dh.stride(0), dh.stride(1), dh.stride(2),
             *sbias,
             **fold_common)
+    if use_g:
+        # dld = intra-chunk reverse-cumsum of the assembled da (gda): dld_t = Σ_{t'≥t in chunk} da_{t'}.
+        # Done per chunk on the [B,chunk,nc] slice (a_t resets each chunk in the fwd, so it's intra-only).
+        for c in range(NCH):
+            r0, r1 = c * chunk, min(c * chunk + chunk, L)
+            g_sl = gda[:, r0:r1]                                    # [B, len, nc]
+            tot = g_sl.sum(dim=1, keepdim=True)
+            dld[:, r0:r1] = tot - g_sl.cumsum(dim=1) + g_sl
     if has_bias:
+        if use_g:
+            return dq[..., :dqk], dk[..., :dqk], dvv[..., :dv], dh, dWr, dWw, dld, dbr, dbw
         return dq[..., :dqk], dk[..., :dqk], dvv[..., :dv], dh, dWr, dWw, dbr, dbw
+    if use_g:
+        return dq[..., :dqk], dk[..., :dqk], dvv[..., :dv], dh, dWr, dWw, dld
     return dq[..., :dqk], dk[..., :dqk], dvv[..., :dv], dh, dWr, dWw
 
 
@@ -966,15 +1005,16 @@ class _RoLARoutedFn(torch.autograd.Function):
     @staticmethod
     @input_guard
     @autocast_custom_fwd
-    def forward(ctx, q, k, v, h, Wr, Ww, D, b, chunk, BG, b_r, b_w):
+    def forward(ctx, q, k, v, h, Wr, Ww, D, b, chunk, BG, b_r, b_w, ld=None):
         chunk = _CHUNK_FWD if chunk is None else min(chunk, _CHUNK_FWD)
         nc = b ** D
         sel = _build_sel(D, b, nc, q.device)
         q, k, v, h, Wr, Ww = (x.contiguous() for x in (q, k, v, h, Wr, Ww))
-        o = _routed_fwd_tiled(q, k, v, h, Wr, Ww, D, b, sel, chunk=chunk, BG=BG, b_r=b_r, b_w=b_w)
+        ldc = ld.contiguous() if ld is not None else None
+        o = _routed_fwd_tiled(q, k, v, h, Wr, Ww, D, b, sel, chunk=chunk, BG=BG, b_r=b_r, b_w=b_w, ld=ldc)
         # save the inputs (NOT gates, NOT [L,nc] grads); the per-chunk pre-state snapshots the reverse-
-        # scan needs are recomputed in backward (fp32-router parity) by `_routed_snapshots`.
-        ctx.save_for_backward(q, k, v, h, Wr, Ww, b_r, b_w)
+        # scan needs are recomputed in backward (fp32-router parity) by `_routed_snapshots`. ld saved for GLA.
+        ctx.save_for_backward(q, k, v, h, Wr, Ww, b_r, b_w, ldc)
         ctx.D, ctx.b, ctx.chunk, ctx.BG = D, b, chunk, BG
         return o.to(q.dtype)
 
@@ -982,19 +1022,24 @@ class _RoLARoutedFn(torch.autograd.Function):
     @input_guard
     @autocast_custom_bwd
     def backward(ctx, do):
-        q, k, v, h, Wr, Ww, b_r, b_w = ctx.saved_tensors
+        q, k, v, h, Wr, Ww, b_r, b_w, ld = ctx.saved_tensors
         grads = _rola_rla_routed_bwd(
-            q, k, v, h, Wr, Ww, do.contiguous(), ctx.D, ctx.b, ctx.chunk, ctx.BG, b_r=b_r, b_w=b_w)
+            q, k, v, h, Wr, Ww, do.contiguous(), ctx.D, ctx.b, ctx.chunk, ctx.BG,
+            b_r=b_r, b_w=b_w, ld=ld)
+        use_g = ld is not None
         if b_r is None:
-            dq, dk, dv, dh, dWr, dWw = grads
-            dbr = dbw = None
+            (dq, dk, dv, dh, dWr, dWw), dbr, dbw = (grads[:6]), None, None
+            dld = grads[6] if use_g else None
         else:
-            dq, dk, dv, dh, dWr, dWw, dbr, dbw = grads
-        # forward arg order: q, k, v, h, Wr, Ww, D, b, chunk, BG, b_r, b_w
+            dq, dk, dv, dh, dWr, dWw = grads[:6]
+            dld = grads[6] if use_g else None
+            dbr, dbw = grads[-2], grads[-1]
+        # forward arg order: q, k, v, h, Wr, Ww, D, b, chunk, BG, b_r, b_w, ld
         return (dq.to(q.dtype), dk.to(k.dtype), dv.to(v.dtype), dh.to(h.dtype),
                 dWr.to(Wr.dtype), dWw.to(Ww.dtype), None, None, None, None,
                 None if dbr is None else dbr.to(b_r.dtype),
-                None if dbw is None else dbw.to(b_w.dtype))
+                None if dbw is None else dbw.to(b_w.dtype),
+                None if dld is None else dld.to(ld.dtype))
 
 
 @input_guard
@@ -1008,7 +1053,17 @@ def rola_rla_routed_triton(q, k, v, h, Wr, Ww, D, b, chunk=None, BG=16, b_r=None
     q,k:[BH,L,K]  v:[BH,L,V]  h:[BH,L,d_model]  Wr,Ww:[D,d_model,b].  Returns [BH,L,V] at BV=next_pow2(V).
     Flat (D=1, b=nc) is the fused equivalent of `rola_rla_triton(q,k,v,r,w)` with r,w the D=1 router's
     explicit softmax gates. Grads dq,dk,dv,d_h,dWr,dWw (+db_r,db_w) match autograd to rel<1e-2 (bf16)."""
-    return _RoLARoutedFn.apply(q, k, v, h, Wr, Ww, D, b, chunk, BG, b_r, b_w)
+    return _RoLARoutedFn.apply(q, k, v, h, Wr, Ww, D, b, chunk, BG, b_r, b_w, None)
+
+
+@input_guard
+def rola_gla_routed_triton(q, k, v, h, Wr, Ww, ld, D, b, chunk=None, BG=16, b_r=None, b_w=None):
+    """Un-normalized TREE-ROUTED GLA readout via Triton — `rola_rla_routed_triton` + a per-state scalar
+    log-decay ld:[BH,L,nc] (GLA), DIFFERENTIABLE end-to-end ([L,nc] gates AND their grads never
+    materialized). The routing gram uses the DECAYED gates (rt=r·eᵃ, w_end=w·e^{Λ−a}) exactly like
+    `rola_gla_triton`, but with the routing built in-kernel from h+Wr,Ww. ld=None is the RLA path.
+    Grads dq,dk,dv,d_h,dWr,dWw,dld: q/k/v TIGHT (<8e-3), the gate/decay grads to the GLA fp32 floor."""
+    return _RoLARoutedFn.apply(q, k, v, h, Wr, Ww, D, b, chunk, BG, b_r, b_w, ld)
 
 
 # ============================================================================
