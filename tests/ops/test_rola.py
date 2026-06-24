@@ -623,3 +623,169 @@ def test_recurrent_state_carry(gla, norm):
                                       initial_state=s1, output_final_state=True)
         assert_close('split==whole readout', o_full, torch.cat([o1, o2], 1), tol)
         assert_close('split==whole state', s_full, s2, tol)
+
+
+# =============================================================================
+# FUSED kappa / per_state TREE-ROUTED path (`chunk_rola_routed`, norm in {kappa,per_state}).
+#
+# The production read-rescale r̃ = r·(d+ε)^{−κ} | r/(d+ε) computed IN-KERNEL (the per-state den d and
+# the rescaled gate r̃ live only as transient [BT,nc] SRAM tiles — never a [*,L,nc] HBM buffer). These
+# gates assert (1) FAITHFULNESS: the fused output AND all grads match the explicit-gate path (the math
+# the routed kernel reproduces) to the bf16/fp32 noise floor, flat/square/tree; (2) AUTOGRAD: grads
+# vs an fp64 chunked reference < 1e-2; (3) NO [*,L,nc] materialization (d_model≠nc≠L to avoid false
+# hits). RLA only (g=None), matching the routed path's scope.
+# =============================================================================
+def _tree_gates_oop(hf, Wr, Ww, D, b):
+    """Out-of-place explicit tree gates (the in-place `_tree_gates_torch` breaks autograd graph reuse)."""
+    fr = torch.stack([torch.softmax(hf @ Wr[i].to(hf.dtype), -1) for i in range(D)], 0)
+    fw = torch.stack([torch.softmax(hf @ Ww[i].to(hf.dtype), -1) for i in range(D)], 0)
+    rc, wc = [], []
+    for leaf in range(b ** D):
+        digs = [(leaf // (b ** (D - 1 - i))) % b for i in range(D)]
+        rr, ww = fr[0][..., digs[0]], fw[0][..., digs[0]]
+        for i in range(1, D):
+            rr, ww = rr * fr[i][..., digs[i]], ww * fw[i][..., digs[i]]
+        rc.append(rr)
+        wc.append(ww)
+    return torch.stack(rc, -1), torch.stack(wc, -1)
+
+
+def _kappa_ref_chunked(q, k, v, h, Wr, Ww, kappa, D, b, per_state, scale, chunk, eps=EPS):
+    """Differentiable chunked reference mirroring the fused kappa/per_state math EXACTLY (carries the
+    value + den states across chunks), on explicit tree gates. The semantic anchor the fused path
+    reproduces bit-for-bit; used for both the faithfulness and the fp64-autograd gates."""
+    B, T, H, Kd = q.shape
+    nc = b ** D
+    def fold(t):
+        return t.permute(0, 2, 1, 3).reshape(B * H, T, t.shape[-1])
+
+    def unfold(t):
+        return t.view(B, H, T, -1).permute(0, 2, 1, 3).contiguous()
+    qf, kf, vf, hf = fold(q) * scale, fold(k), fold(v), fold(h)
+    rf, wf = _tree_gates_oop(hf, Wr, Ww, D, b)
+    kapf = fold(kappa)
+    BH = B * H
+    Sval = qf.new_zeros(BH, nc, Kd, vf.shape[-1])
+    Sden = qf.new_zeros(BH, nc, Kd)
+    outs = []
+    for c0 in range(0, T, chunk):
+        c1 = min(c0 + chunk, T)
+        Cc = c1 - c0
+        qc, kc, vc = qf[:, c0:c1], kf[:, c0:c1], vf[:, c0:c1]
+        rc, wc, kc2 = rf[:, c0:c1], wf[:, c0:c1], kapf[:, c0:c1]
+        G = torch.einsum('bid,bjd->bij', qc, kc)
+        caus = torch.tril(torch.ones(Cc, Cc, device=q.device, dtype=qf.dtype))
+        d = torch.einsum('bij,bjc->bic', G * caus, wc) + torch.einsum('bik,bck->bic', qc, Sden)
+        rt = (rc / (d + eps)) if per_state else rc * (d + eps).pow(-kc2)
+        R = torch.einsum('bic,bjc->bij', rt, wc)
+        num = (torch.einsum('bij,bjv->biv', G * R * caus, vc)
+               + torch.einsum('bic,bicv->biv', rt, torch.einsum('bik,bckv->bicv', qc, Sval)))
+        den = (rt * d).sum(-1, keepdim=True)
+        outs.append(num / (den + eps))
+        Sval = Sval + torch.einsum('bjc,bjk,bjv->bckv', wc, kc, vc)
+        Sden = Sden + torch.einsum('bjc,bjk->bck', wc, kc)
+    return unfold(torch.cat(outs, 1))
+
+
+_ROUTE_SHAPES = [(1, 8), (2, 3), (3, 2), (2, 4)]   # flat, square(nc=9), tree(nc=8), square(nc=16)
+
+
+@pytest.mark.parametrize('per_state', [False, True])
+@pytest.mark.parametrize('D,b', _ROUTE_SHAPES)
+def test_kappa_routed_autograd_fp64(D, b, per_state):
+    """fp64 gate: fused chunk_rola_routed (kappa|per_state) grads == autograd of the chunked reference,
+    flat/square/tree, NCH>=4 (well-conditioned q,k>=0 so the den is sizable and the pow/divide stable).
+    fp64 → rigorous ~1e-3 (the bf16/algorithmic floor is the separate faithfulness gate)."""
+    if device != 'cuda':
+        pytest.skip('RoLA Triton kernels require CUDA')
+    norm = 'per_state' if per_state else 'kappa'
+    B, H, T, Kd, V, dm = 2, 2, 96, 16, 24, 40   # NCH=6 at the backward chunk (16); dm!=nc, dm!=L
+    scale = Kd ** -0.5
+    g = torch.Generator(device=device).manual_seed(0)
+
+    def mk(*s, f=False):
+        x = torch.randn(*s, device=device, dtype=torch.float64, generator=g)
+        return ((torch.nn.functional.elu(x) + 1.0) if f else x).requires_grad_()
+    q, k = mk(B, T, H, Kd, f=True), mk(B, T, H, Kd, f=True)
+    v, h = mk(B, T, H, V), mk(B, T, H, dm)
+    Wr = (torch.randn(D, dm, b, device=device, dtype=torch.float64, generator=g) * 0.4).requires_grad_()
+    Ww = (torch.randn(D, dm, b, device=device, dtype=torch.float64, generator=g) * 0.4).requires_grad_()
+    kappa = (torch.rand(B, T, H, 1, device=device, dtype=torch.float64, generator=g) * 0.5).requires_grad_()
+    go = torch.randn(B, T, H, V, device=device, dtype=torch.float64, generator=g)
+    sel = [q, k, v, h, Wr, Ww] + ([] if per_state else [kappa])
+    of = C.chunk_rola_routed(q.float(), k.float(), v.float(), h.float(), Wr.float(), Ww.float(), D, b,
+                             norm=norm, kappa=(None if per_state else kappa.float()), scale=scale)
+    gf = torch.autograd.grad(of, sel, go.float())
+    chunk = min(64, max(16, triton.next_power_of_2(T)))
+    oe = _kappa_ref_chunked(q, k, v, h, Wr, Ww, kappa, D, b, per_state, scale, chunk)
+    ge = torch.autograd.grad(oe, sel, go)
+    names = ['q', 'k', 'v', 'h', 'Wr', 'Ww'] + ([] if per_state else ['kappa'])
+    rels = {n: _relmax(a.float(), b.float()) for n, a, b in zip(names, gf, ge)}
+    assert _relmax(of.float(), oe.float()) < 1e-2, f'out {_relmax(of.float(), oe.float()):.2e}'
+    assert all(r < 1e-2 for r in rels.values()), f'grads {rels}'
+
+
+@pytest.mark.parametrize('per_state', [False, True])
+@pytest.mark.parametrize('D,b', _ROUTE_SHAPES)
+def test_kappa_routed_faithful_bf16(D, b, per_state):
+    """Faithfulness gate (the no-model-change proof): the fused output matches the chunked reference
+    (the explicit-gate math the routed kernel reproduces) to the bf16 noise floor, flat/square/tree."""
+    if device != 'cuda':
+        pytest.skip('RoLA Triton kernels require CUDA')
+    norm = 'per_state' if per_state else 'kappa'
+    B, H, T, Kd, V, dm = 2, 2, 128, 16, 24, 32
+    scale = Kd ** -0.5
+    g = torch.Generator(device=device).manual_seed(1)
+
+    def fm(x):
+        return torch.nn.functional.elu(x) + 1.0
+    q = fm(torch.randn(B, T, H, Kd, device=device, generator=g)).to(torch.bfloat16)
+    k = fm(torch.randn(B, T, H, Kd, device=device, generator=g)).to(torch.bfloat16)
+    v = torch.randn(B, T, H, V, device=device, generator=g).to(torch.bfloat16)
+    h = torch.randn(B, T, H, dm, device=device, generator=g).to(torch.bfloat16)
+    Wr = (torch.randn(D, dm, b, device=device, generator=g) * 0.5).to(torch.bfloat16)
+    Ww = (torch.randn(D, dm, b, device=device, generator=g) * 0.5).to(torch.bfloat16)
+    kappa = (torch.rand(B, T, H, 1, device=device, generator=g) * 0.6).to(torch.bfloat16)
+    of = C.chunk_rola_routed(q, k, v, h, Wr, Ww, D, b, norm=norm,
+                             kappa=(None if per_state else kappa), scale=scale)
+    oe = _kappa_ref_chunked(q.float(), k.float(), v.float(), h.float(), Wr.float(), Ww.float(),
+                            kappa.float(), D, b, per_state, scale, min(64, max(16, triton.next_power_of_2(T))))
+    assert _relmax(of.float(), oe.float()) < 1e-2, f'fused vs explicit out {_relmax(of.float(), oe.float()):.2e}'
+
+
+@pytest.mark.parametrize('per_state', [False, True])
+def test_kappa_routed_no_LNC_materialization(per_state):
+    """No [*,L,nc] d / r̃ buffer is ever allocated in the fused kappa/per_state path (fwd+bwd). Uses
+    d_model != nc != L so any [*,L,nc]-shaped allocation is unambiguous."""
+    if device != 'cuda':
+        pytest.skip('RoLA Triton kernels require CUDA')
+    D, b, nc = 2, 3, 9
+    B, H, T, Kd, V, dm = 2, 2, 96, 16, 24, 40   # T=96, nc=9, dm=40 all distinct
+    scale = Kd ** -0.5
+    def mk(*s, f=False):
+        x = torch.randn(*s, device=device)
+        return ((torch.nn.functional.elu(x) + 1.0) if f else x).to(torch.bfloat16).requires_grad_()
+    q, k, v, h = mk(B, T, H, Kd, f=True), mk(B, T, H, Kd, f=True), mk(B, T, H, V), mk(B, T, H, dm)
+    Wr = (torch.randn(D, dm, b, device=device) * 0.5).to(torch.bfloat16).requires_grad_()
+    Ww = (torch.randn(D, dm, b, device=device) * 0.5).to(torch.bfloat16).requires_grad_()
+    kappa = (torch.rand(B, T, H, 1, device=device) * 0.5).to(torch.bfloat16).requires_grad_()
+    norm = 'per_state' if per_state else 'kappa'
+    hits = []
+    real_zeros, real_empty = torch.zeros, torch.empty
+
+    def watch(fn):
+        def w(*a, **kw):
+            t = fn(*a, **kw)
+            sh = tuple(t.shape)
+            if T in sh and nc in sh:        # a [*,L,nc]-shaped d/r̃/gate buffer would trip this
+                hits.append(sh)
+            return t
+        return w
+    torch.zeros, torch.empty = watch(real_zeros), watch(real_empty)
+    try:
+        o = C.chunk_rola_routed(q, k, v, h, Wr, Ww, D, b, norm=norm,
+                                kappa=(None if per_state else kappa), scale=scale)
+        o.sum().backward()
+    finally:
+        torch.zeros, torch.empty = real_zeros, real_empty
+    assert not hits, f'[*,L={T},nc={nc}] buffer(s) materialized: {hits}'
