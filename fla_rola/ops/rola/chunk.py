@@ -1680,6 +1680,17 @@ def _recompute_S_gla(k_ptr, v_ptr, wg_ptr, ld_ptr, Sb_ptr, t, b, sb, L,
                      BV: tl.constexpr, KSNAP: tl.constexpr):
     # forward anchor = (t//KSNAP)*KSNAP (boundary state ENTERING that chunk); replay chunks [t0, t)
     # ascending applying Sflat = decvec*Sflat + Kᵀ·WV. Trip count is CONSTEXPR KSNAP (unrolled).
+    # WV-BT-SPLIT: WV=[BT,BG*BV] is the dominant SMEM tile of the GLA decay-replay (32KB at BT32/BG16/BV16)
+    # — the term that pushes GLA-qr 32KB past a 99KB (sm_86) card vs the RLA path (which reuses one tile).
+    # Kᵀ·WV contracts the BT (time) axis, so split that contraction into NWV row-blocks: each block
+    # materialises only a [BTS,BG*BV] sub-WV (BTS=BT/NWV) and accumulates its dot. The decay exponent is
+    # the GLOBAL within-chunk prefix-sum, carried across blocks via `base` (=Σ ld of earlier blocks); Lam
+    # (chunk total) is the masked full-load sum (==the old where(offs_t==BT-1,cumsum) since masked rows
+    # carry ld=0). Halves the resident replay tile (32→16KB). Exact (matmul contraction split + exact
+    # prefix carry); NWV=1 (BT<=16) is byte-identical to the un-split body. tl.dot needs the contracted
+    # BT-block >=16 ⇒ BTS>=16 (BT32→NWV2, BT16→NWV1).
+    NWV: tl.constexpr = BT // 16 if BT >= 32 else 1
+    BTS: tl.constexpr = BT // NWV
     t0 = (t // KSNAP) * KSNAP
     Sflat = tl.load(Sb_ptr + b*ssb_b + sb*ssb_n + (t // KSNAP)*ssb_t
                     + offs_d[:, None]*ssb_d + offs_e[None, :]*ssb_e, mask=dmask[:, None], other=0.0)
@@ -1687,20 +1698,29 @@ def _recompute_S_gla(k_ptr, v_ptr, wg_ptr, ld_ptr, Sb_ptr, t, b, sb, L,
         tt = t0 + i
         rows = tt * BT + offs_t
         rmask = (rows < L) & (tt < t)
-        kc = tl.load(k_ptr + b*sq_b + rows[:, None]*sq_l + offs_d[None, :]*sq_d,
-                     mask=rmask[:, None] & dmask[None, :], other=0.0).to(tl.float32)
-        vc = tl.load(v_ptr + b*sv_b + rows[:, None]*sv_l + offs_v[None, :]*sv_d,
-                     mask=rmask[:, None] & vmask[None, :], other=0.0).to(tl.float32)
-        wgc = tl.load(wg_ptr + b*sg_b + rows[:, None]*sg_l + offs_c[None, :]*sg_c,
-                      mask=rmask[:, None] & cmask[None, :], other=0.0).to(tl.float32)
         ldc = tl.load(ld_ptr + b*sg_b + rows[:, None]*sg_l + offs_c[None, :]*sg_c,
                       mask=rmask[:, None] & cmask[None, :], other=0.0).to(tl.float32)
-        a = tl.cumsum(ldc, axis=0)
-        Lam = tl.sum(tl.where(offs_t[:, None] == (BT - 1), a, 0.0), axis=0)
-        w_end = wgc * tl.exp(Lam[None, :] - a)
-        WV = tl.reshape(w_end[:, :, None] * vc[:, None, :], [BT, BG * BV])
+        Lam = tl.sum(ldc, axis=0)
         decvec = tl.reshape(tl.exp(Lam)[:, None] * tl.full([BG, BV], 1.0, tl.float32), [BG * BV])
-        Sflat = decvec[None, :] * Sflat + tl.dot(tl.trans(kc), WV.to(kc.dtype))
+        upd = tl.zeros([BD, BG * BV], dtype=tl.float32)
+        base = tl.zeros([BG], dtype=tl.float32)
+        for s in tl.static_range(NWV):
+            srows = tt * BT + s * BTS + tl.arange(0, BTS)
+            srmask = (srows < L) & (tt < t)
+            sk = tl.load(k_ptr + b*sq_b + srows[:, None]*sq_l + offs_d[None, :]*sq_d,
+                         mask=srmask[:, None] & dmask[None, :], other=0.0).to(tl.float32)
+            sv = tl.load(v_ptr + b*sv_b + srows[:, None]*sv_l + offs_v[None, :]*sv_d,
+                         mask=srmask[:, None] & vmask[None, :], other=0.0).to(tl.float32)
+            swg = tl.load(wg_ptr + b*sg_b + srows[:, None]*sg_l + offs_c[None, :]*sg_c,
+                          mask=srmask[:, None] & cmask[None, :], other=0.0).to(tl.float32)
+            sld = tl.load(ld_ptr + b*sg_b + srows[:, None]*sg_l + offs_c[None, :]*sg_c,
+                          mask=srmask[:, None] & cmask[None, :], other=0.0).to(tl.float32)
+            a_s = base[None, :] + tl.cumsum(sld, axis=0)
+            w_end_s = swg * tl.exp(Lam[None, :] - a_s)
+            WVs = tl.reshape(w_end_s[:, :, None] * sv[:, None, :], [BTS, BG * BV])
+            upd += tl.dot(tl.trans(sk), WVs.to(sk.dtype))
+            base += tl.sum(sld, axis=0)
+        Sflat = decvec[None, :] * Sflat + upd
     return Sflat
 
 
@@ -1713,6 +1733,12 @@ def _recompute_dS_gla(q_ptr, rg_ptr, ld_ptr, g_ptr, dSa_ptr, t, b, sb, L,
                       BV: tl.constexpr, KSNAP: tl.constexpr):
     # reverse anchor = top of t's coarse block (slot holds Σ_{t'>top}); replay chunks (t, top] in REVERSE
     # applying dS = decvec*dS + Qᵀ·rt_g → Σ_{t'>t}. Trip count CONSTEXPR KSNAP; tt<=t OR tt>top MASKED.
+    # WV-BT-SPLIT (mirror of _recompute_S_gla): rt_g=[BT,BG*BV] is the dominant replay SMEM tile; Qᵀ·rt_g
+    # contracts the BT axis, so split into NWV row-blocks of [BTS,BG*BV], carrying the within-chunk decay
+    # prefix `a_s = base + cumsum` across blocks (rt = rgc·e^{a}, forward prefix). Halves the tile
+    # (32→16KB); NWV=1 (BT<=16) is byte-identical to the un-split body.
+    NWV: tl.constexpr = BT // 16 if BT >= 32 else 1
+    BTS: tl.constexpr = BT // NWV
     top = (t // KSNAP) * KSNAP + (KSNAP - 1)
     if top > NCH - 1:
         top = NCH - 1
@@ -1722,20 +1748,29 @@ def _recompute_dS_gla(q_ptr, rg_ptr, ld_ptr, g_ptr, dSa_ptr, t, b, sb, L,
         tt = top - i
         rows = tt * BT + offs_t
         rmask = (rows < L) & (tt > t)
-        qc = tl.load(q_ptr + b*sq_b + rows[:, None]*sq_l + offs_d[None, :]*sq_d,
-                     mask=rmask[:, None] & dmask[None, :], other=0.0).to(tl.float32)
-        rgc = tl.load(rg_ptr + b*sg_b + rows[:, None]*sg_l + offs_c[None, :]*sg_c,
-                      mask=rmask[:, None] & cmask[None, :], other=0.0).to(tl.float32)
-        gc = tl.load(g_ptr + b*sgr_b + rows[:, None]*sgr_l + offs_v[None, :]*sgr_d,
-                     mask=rmask[:, None] & vmask[None, :], other=0.0).to(tl.float32)
         ldc = tl.load(ld_ptr + b*sg_b + rows[:, None]*sg_l + offs_c[None, :]*sg_c,
                       mask=rmask[:, None] & cmask[None, :], other=0.0).to(tl.float32)
-        a = tl.cumsum(ldc, axis=0)
-        rt = rgc * tl.exp(a)
-        Lam = tl.sum(tl.where(offs_t[:, None] == (BT - 1), a, 0.0), axis=0)
-        rt_g = tl.reshape(rt[:, :, None] * gc[:, None, :], [BT, BG * BV])
+        Lam = tl.sum(ldc, axis=0)
         decvec = tl.reshape(tl.exp(Lam)[:, None] * tl.full([BG, BV], 1.0, tl.float32), [BG * BV])
-        dS = decvec[None, :] * dS + tl.dot(tl.trans(qc), rt_g.to(qc.dtype))
+        upd = tl.zeros([BD, BG * BV], dtype=tl.float32)
+        base = tl.zeros([BG], dtype=tl.float32)
+        for s in tl.static_range(NWV):
+            srows = tt * BT + s * BTS + tl.arange(0, BTS)
+            srmask = (srows < L) & (tt > t)
+            sq = tl.load(q_ptr + b*sq_b + srows[:, None]*sq_l + offs_d[None, :]*sq_d,
+                         mask=srmask[:, None] & dmask[None, :], other=0.0).to(tl.float32)
+            srg = tl.load(rg_ptr + b*sg_b + srows[:, None]*sg_l + offs_c[None, :]*sg_c,
+                          mask=srmask[:, None] & cmask[None, :], other=0.0).to(tl.float32)
+            sg_v = tl.load(g_ptr + b*sgr_b + srows[:, None]*sgr_l + offs_v[None, :]*sgr_d,
+                           mask=srmask[:, None] & vmask[None, :], other=0.0).to(tl.float32)
+            sld = tl.load(ld_ptr + b*sg_b + srows[:, None]*sg_l + offs_c[None, :]*sg_c,
+                          mask=srmask[:, None] & cmask[None, :], other=0.0).to(tl.float32)
+            a_s = base[None, :] + tl.cumsum(sld, axis=0)
+            rt_s = srg * tl.exp(a_s)
+            rt_g_s = tl.reshape(rt_s[:, :, None] * sg_v[:, None, :], [BTS, BG * BV])
+            upd += tl.dot(tl.trans(sq), rt_g_s.to(sq.dtype))
+            base += tl.sum(sld, axis=0)
+        dS = decvec[None, :] * dS + upd
     return dS
 
 
