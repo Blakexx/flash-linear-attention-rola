@@ -78,14 +78,14 @@ def _digits(leaf, D, b):
 
 @triton.jit
 def _tree_routed_intra_kernel(
-    h_ptr, q_ptr, k_ptr, v_ptr, wr_ptr, ww_ptr, o_ptr,
+    h_ptr, q_ptr, k_ptr, v_ptr, wr_ptr, ww_ptr, o_ptr, br_ptr, bw_ptr,
     L, d_model, dqk, dv, nc,
     sh_b, sh_l, sh_d, sq_b, sq_l, sq_d, sv_b, sv_l, sv_d,
     swr_lvl, swr_d, swr_b, sww_lvl, sww_d, sww_b,
-    so_b, so_l, so_v,
+    so_b, so_l, so_v, sbr_lvl, sbr_b, sbw_lvl, sbw_b,
     D: tl.constexpr, b: tl.constexpr, BB: tl.constexpr,
     BT: tl.constexpr, BK: tl.constexpr, BV: tl.constexpr, BD: tl.constexpr,
-    ND: tl.constexpr, NDM: tl.constexpr,
+    ND: tl.constexpr, NDM: tl.constexpr, HAS_BIAS: tl.constexpr,
 ):
     pid_b = tl.program_id(0)
     pid_t = tl.program_id(1)
@@ -124,6 +124,9 @@ def _tree_routed_intra_kernel(
                          mask=mmask[:, None] & bmask[None, :], other=0.0)
             lr += tl.dot(hc, wr)
             lw += tl.dot(hc, ww)
+        if HAS_BIAS:
+            lr += tl.load(br_ptr + lvl * sbr_lvl + offs_bb * sbr_b, mask=bmask, other=0.0)[None, :]
+            lw += tl.load(bw_ptr + lvl * sbw_lvl + offs_bb * sbw_b, mask=bmask, other=0.0)[None, :]
         # softmax over the b axis (pad cols → -inf so they vanish from both the factor and the gram).
         neg = tl.full([BT, BB], float('-inf'), dtype=tl.float32)
         lr = tl.where(bmask[None, :], lr, neg)
@@ -157,17 +160,17 @@ def _tree_routed_intra_kernel(
 
 @triton.jit
 def _tree_routed_chunk_kernel(
-    h_ptr, q_ptr, k_ptr, v_ptr, wr_ptr, ww_ptr, sel_ptr, s_ptr, o_ptr,
+    h_ptr, q_ptr, k_ptr, v_ptr, wr_ptr, ww_ptr, sel_ptr, s_ptr, o_ptr, br_ptr, bw_ptr,
     L, d_model, dqk, dv, nc, t_start,
     sh_b, sh_l, sh_d, sq_b, sq_l, sq_d, sv_b, sv_l, sv_d,
     swr_lvl, swr_d, swr_b, sww_lvl, sww_d, sww_b,
     ssel_lvl, ssel_b, ssel_c,
     ss_b, ss_c, ss_k, ss_v,
-    so_b, so_l, so_v,
+    so_b, so_l, so_v, sbr_lvl, sbr_b, sbw_lvl, sbw_b,
     D: tl.constexpr, b: tl.constexpr, BB: tl.constexpr,
     BT: tl.constexpr, BK: tl.constexpr, BV: tl.constexpr, BD: tl.constexpr,
     BC: tl.constexpr, NCBLK: tl.constexpr,
-    ND: tl.constexpr, NDM: tl.constexpr,
+    ND: tl.constexpr, NDM: tl.constexpr, HAS_BIAS: tl.constexpr,
 ):
     pid_b = tl.program_id(0)
     offs_t = tl.arange(0, BT)
@@ -218,6 +221,9 @@ def _tree_routed_chunk_kernel(
                              mask=mmask[:, None] & bmask[None, :], other=0.0)
                 lr += tl.dot(hc, wr)
                 lw += tl.dot(hc, ww)
+            if HAS_BIAS:
+                lr += tl.load(br_ptr + lvl * sbr_lvl + offs_bb * sbr_b, mask=bmask, other=0.0)[None, :]
+                lw += tl.load(bw_ptr + lvl * sbw_lvl + offs_bb * sbw_b, mask=bmask, other=0.0)[None, :]
             neg = tl.full([BT, BB], float('-inf'), dtype=tl.float32)
             lr = tl.where(bmask[None, :], lr, neg)
             lw = tl.where(bmask[None, :], lw, neg)
@@ -278,7 +284,7 @@ def _build_sel(D, b, nc, device):
     return sel
 
 
-def tree_routed_chunked(h, q, k, v, Wr, Ww, D, b, chunk=64, return_states=False):
+def tree_routed_chunked(h, q, k, v, Wr, Ww, D, b, chunk=64, return_states=False, b_r=None, b_w=None):
     """Full chunked tree-routed forward: o = o_intra + o_inter, with a sequential per-state
     state-scan across chunks. The [L,nc] gates are NEVER materialized — only [BT,nc] gate tiles
     are reconstructed transiently in-kernel from the [BT,b] per-level factors.
@@ -303,6 +309,9 @@ def tree_routed_chunked(h, q, k, v, Wr, Ww, D, b, chunk=64, return_states=False)
     NDM = triton.cdiv(d_model, BD)
     NCH = triton.cdiv(L, chunk)
     h, q, k, v, Wr, Ww = (x.contiguous() for x in (h, q, k, v, Wr, Ww))
+    br, bw, has_bias = _bias_args(b_r, b_w, D, b, q.device)
+    sbr = (br.stride(0), br.stride(1)) if has_bias else (0, 0)
+    sbw = (bw.stride(0), bw.stride(1)) if has_bias else (0, 0)
     sel = _build_sel(D, b, nc, q.device)
     # state S : [B, nc, dqk, dv], carried across chunks (state BEFORE current chunk).
     S = torch.zeros(B, nc, dqk, dv, device=q.device, dtype=torch.float32)
@@ -314,7 +323,7 @@ def tree_routed_chunked(h, q, k, v, Wr, Ww, D, b, chunk=64, return_states=False)
         if return_states:
             states.append(S.clone())  # state BEFORE chunk c, for the backward reverse-scan
         _tree_routed_chunk_kernel[(B,)](
-            h, q, k, v, Wr, Ww, sel, S, o,
+            h, q, k, v, Wr, Ww, sel, S, o, br, bw,
             L, d_model, dqk, dv, nc, t_start,
             h.stride(0), h.stride(1), h.stride(2),
             q.stride(0), q.stride(1), q.stride(2),
@@ -324,8 +333,9 @@ def tree_routed_chunked(h, q, k, v, Wr, Ww, D, b, chunk=64, return_states=False)
             sel.stride(0), sel.stride(1), sel.stride(2),
             S.stride(0), S.stride(1), S.stride(2), S.stride(3),
             o.stride(0), o.stride(1), o.stride(2),
+            *sbr, *sbw,
             D=D, b=b, BB=BB, BT=chunk, BK=BK, BV=BV, BD=BD,
-            BC=BC, NCBLK=NCBLK, ND=ND, NDM=NDM,
+            BC=BC, NCBLK=NCBLK, ND=ND, NDM=NDM, HAS_BIAS=has_bias,
             num_warps=4, num_stages=1,
         )
     if return_states:
@@ -333,7 +343,18 @@ def tree_routed_chunked(h, q, k, v, Wr, Ww, D, b, chunk=64, return_states=False)
     return o[..., :dv]
 
 
-def tree_routed_intra(h, q, k, v, Wr, Ww, D, b, chunk=64):
+def _bias_args(b_r, b_w, D, b, device):
+    """Resolve optional [D,b] routing biases to (br, bw, has_bias). None → a 1-element dummy (never
+    read; HAS_BIAS=False gates every load) so the kernel signature stays uniform / backward-compatible."""
+    if b_r is None and b_w is None:
+        dummy = torch.zeros(1, device=device, dtype=torch.float32)
+        return dummy, dummy, False
+    assert b_r is not None and b_w is not None, "pass both b_r and b_w or neither"
+    assert b_r.shape == (D, b) and b_w.shape == (D, b), f"bias must be [D,b]=[{D},{b}]"
+    return b_r.contiguous(), b_w.contiguous(), True
+
+
+def tree_routed_intra(h, q, k, v, Wr, Ww, D, b, chunk=64, b_r=None, b_w=None):
     """In-kernel tree-routed intra readout: o = (G ⊙ R ⊙ causal)·v with R built from h + routers.
 
     h  : [B, L, d_model]   pre-routing hidden state (router lives in kernel, weights are inputs)
@@ -356,9 +377,10 @@ def tree_routed_intra(h, q, k, v, Wr, Ww, D, b, chunk=64):
     NDM = triton.cdiv(d_model, BD)
     NCH = triton.cdiv(L, chunk)
     h, q, k, v, Wr, Ww = (x.contiguous() for x in (h, q, k, v, Wr, Ww))
+    br, bw, has_bias = _bias_args(b_r, b_w, D, b, q.device)
     o = torch.zeros(B, L, BV, device=q.device, dtype=torch.float32)
     _tree_routed_intra_kernel[(B, NCH)](
-        h, q, k, v, Wr, Ww, o,
+        h, q, k, v, Wr, Ww, o, br, bw,
         L, d_model, dqk, dv, nc,
         h.stride(0), h.stride(1), h.stride(2),
         q.stride(0), q.stride(1), q.stride(2),
@@ -366,7 +388,9 @@ def tree_routed_intra(h, q, k, v, Wr, Ww, D, b, chunk=64):
         Wr.stride(0), Wr.stride(1), Wr.stride(2),
         Ww.stride(0), Ww.stride(1), Ww.stride(2),
         o.stride(0), o.stride(1), o.stride(2),
-        D=D, b=b, BB=BB, BT=chunk, BK=BK, BV=BV, BD=BD, ND=ND, NDM=NDM,
+        br.stride(0) if has_bias else 0, br.stride(1) if has_bias else 0,
+        bw.stride(0) if has_bias else 0, bw.stride(1) if has_bias else 0,
+        D=D, b=b, BB=BB, BT=chunk, BK=BK, BV=BV, BD=BD, ND=ND, NDM=NDM, HAS_BIAS=has_bias,
         num_warps=4, num_stages=2,
     )
     return o[..., :dv]
@@ -465,9 +489,11 @@ def _fold_level(dr_tile, dw_tile, r_tile, w_tile, cols, cmask,
                 pid_b, rows, rmask, offs_bb, bmask, d_model,
                 sh_b, sh_l, sh_d, swr_lvl, swr_d, swr_b, sww_lvl, sww_d, sww_b,
                 ssel_lvl, ssel_b, ssel_c, sdh_b, sdh_l, sdh_d,
+                br_ptr, bw_ptr, sbr_lvl, sbr_b, sbw_lvl, sbw_b, dbr_ptr, dbw_ptr,
                 lvl, D: tl.constexpr, BT: tl.constexpr, BB: tl.constexpr,
-                BC: tl.constexpr, BD: tl.constexpr, NDM: tl.constexpr):
-    # recompute fr,fw for this level, fold dr_tile,dw_tile -> dWr,dWw,dh.
+                BC: tl.constexpr, BD: tl.constexpr, NDM: tl.constexpr,
+                HAS_BIAS: tl.constexpr):
+    # recompute fr,fw for this level (incl. optional bias), fold dr_tile,dw_tile -> dWr,dWw,dh (+db).
     lr = tl.zeros([BT, BB], dtype=tl.float32)
     lw = tl.zeros([BT, BB], dtype=tl.float32)
     for dm in range(NDM):
@@ -481,6 +507,11 @@ def _fold_level(dr_tile, dw_tile, r_tile, w_tile, cols, cmask,
                      mask=mmask[:, None] & bmask[None, :], other=0.0)
         lr += tl.dot(hc, wr)
         lw += tl.dot(hc, ww)
+    if HAS_BIAS:
+        brc = tl.load(br_ptr + lvl * sbr_lvl + offs_bb * sbr_b, mask=bmask, other=0.0)
+        bwc = tl.load(bw_ptr + lvl * sbw_lvl + offs_bb * sbw_b, mask=bmask, other=0.0)
+        lr += brc[None, :]
+        lw += bwc[None, :]
     neg = tl.full([BT, BB], float('-inf'), dtype=tl.float32)
     lr = tl.where(bmask[None, :], lr, neg)
     lw = tl.where(bmask[None, :], lw, neg)
@@ -514,14 +545,24 @@ def _fold_level(dr_tile, dw_tile, r_tile, w_tile, cols, cmask,
         dh_blk = tl.dot(dlr.to(wr.dtype), tl.trans(wr)) + tl.dot(dlw.to(ww.dtype), tl.trans(ww))
         tl.atomic_add(dh_ptr + pid_b * sdh_b + rows[:, None] * sdh_l + offs_dm[None, :] * sdh_d,
                       dh_blk, mask=rmask[:, None] & mmask[None, :])
+    if HAS_BIAS:
+        # db_lvl[branch] = Σ_t dlr[t,branch] (the logit-grad summed over the chunk's tokens). Transient;
+        # never an [L,nc] tensor. Pad branches (¬bmask) contribute 0 (dlr already 0 there via softmax).
+        dbr = tl.sum(tl.where(rmask[:, None], dlr, 0.0), axis=0)
+        dbw = tl.sum(tl.where(rmask[:, None], dlw, 0.0), axis=0)
+        tl.atomic_add(dbr_ptr + lvl * sbr_lvl + offs_bb * sbr_b, dbr, mask=bmask)
+        tl.atomic_add(dbw_ptr + lvl * sbw_lvl + offs_bb * sbw_b, dbw, mask=bmask)
 
 
 @triton.jit
 def _build_factors(h_ptr, wr_ptr, ww_ptr, sel_ptr, cols, cmask,
                    pid_b, rows, rmask, offs_bb, bmask, d_model,
                    sh_b, sh_l, sh_d, swr_lvl, swr_d, swr_b, sww_lvl, sww_d, sww_b,
-                   ssel_lvl, ssel_b, ssel_c, D: tl.constexpr, BT: tl.constexpr,
-                   BB: tl.constexpr, BC: tl.constexpr, BD: tl.constexpr, NDM: tl.constexpr):
+                   ssel_lvl, ssel_b, ssel_c,
+                   br_ptr, bw_ptr, sbr_lvl, sbr_b, sbw_lvl, sbw_b,
+                   D: tl.constexpr, BT: tl.constexpr,
+                   BB: tl.constexpr, BC: tl.constexpr, BD: tl.constexpr, NDM: tl.constexpr,
+                   HAS_BIAS: tl.constexpr):
     r_tile = tl.full([BT, BC], 1.0, dtype=tl.float32)
     w_tile = tl.full([BT, BC], 1.0, dtype=tl.float32)
     for lvl in range(D):
@@ -538,6 +579,11 @@ def _build_factors(h_ptr, wr_ptr, ww_ptr, sel_ptr, cols, cmask,
                          mask=mmask[:, None] & bmask[None, :], other=0.0)
             lr += tl.dot(hc, wr)
             lw += tl.dot(hc, ww)
+        if HAS_BIAS:
+            brc = tl.load(br_ptr + lvl * sbr_lvl + offs_bb * sbr_b, mask=bmask, other=0.0)
+            bwc = tl.load(bw_ptr + lvl * sbw_lvl + offs_bb * sbw_b, mask=bmask, other=0.0)
+            lr += brc[None, :]
+            lw += bwc[None, :]
         neg = tl.full([BT, BB], float('-inf'), dtype=tl.float32)
         lr = tl.where(bmask[None, :], lr, neg)
         lw = tl.where(bmask[None, :], lw, neg)
@@ -559,13 +605,16 @@ def _build_factors(h_ptr, wr_ptr, ww_ptr, sel_ptr, cols, cmask,
 def _bwd_intra_kernel(
     h_ptr, q_ptr, k_ptr, v_ptr, wr_ptr, ww_ptr, sel_ptr, do_ptr,
     dq_ptr, dk_ptr, dv_ptr, dh_ptr, dwr_ptr, dww_ptr,
+    br_ptr, bw_ptr, dbr_ptr, dbw_ptr,
     L, d_model, dqk, dv, nc,
     sh_b, sh_l, sh_d, sq_b, sq_l, sq_d, sv_b, sv_l, sv_d,
     swr_lvl, swr_d, swr_b, sww_lvl, sww_d, sww_b,
     ssel_lvl, ssel_b, ssel_c, so_b, so_l, so_v, sdh_b, sdh_l, sdh_d,
+    sbr_lvl, sbr_b, sbw_lvl, sbw_b,
     D: tl.constexpr, b: tl.constexpr, BB: tl.constexpr,
     BT: tl.constexpr, BK: tl.constexpr, BV: tl.constexpr, BD: tl.constexpr,
     BC: tl.constexpr, NCBLK: tl.constexpr, ND: tl.constexpr, NDM: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
 ):
     pid_b = tl.program_id(0)
     pid_t = tl.program_id(1)
@@ -598,7 +647,9 @@ def _bwd_intra_kernel(
         r_tile, w_tile = _build_factors(h_ptr, wr_ptr, ww_ptr, sel_ptr, cols, cmask,
                                         pid_b, rows, rmask, offs_bb, bmask, d_model,
                                         sh_b, sh_l, sh_d, swr_lvl, swr_d, swr_b, sww_lvl, sww_d, sww_b,
-                                        ssel_lvl, ssel_b, ssel_c, D, BT, BB, BC, BD, NDM)
+                                        ssel_lvl, ssel_b, ssel_c,
+                                        br_ptr, bw_ptr, sbr_lvl, sbr_b, sbw_lvl, sbw_b,
+                                        D, BT, BB, BC, BD, NDM, HAS_BIAS)
         Rgram += tl.dot(r_tile, tl.trans(w_tile))
     A = G * Rgram * causal
     dv_acc = tl.dot(tl.trans(A).to(doc.dtype), doc)
@@ -619,7 +670,9 @@ def _bwd_intra_kernel(
         r_tile, w_tile = _build_factors(h_ptr, wr_ptr, ww_ptr, sel_ptr, cols, cmask,
                                         pid_b, rows, rmask, offs_bb, bmask, d_model,
                                         sh_b, sh_l, sh_d, swr_lvl, swr_d, swr_b, sww_lvl, sww_d, sww_b,
-                                        ssel_lvl, ssel_b, ssel_c, D, BT, BB, BC, BD, NDM)
+                                        ssel_lvl, ssel_b, ssel_c,
+                                        br_ptr, bw_ptr, sbr_lvl, sbr_b, sbw_lvl, sbw_b,
+                                        D, BT, BB, BC, BD, NDM, HAS_BIAS)
         dr_tile = tl.dot(dRgram.to(w_tile.dtype), w_tile)
         dw_tile = tl.dot(tl.trans(dRgram).to(r_tile.dtype), r_tile)
         for lvl in range(D):
@@ -628,7 +681,8 @@ def _bwd_intra_kernel(
                         pid_b, rows, rmask, offs_bb, bmask, d_model,
                         sh_b, sh_l, sh_d, swr_lvl, swr_d, swr_b, sww_lvl, sww_d, sww_b,
                         ssel_lvl, ssel_b, ssel_c, sdh_b, sdh_l, sdh_d,
-                        lvl, D, BT, BB, BC, BD, NDM)
+                        br_ptr, bw_ptr, sbr_lvl, sbr_b, sbw_lvl, sbw_b, dbr_ptr, dbw_ptr,
+                        lvl, D, BT, BB, BC, BD, NDM, HAS_BIAS)
 
 
 # ============ INTER readout backward (dr, dq from o_inter; accumulates dS_read into ds) ============
@@ -636,15 +690,16 @@ def _bwd_intra_kernel(
 @triton.jit
 def _bwd_inter_read_kernel(
     h_ptr, q_ptr, wr_ptr, ww_ptr, sel_ptr, s_ptr, ds_ptr, do_ptr,
-    dq_ptr, gdr_ptr,
+    dq_ptr, gdr_ptr, br_ptr, bw_ptr,
     L, d_model, dqk, dv, nc, t_start,
     sh_b, sh_l, sh_d, sq_b, sq_l, sq_d,
     swr_lvl, swr_d, swr_b, sww_lvl, sww_d, sww_b,
     ssel_lvl, ssel_b, ssel_c, ss_b, ss_c, ss_k, ss_v,
-    so_b, so_l, so_v, sg_b, sg_t, sg_c,
+    so_b, so_l, so_v, sg_b, sg_t, sg_c, sbr_lvl, sbr_b, sbw_lvl, sbw_b,
     D: tl.constexpr, b: tl.constexpr, BB: tl.constexpr,
     BT: tl.constexpr, BK: tl.constexpr, BV: tl.constexpr, BD: tl.constexpr,
     BC: tl.constexpr, NCBLK: tl.constexpr, NDM: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
 ):
     pid_b = tl.program_id(0)
     offs_t = tl.arange(0, BT)
@@ -668,7 +723,9 @@ def _bwd_inter_read_kernel(
         r_tile, w_tile = _build_factors(h_ptr, wr_ptr, ww_ptr, sel_ptr, cols, cmask,
                                         pid_b, rows, rmask, offs_bb, bmask, d_model,
                                         sh_b, sh_l, sh_d, swr_lvl, swr_d, swr_b, sww_lvl, sww_d, sww_b,
-                                        ssel_lvl, ssel_b, ssel_c, D, BT, BB, BC, BD, NDM)
+                                        ssel_lvl, ssel_b, ssel_c,
+                                        br_ptr, bw_ptr, sbr_lvl, sbr_b, sbw_lvl, sbw_b,
+                                        D, BT, BB, BC, BD, NDM, HAS_BIAS)
         ckv = tl.reshape(cols[:, None] * dqk + offs_k[None, :], [BC * BK])
         ckmask = tl.reshape(cmask[:, None] & kmask[None, :], [BC * BK])
         s_flat = tl.load(s_ptr + pid_b * ss_b + ckv[:, None] * ss_k + offs_v[None, :] * ss_v,
@@ -696,15 +753,16 @@ def _bwd_inter_read_kernel(
 @triton.jit
 def _bwd_inter_state_kernel(
     h_ptr, k_ptr, v_ptr, wr_ptr, ww_ptr, sel_ptr, ds_ptr,
-    dk_ptr, dv_ptr, gdw_ptr,
+    dk_ptr, dv_ptr, gdw_ptr, br_ptr, bw_ptr,
     L, d_model, dqk, dv, nc, t_start,
     sh_b, sh_l, sh_d, sq_b, sq_l, sq_d, sv_b, sv_l, sv_d,
     swr_lvl, swr_d, swr_b, sww_lvl, sww_d, sww_b,
     ssel_lvl, ssel_b, ssel_c, ss_b, ss_c, ss_k, ss_v,
-    sg_b, sg_t, sg_c,
+    sg_b, sg_t, sg_c, sbr_lvl, sbr_b, sbw_lvl, sbw_b,
     D: tl.constexpr, b: tl.constexpr, BB: tl.constexpr,
     BT: tl.constexpr, BK: tl.constexpr, BV: tl.constexpr, BD: tl.constexpr,
     BC: tl.constexpr, NCBLK: tl.constexpr, NDM: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
 ):
     pid_b = tl.program_id(0)
     offs_t = tl.arange(0, BT)
@@ -729,7 +787,9 @@ def _bwd_inter_state_kernel(
         r_tile, w_tile = _build_factors(h_ptr, wr_ptr, ww_ptr, sel_ptr, cols, cmask,
                                         pid_b, rows, rmask, offs_bb, bmask, d_model,
                                         sh_b, sh_l, sh_d, swr_lvl, swr_d, swr_b, sww_lvl, sww_d, sww_b,
-                                        ssel_lvl, ssel_b, ssel_c, D, BT, BB, BC, BD, NDM)
+                                        ssel_lvl, ssel_b, ssel_c,
+                                        br_ptr, bw_ptr, sbr_lvl, sbr_b, sbw_lvl, sbw_b,
+                                        D, BT, BB, BC, BD, NDM, HAS_BIAS)
         ckv = tl.reshape(cols[:, None] * dqk + offs_k[None, :], [BC * BK])
         ckmask = tl.reshape(cmask[:, None] & kmask[None, :], [BC * BK])
         dS_in = tl.load(ds_ptr + pid_b * ss_b + ckv[:, None] * ss_k + offs_v[None, :] * ss_v,
@@ -753,13 +813,15 @@ def _bwd_inter_state_kernel(
 @triton.jit
 def _fold_kernel(
     h_ptr, wr_ptr, ww_ptr, sel_ptr, gdr_ptr, gdw_ptr,
-    dh_ptr, dwr_ptr, dww_ptr,
+    dh_ptr, dwr_ptr, dww_ptr, br_ptr, bw_ptr, dbr_ptr, dbw_ptr,
     L, d_model, nc, t_start,
     sh_b, sh_l, sh_d, swr_lvl, swr_d, swr_b, sww_lvl, sww_d, sww_b,
     ssel_lvl, ssel_b, ssel_c, sg_b, sg_t, sg_c, sdh_b, sdh_l, sdh_d,
+    sbr_lvl, sbr_b, sbw_lvl, sbw_b,
     D: tl.constexpr, b: tl.constexpr, BB: tl.constexpr,
     BT: tl.constexpr, BC: tl.constexpr, BD: tl.constexpr,
     NCBLK: tl.constexpr, NDM: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
 ):
     pid_b = tl.program_id(0)
     offs_t = tl.arange(0, BT)
@@ -774,7 +836,9 @@ def _fold_kernel(
         r_tile, w_tile = _build_factors(h_ptr, wr_ptr, ww_ptr, sel_ptr, cols, cmask,
                                         pid_b, rows, rmask, offs_bb, bmask, d_model,
                                         sh_b, sh_l, sh_d, swr_lvl, swr_d, swr_b, sww_lvl, sww_d, sww_b,
-                                        ssel_lvl, ssel_b, ssel_c, D, BT, BB, BC, BD, NDM)
+                                        ssel_lvl, ssel_b, ssel_c,
+                                        br_ptr, bw_ptr, sbr_lvl, sbr_b, sbw_lvl, sbw_b,
+                                        D, BT, BB, BC, BD, NDM, HAS_BIAS)
         dr_tile = tl.load(gdr_ptr + pid_b * sg_b + offs_t[:, None] * sg_t + cols[None, :] * sg_c,
                           mask=rmask[:, None] & cmask[None, :], other=0.0)
         dw_tile = tl.load(gdw_ptr + pid_b * sg_b + offs_t[:, None] * sg_t + cols[None, :] * sg_c,
@@ -785,10 +849,11 @@ def _fold_kernel(
                         pid_b, rows, rmask, offs_bb, bmask, d_model,
                         sh_b, sh_l, sh_d, swr_lvl, swr_d, swr_b, sww_lvl, sww_d, sww_b,
                         ssel_lvl, ssel_b, ssel_c, sdh_b, sdh_l, sdh_d,
-                        lvl, D, BT, BB, BC, BD, NDM)
+                        br_ptr, bw_ptr, sbr_lvl, sbr_b, sbw_lvl, sbw_b, dbr_ptr, dbw_ptr,
+                        lvl, D, BT, BB, BC, BD, NDM, HAS_BIAS)
 
 
-def tree_routed_chunked_bwd(h, q, k, v, Wr, Ww, do, states, D, b, chunk=64):
+def tree_routed_chunked_bwd(h, q, k, v, Wr, Ww, do, states, D, b, chunk=64, b_r=None, b_w=None):
     B, L, d_model = h.shape
     dqk = q.shape[-1]
     dv = v.shape[-1]
@@ -806,63 +871,73 @@ def tree_routed_chunked_bwd(h, q, k, v, Wr, Ww, do, states, D, b, chunk=64):
     do = do.to(v.dtype)
     h, q, k, v, Wr, Ww, do = (x.contiguous() for x in (h, q, k, v, Wr, Ww, do))
     sel = _build_sel(D, b, nc, q.device)
+    br, bw, has_bias = _bias_args(b_r, b_w, D, b, q.device)
+    sbr = (br.stride(0), br.stride(1)) if has_bias else (0, 0)
+    sbw = (bw.stride(0), bw.stride(1)) if has_bias else (0, 0)
     dq = torch.zeros(B, L, BK, device=q.device, dtype=torch.float32)
     dk = torch.zeros(B, L, BK, device=q.device, dtype=torch.float32)
     dvv = torch.zeros(B, L, BV, device=q.device, dtype=torch.float32)
     dh = torch.zeros(B, L, d_model, device=q.device, dtype=torch.float32)
     dWr = torch.zeros(D, d_model, b, device=q.device, dtype=torch.float32)
     dWw = torch.zeros(D, d_model, b, device=q.device, dtype=torch.float32)
+    dbr = torch.zeros(D, b, device=q.device, dtype=torch.float32)   # routing-bias grads [D,b] (transient fold)
+    dbw = torch.zeros(D, b, device=q.device, dtype=torch.float32)
     common = dict(D=D, b=b, BB=BB, BT=chunk, BK=BK, BV=BV, BD=BD, BC=BC,
-                  NCBLK=NCBLK, ND=ND, NDM=NDM, num_warps=4, num_stages=1)
+                  NCBLK=NCBLK, ND=ND, NDM=NDM, HAS_BIAS=has_bias, num_warps=4, num_stages=1)
     _bwd_intra_kernel[(B, NCH)](
         h, q, k, v, Wr, Ww, sel, do, dq, dk, dvv, dh, dWr, dWw,
+        br, bw, dbr, dbw,
         L, d_model, dqk, dv, nc,
         h.stride(0), h.stride(1), h.stride(2), q.stride(0), q.stride(1), q.stride(2),
         v.stride(0), v.stride(1), v.stride(2),
         Wr.stride(0), Wr.stride(1), Wr.stride(2), Ww.stride(0), Ww.stride(1), Ww.stride(2),
         sel.stride(0), sel.stride(1), sel.stride(2),
         do.stride(0), do.stride(1), do.stride(2), dh.stride(0), dh.stride(1), dh.stride(2),
+        *sbr, *sbw,
         **common)
     dS = torch.zeros(B, nc, dqk, dv, device=q.device, dtype=torch.float32)
     # per-chunk gate-grad scratch [B, chunk, nc] — transient, OVERWRITTEN each chunk (never [L,nc]).
     gdr = torch.zeros(B, chunk, nc, device=q.device, dtype=torch.float32)
     gdw = torch.zeros(B, chunk, nc, device=q.device, dtype=torch.float32)
     fold_common = dict(D=D, b=b, BB=BB, BT=chunk, BC=BC, BD=BD, NCBLK=NCBLK, NDM=NDM,
-                       num_warps=4, num_stages=1)
+                       HAS_BIAS=has_bias, num_warps=4, num_stages=1)
     inter_common = dict(D=D, b=b, BB=BB, BT=chunk, BK=BK, BV=BV, BD=BD, BC=BC,
-                        NCBLK=NCBLK, NDM=NDM, num_warps=4, num_stages=1)
+                        NCBLK=NCBLK, NDM=NDM, HAS_BIAS=has_bias, num_warps=4, num_stages=1)
     for c in reversed(range(NCH)):
         Sj = states[c].contiguous()
         # state-update bwd FIRST: it reads dS = adjoint of S_{j+1} (before readout folds dS_read in).
         _bwd_inter_state_kernel[(B,)](
-            h, k, v, Wr, Ww, sel, dS, dk, dvv, gdw,
+            h, k, v, Wr, Ww, sel, dS, dk, dvv, gdw, br, bw,
             L, d_model, dqk, dv, nc, c * chunk,
             h.stride(0), h.stride(1), h.stride(2), q.stride(0), q.stride(1), q.stride(2),
             v.stride(0), v.stride(1), v.stride(2),
             Wr.stride(0), Wr.stride(1), Wr.stride(2), Ww.stride(0), Ww.stride(1), Ww.stride(2),
             sel.stride(0), sel.stride(1), sel.stride(2),
             dS.stride(0), dS.stride(1), dS.stride(2), dS.stride(3),
-            gdr.stride(0), gdr.stride(1), gdr.stride(2),
+            gdr.stride(0), gdr.stride(1), gdr.stride(2), *sbr, *sbw,
             **inter_common)
         # readout bwd: computes dr,dq, then accumulates dS_read into dS (= adjoint of S_j for next iter).
         _bwd_inter_read_kernel[(B,)](
-            h, q, Wr, Ww, sel, Sj, dS, do, dq, gdr,
+            h, q, Wr, Ww, sel, Sj, dS, do, dq, gdr, br, bw,
             L, d_model, dqk, dv, nc, c * chunk,
             h.stride(0), h.stride(1), h.stride(2), q.stride(0), q.stride(1), q.stride(2),
             Wr.stride(0), Wr.stride(1), Wr.stride(2), Ww.stride(0), Ww.stride(1), Ww.stride(2),
             sel.stride(0), sel.stride(1), sel.stride(2),
             Sj.stride(0), Sj.stride(1), Sj.stride(2), Sj.stride(3),
             do.stride(0), do.stride(1), do.stride(2),
-            gdr.stride(0), gdr.stride(1), gdr.stride(2),
+            gdr.stride(0), gdr.stride(1), gdr.stride(2), *sbr, *sbw,
             **inter_common)
         _fold_kernel[(B,)](
-            h, Wr, Ww, sel, gdr, gdw, dh, dWr, dWw,
+            h, Wr, Ww, sel, gdr, gdw, dh, dWr, dWw, br, bw, dbr, dbw,
             L, d_model, nc, c * chunk,
             h.stride(0), h.stride(1), h.stride(2),
             Wr.stride(0), Wr.stride(1), Wr.stride(2), Ww.stride(0), Ww.stride(1), Ww.stride(2),
             sel.stride(0), sel.stride(1), sel.stride(2),
             gdr.stride(0), gdr.stride(1), gdr.stride(2), dh.stride(0), dh.stride(1), dh.stride(2),
+            *sbr, *sbw,
             **fold_common)
+    if has_bias:
+        return dq[..., :dqk], dk[..., :dqk], dvv[..., :dv], dh, dWr, dWw, dbr, dbw
     return dq[..., :dqk], dk[..., :dqk], dvv[..., :dv], dh, dWr, dWw
 
 
@@ -870,28 +945,37 @@ def tree_routed_chunked_bwd(h, q, k, v, Wr, Ww, do, states, D, b, chunk=64):
 
 class _TreeRoutedFn(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, h, q, k, v, Wr, Ww, D, b, chunk):
-        o, states = tree_routed_chunked(h, q, k, v, Wr, Ww, D, b, chunk, return_states=True)
-        ctx.save_for_backward(h, q, k, v, Wr, Ww)
+    def forward(ctx, h, q, k, v, Wr, Ww, D, b, chunk, b_r, b_w):
+        o, states = tree_routed_chunked(h, q, k, v, Wr, Ww, D, b, chunk, return_states=True,
+                                        b_r=b_r, b_w=b_w)
+        ctx.save_for_backward(h, q, k, v, Wr, Ww, b_r, b_w)
         ctx.states = states
         ctx.D, ctx.b, ctx.chunk = D, b, chunk
         return o
 
     @staticmethod
     def backward(ctx, do):
-        h, q, k, v, Wr, Ww = ctx.saved_tensors
-        dq, dk, dv, dh, dWr, dWw = tree_routed_chunked_bwd(
-            h, q, k, v, Wr, Ww, do.contiguous(), ctx.states, ctx.D, ctx.b, ctx.chunk)
+        h, q, k, v, Wr, Ww, b_r, b_w = ctx.saved_tensors
+        grads = tree_routed_chunked_bwd(
+            h, q, k, v, Wr, Ww, do.contiguous(), ctx.states, ctx.D, ctx.b, ctx.chunk,
+            b_r=b_r, b_w=b_w)
+        if b_r is None:
+            dq, dk, dv, dh, dWr, dWw = grads
+            dbr = dbw = None
+        else:
+            dq, dk, dv, dh, dWr, dWw, dbr, dbw = grads
         # cast grads back to the input dtypes
         return (dh.to(h.dtype), dq.to(q.dtype), dk.to(k.dtype), dv.to(v.dtype),
-                dWr.to(Wr.dtype), dWw.to(Ww.dtype), None, None, None)
+                dWr.to(Wr.dtype), dWw.to(Ww.dtype), None, None, None,
+                None if dbr is None else dbr.to(b_r.dtype),
+                None if dbw is None else dbw.to(b_w.dtype))
 
 
-def tree_routed(h, q, k, v, Wr, Ww, D, b, chunk=64):
+def tree_routed(h, q, k, v, Wr, Ww, D, b, chunk=64, b_r=None, b_w=None):
     """End-to-end differentiable fused tree-routing: o = o_intra + o_inter, with the full backward
     (dq,dk,dv,d_h,dWr,dWw) and the [L,nc] gates + their grads NEVER materialized. Plug into autograd.
 
     h  : [B, L, d_model]   q,k: [B, L, dqk]   v: [B, L, dv]   Wr,Ww: [D, d_model, b]
     Returns o : [B, L, dv].
     """
-    return _TreeRoutedFn.apply(h, q, k, v, Wr, Ww, D, b, chunk)
+    return _TreeRoutedFn.apply(h, q, k, v, Wr, Ww, D, b, chunk, b_r, b_w)
