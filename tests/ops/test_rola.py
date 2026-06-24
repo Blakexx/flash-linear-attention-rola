@@ -789,3 +789,82 @@ def test_kappa_routed_no_LNC_materialization(per_state):
     finally:
         torch.zeros, torch.empty = real_zeros, real_empty
     assert not hits, f'[*,L={T},nc={nc}] buffer(s) materialized: {hits}'
+
+
+# =============================================================================
+# Routed RAW / GLOBAL-numerator backward at NON-POW2 dv (regression for the dv=24 grad-corruption bug).
+#
+# `_rola_rla_routed_bwd` allocated dq/dk at BK=next_pow2(dqk) and dvv at BV=next_pow2(dv) but the fold
+# kernels store at q's/v's TRUE row stride (sq_l=dqk, sv_l=dv). For non-pow2 dv (24→BV=32) the alloc
+# row width (32) != store stride (24) → rows overlap and dv is silently corrupted. The pow2-only tests
+# never caught it. Fixed by allocating dq/dk/dvv at the TRUE dqk/dv width (the masked :dqk/:dv stores
+# land exactly), mirroring `_kappa_routed_bwd`. This numerator backward (`_RoLARoutedFn`) backs BOTH
+# norm='raw' AND norm='global' (global divides by a separately-computed den), so we exercise it via the
+# public norm='raw' AND the shared numerator op `_rola_routed_readout` (the global numerator) — both
+# code paths gated. (norm='global''s FULL-autograd path has a SEPARATE, pre-existing in-place
+# `_tree_gates_torch` den-prepass incompatibility, unrelated to this dv bug.) Gate: grads
+# (flat/square/tree) vs autograd of an fp64 explicit-gate reference < 1e-2 — FAILS at dv=24 pre-fix
+# (dv-grad rel ~1.0), PASSES post-fix; dv=16 guards the common pow2 path.
+# =============================================================================
+def _routed_raw_ref(q, k, v, h, Wr, Ww, D, b, scale):
+    """fp64 explicit-gate reference for the routed un-normalized numerator (the math both norm='raw'
+    and the norm='global' numerator reproduce)."""
+    B, T, H, Kd = q.shape
+
+    def fold(t):
+        return t.permute(0, 2, 1, 3).reshape(B * H, T, t.shape[-1])
+
+    def unfold(t):
+        return t.view(B, H, T, -1).permute(0, 2, 1, 3).contiguous()
+    qf, kf, vf, hf = fold(q) * scale, fold(k), fold(v), fold(h)
+    rf, wf = _tree_gates_oop(hf, Wr, Ww, D, b)
+    G = torch.einsum('bid,bjd->bij', qf, kf)
+    caus = torch.tril(torch.ones(T, T, device=q.device, dtype=qf.dtype))
+    R = torch.einsum('bic,bjc->bij', rf, wf)
+    num = torch.einsum('bij,bjv->biv', G * R * caus, vf)
+    return unfold(num)
+
+
+@pytest.mark.parametrize('path', ['raw', 'global_num'])
+@pytest.mark.parametrize('D,b', [(1, 8), (2, 3), (3, 2)])   # flat, square(nc=9), tree(nc=8)
+@pytest.mark.parametrize('dv', [24, 16])                    # non-pow2 (the bug) + pow2 (regression)
+def test_routed_bwd_nonpow2_dv(path, D, b, dv):
+    """Routed numerator backward at non-pow2 dv (24, BV=32) and pow2 dv (16): grads vs autograd of an
+    fp64 explicit-gate reference < 1e-2. `raw` drives chunk_rola_routed(norm='raw') end-to-end;
+    `global_num` drives the shared numerator op `_rola_routed_readout` directly (the norm='global'
+    numerator). The dv=24 case fails pre-fix (dv-grad corrupted ~1.0); dv=16 guards the pow2 path."""
+    if device != 'cuda':
+        pytest.skip('RoLA Triton kernels require CUDA')
+    B, H, T, Kd, dm = 2, 2, 64, 16, 40
+    scale = Kd ** -0.5
+    chunk_size = min(64, max(16, triton.next_power_of_2(T)))
+    g = torch.Generator(device=device).manual_seed(0)
+
+    def mk(*s, f=False):
+        x = torch.randn(*s, device=device, dtype=torch.float64, generator=g)
+        return ((torch.nn.functional.elu(x) + 1.0) if f else x).requires_grad_()
+    q, k = mk(B, T, H, Kd, f=True), mk(B, T, H, Kd, f=True)
+    v, h = mk(B, T, H, dv), mk(B, T, H, dm)
+    Wr = (torch.randn(D, dm, b, device=device, dtype=torch.float64, generator=g) * 0.4).requires_grad_()
+    Ww = (torch.randn(D, dm, b, device=device, dtype=torch.float64, generator=g) * 0.4).requires_grad_()
+    go = torch.randn(B, T, H, dv, device=device, dtype=torch.float64, generator=g)
+    sel = [q, k, v, h, Wr, Ww]
+    if path == 'raw':
+        of = C.chunk_rola_routed(q.float(), k.float(), v.float(), h.float(), Wr.float(), Ww.float(),
+                                 D, b, norm='raw', scale=scale)
+    else:  # exercise the shared numerator op directly (the norm='global' numerator)
+        def foldf(t):
+            return t.permute(0, 2, 1, 3).reshape(B * H, T, t.shape[-1]).float()
+
+        def unfold(t):
+            return t.view(B, H, T, -1).permute(0, 2, 1, 3).contiguous()
+        num = C._rola_routed_readout(foldf(q) * scale, foldf(k), foldf(v), foldf(h),
+                                     Wr.float(), Ww.float(), D, b, chunk_size)
+        of = unfold(num)
+    gf = torch.autograd.grad(of, sel, go.float())
+    oe = _routed_raw_ref(q, k, v, h, Wr, Ww, D, b, scale)
+    ge = torch.autograd.grad(oe, sel, go)
+    names = ['q', 'k', 'v', 'h', 'Wr', 'Ww']
+    rels = {n: _relmax(a.float(), b.float()) for n, a, b in zip(names, gf, ge)}
+    assert _relmax(of.float(), oe.float()) < 1e-2, f'out {_relmax(of.float(), oe.float()):.2e}'
+    assert all(r < 1e-2 for r in rels.values()), f'grads {rels}'
