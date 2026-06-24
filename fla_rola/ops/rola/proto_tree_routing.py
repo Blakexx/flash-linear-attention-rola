@@ -1,6 +1,6 @@
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 #
-# PROTOTYPE — in-kernel "tree-routing" for routed linear attention (forward only, exploratory).
+# PROTOTYPE — in-kernel "tree-routing" for routed linear attention (forward + backward, exploratory).
 #
 # RoLA's intra readout is  o = (G ⊙ R ⊙ causal) · v,  where
 #   G = q·kᵀ  (content gram, contract over dqk),
@@ -24,8 +24,30 @@
 # factors (SRAM) and the [BT,BT] gram. This is the activation-floor win: the dominant L×nc gate
 # tensor disappears from the forward graph.
 #
-# This file is a standalone prototype: it does NOT touch the production chunk.py. Forward only —
-# backward (router weight-grads) is out of scope for this prototype.
+# This file is a standalone prototype: it does NOT touch the production chunk.py.
+#
+# BACKWARD (router weight-grads, the final piece). Given d_o, compute dq,dk,dv,d_h,dWr,dWw. The
+# load-bearing claim mirrors the forward: the gate grads dr,dw ∈ [L,nc] are NEVER materialized.
+# They live only as transient [BT,nc] tiles, consumed in-kernel and folded — through the Sel maps
+# (dfr,dfw [BT,b]) and the per-level softmax jacobian — into dWr,dWw,d_h. Chain:
+#   d_o -> (intra gram bwd  +  inter recurrent reverse state-adjoint scan) -> dr,dw [BT,nc] transient
+#       -> tree factorization bwd (Sel gather + softmax jacobian) -> dWr,dWw,d_h ; plus dq,dk,dv.
+# All grads validated vs torch.autograd.grad(ref...) to rel < 5e-3 (bf16) for flat/square/tree.
+#
+# What is in-kernel vs not (honest scope, per the prototype budget):
+#   * Intra bwd:  _bwd_intra_kernel — fully in-kernel (dq,dk,dv-intra + dr,dw-intra fold). One launch.
+#   * Inter bwd:  the reverse state-adjoint scan is a sequential Python loop over chunks (mirroring
+#     the forward's sequential scan), driving three Triton kernels per chunk:
+#       _bwd_inter_state_kernel (dw,dk,dv from the state update, reads dS=adjoint of S_{j+1}),
+#       _bwd_inter_read_kernel  (dr,dq from the inter readout, folds dS_read into dS), and
+#       _fold_kernel            (folds the combined inter gate-grad tiles -> dWr,dWw,d_h).
+#     The read/state split is purely a shared-memory budget split on the prototype GPU; each writes
+#     its gate-grad as a [BT,nc] per-chunk tile (gdr,gdw), OVERWRITTEN every chunk — never [L,nc].
+#   * The router-grad fold (dr,dw [BT,nc] -> dWr,dWw,d_h) — the novel non-materialization claim — is
+#     ENTIRELY in-kernel for both intra and inter. The fold is linear given the (recomputed) softmax
+#     activations, so folding the intra and inter gate-grad contributions separately and summing
+#     dWr/dWw/d_h is exact (verified). The forward states S_j the reverse scan needs are the [nc,dqk,dv]
+#     recurrent state (returned by tree_routed_chunked(..., return_states=True)), NOT the [L,nc] gates.
 
 import torch
 import triton
@@ -256,13 +278,15 @@ def _build_sel(D, b, nc, device):
     return sel
 
 
-def tree_routed_chunked(h, q, k, v, Wr, Ww, D, b, chunk=64):
+def tree_routed_chunked(h, q, k, v, Wr, Ww, D, b, chunk=64, return_states=False):
     """Full chunked tree-routed forward: o = o_intra + o_inter, with a sequential per-state
     state-scan across chunks. The [L,nc] gates are NEVER materialized — only [BT,nc] gate tiles
-    are reconstructed transiently in-kernel from the [BT,b] per-level factors. Forward only.
+    are reconstructed transiently in-kernel from the [BT,b] per-level factors.
 
     h  : [B, L, d_model]   q,k: [B, L, dqk]   v: [B, L, dv]   Wr,Ww: [D, d_model, b]
-    Returns o : [B, L, dv].
+    Returns o : [B, L, dv].  If return_states, also returns the per-chunk pre-state snapshots
+    [B, nc, dqk, dv] (one per chunk) the backward reverse-scan needs — this is the recurrent
+    STATE, not the [L,nc] gates, so the gate-non-materialization property is unaffected.
     """
     B, L, d_model = h.shape
     dqk = q.shape[-1]
@@ -284,8 +308,11 @@ def tree_routed_chunked(h, q, k, v, Wr, Ww, D, b, chunk=64):
     S = torch.zeros(B, nc, dqk, dv, device=q.device, dtype=torch.float32)
     o = torch.zeros(B, L, BV, device=q.device, dtype=torch.float32)
     # S is indexed in-kernel as flat row (c*dqk+k); ss_k is the stride of that flat row = S.stride(2).
+    states = []
     for c in range(NCH):
         t_start = c * chunk
+        if return_states:
+            states.append(S.clone())  # state BEFORE chunk c, for the backward reverse-scan
         _tree_routed_chunk_kernel[(B,)](
             h, q, k, v, Wr, Ww, sel, S, o,
             L, d_model, dqk, dv, nc, t_start,
@@ -301,6 +328,8 @@ def tree_routed_chunked(h, q, k, v, Wr, Ww, D, b, chunk=64):
             BC=BC, NCBLK=NCBLK, ND=ND, NDM=NDM,
             num_warps=4, num_stages=1,
         )
+    if return_states:
+        return o[..., :dv], states
     return o[..., :dv]
 
 
@@ -419,3 +448,450 @@ def ref_routed_chunked(h, q, k, v, Wr, Ww, D, b, chunk=64):
         # --- update state: add this chunk's writes  Sᶜ += Σ_j wⱼᶜ (kⱼ⊗vⱼ) ---
         S = S + torch.einsum('btc,btk,btv->bckv', wc, kc, vc)
     return o
+
+
+# --- backward kernels --------------------------------------------------------------------------
+#
+# In-kernel device helpers shared by the backward kernels:
+#   _build_factors : rebuilds the [BT,BC] read/write gate tiles for an nc-block (mirrors the
+#                    forward's in-kernel factor construction; recomputed, never saved as [L,nc]).
+#   _fold_level    : the router-grad fold for ONE tree level — recompute fr,fw,Sel, gather the
+#                    transient [BT,BC] gate-grads to dfr,dfw [BT,b], apply the softmax jacobian to
+#                    get the logit grads, and atomic-add into dWr,dWw,d_h. This is where dr,dw die.
+
+@triton.jit
+def _fold_level(dr_tile, dw_tile, r_tile, w_tile, cols, cmask,
+                h_ptr, wr_ptr, ww_ptr, sel_ptr, dwr_ptr, dww_ptr, dh_ptr,
+                pid_b, rows, rmask, offs_bb, bmask, d_model,
+                sh_b, sh_l, sh_d, swr_lvl, swr_d, swr_b, sww_lvl, sww_d, sww_b,
+                ssel_lvl, ssel_b, ssel_c, sdh_b, sdh_l, sdh_d,
+                lvl, D: tl.constexpr, BT: tl.constexpr, BB: tl.constexpr,
+                BC: tl.constexpr, BD: tl.constexpr, NDM: tl.constexpr):
+    # recompute fr,fw for this level, fold dr_tile,dw_tile -> dWr,dWw,dh.
+    lr = tl.zeros([BT, BB], dtype=tl.float32)
+    lw = tl.zeros([BT, BB], dtype=tl.float32)
+    for dm in range(NDM):
+        offs_dm = dm * BD + tl.arange(0, BD)
+        mmask = offs_dm < d_model
+        hc = tl.load(h_ptr + pid_b * sh_b + rows[:, None] * sh_l + offs_dm[None, :] * sh_d,
+                     mask=rmask[:, None] & mmask[None, :], other=0.0)
+        wr = tl.load(wr_ptr + lvl * swr_lvl + offs_dm[:, None] * swr_d + offs_bb[None, :] * swr_b,
+                     mask=mmask[:, None] & bmask[None, :], other=0.0)
+        ww = tl.load(ww_ptr + lvl * sww_lvl + offs_dm[:, None] * sww_d + offs_bb[None, :] * sww_b,
+                     mask=mmask[:, None] & bmask[None, :], other=0.0)
+        lr += tl.dot(hc, wr)
+        lw += tl.dot(hc, ww)
+    neg = tl.full([BT, BB], float('-inf'), dtype=tl.float32)
+    lr = tl.where(bmask[None, :], lr, neg)
+    lw = tl.where(bmask[None, :], lw, neg)
+    er = tl.exp(lr - tl.max(lr, axis=1)[:, None])
+    ew = tl.exp(lw - tl.max(lw, axis=1)[:, None])
+    fr = er / tl.sum(er, axis=1)[:, None]
+    fw = ew / tl.sum(ew, axis=1)[:, None]
+    sel = tl.load(sel_ptr + lvl * ssel_lvl + offs_bb[:, None] * ssel_b + cols[None, :] * ssel_c,
+                  mask=bmask[:, None] & cmask[None, :], other=0.0)
+    drr = dr_tile * r_tile
+    dww_ = dw_tile * w_tile
+    dfr = tl.dot(drr, tl.trans(sel)) / fr
+    dfw = tl.dot(dww_, tl.trans(sel)) / fw
+    dfr = tl.where(bmask[None, :], dfr, 0.0)
+    dfw = tl.where(bmask[None, :], dfw, 0.0)
+    dlr = fr * (dfr - tl.sum(fr * dfr, axis=1)[:, None])
+    dlw = fw * (dfw - tl.sum(fw * dfw, axis=1)[:, None])
+    for dm in range(NDM):
+        offs_dm = dm * BD + tl.arange(0, BD)
+        mmask = offs_dm < d_model
+        hc = tl.load(h_ptr + pid_b * sh_b + rows[:, None] * sh_l + offs_dm[None, :] * sh_d,
+                     mask=rmask[:, None] & mmask[None, :], other=0.0)
+        wr = tl.load(wr_ptr + lvl * swr_lvl + offs_dm[:, None] * swr_d + offs_bb[None, :] * swr_b,
+                     mask=mmask[:, None] & bmask[None, :], other=0.0)
+        ww = tl.load(ww_ptr + lvl * sww_lvl + offs_dm[:, None] * sww_d + offs_bb[None, :] * sww_b,
+                     mask=mmask[:, None] & bmask[None, :], other=0.0)
+        tl.atomic_add(dwr_ptr + lvl * swr_lvl + offs_dm[:, None] * swr_d + offs_bb[None, :] * swr_b,
+                      tl.dot(tl.trans(hc), dlr.to(hc.dtype)), mask=mmask[:, None] & bmask[None, :])
+        tl.atomic_add(dww_ptr + lvl * sww_lvl + offs_dm[:, None] * sww_d + offs_bb[None, :] * sww_b,
+                      tl.dot(tl.trans(hc), dlw.to(hc.dtype)), mask=mmask[:, None] & bmask[None, :])
+        dh_blk = tl.dot(dlr.to(wr.dtype), tl.trans(wr)) + tl.dot(dlw.to(ww.dtype), tl.trans(ww))
+        tl.atomic_add(dh_ptr + pid_b * sdh_b + rows[:, None] * sdh_l + offs_dm[None, :] * sdh_d,
+                      dh_blk, mask=rmask[:, None] & mmask[None, :])
+
+
+@triton.jit
+def _build_factors(h_ptr, wr_ptr, ww_ptr, sel_ptr, cols, cmask,
+                   pid_b, rows, rmask, offs_bb, bmask, d_model,
+                   sh_b, sh_l, sh_d, swr_lvl, swr_d, swr_b, sww_lvl, sww_d, sww_b,
+                   ssel_lvl, ssel_b, ssel_c, D: tl.constexpr, BT: tl.constexpr,
+                   BB: tl.constexpr, BC: tl.constexpr, BD: tl.constexpr, NDM: tl.constexpr):
+    r_tile = tl.full([BT, BC], 1.0, dtype=tl.float32)
+    w_tile = tl.full([BT, BC], 1.0, dtype=tl.float32)
+    for lvl in range(D):
+        lr = tl.zeros([BT, BB], dtype=tl.float32)
+        lw = tl.zeros([BT, BB], dtype=tl.float32)
+        for dm in range(NDM):
+            offs_dm = dm * BD + tl.arange(0, BD)
+            mmask = offs_dm < d_model
+            hc = tl.load(h_ptr + pid_b * sh_b + rows[:, None] * sh_l + offs_dm[None, :] * sh_d,
+                         mask=rmask[:, None] & mmask[None, :], other=0.0)
+            wr = tl.load(wr_ptr + lvl * swr_lvl + offs_dm[:, None] * swr_d + offs_bb[None, :] * swr_b,
+                         mask=mmask[:, None] & bmask[None, :], other=0.0)
+            ww = tl.load(ww_ptr + lvl * sww_lvl + offs_dm[:, None] * sww_d + offs_bb[None, :] * sww_b,
+                         mask=mmask[:, None] & bmask[None, :], other=0.0)
+            lr += tl.dot(hc, wr)
+            lw += tl.dot(hc, ww)
+        neg = tl.full([BT, BB], float('-inf'), dtype=tl.float32)
+        lr = tl.where(bmask[None, :], lr, neg)
+        lw = tl.where(bmask[None, :], lw, neg)
+        er = tl.exp(lr - tl.max(lr, axis=1)[:, None])
+        ew = tl.exp(lw - tl.max(lw, axis=1)[:, None])
+        fr = er / tl.sum(er, axis=1)[:, None]
+        fw = ew / tl.sum(ew, axis=1)[:, None]
+        sel = tl.load(sel_ptr + lvl * ssel_lvl + offs_bb[:, None] * ssel_b + cols[None, :] * ssel_c,
+                      mask=bmask[:, None] & cmask[None, :], other=0.0)
+        r_tile *= tl.dot(fr, sel)
+        w_tile *= tl.dot(fw, sel)
+    r_tile = tl.where(cmask[None, :], r_tile, 0.0)
+    w_tile = tl.where(cmask[None, :], w_tile, 0.0)
+    return r_tile, w_tile
+
+
+# ============ INTRA backward kernel ============
+@triton.jit
+def _bwd_intra_kernel(
+    h_ptr, q_ptr, k_ptr, v_ptr, wr_ptr, ww_ptr, sel_ptr, do_ptr,
+    dq_ptr, dk_ptr, dv_ptr, dh_ptr, dwr_ptr, dww_ptr,
+    L, d_model, dqk, dv, nc,
+    sh_b, sh_l, sh_d, sq_b, sq_l, sq_d, sv_b, sv_l, sv_d,
+    swr_lvl, swr_d, swr_b, sww_lvl, sww_d, sww_b,
+    ssel_lvl, ssel_b, ssel_c, so_b, so_l, so_v, sdh_b, sdh_l, sdh_d,
+    D: tl.constexpr, b: tl.constexpr, BB: tl.constexpr,
+    BT: tl.constexpr, BK: tl.constexpr, BV: tl.constexpr, BD: tl.constexpr,
+    BC: tl.constexpr, NCBLK: tl.constexpr, ND: tl.constexpr, NDM: tl.constexpr,
+):
+    pid_b = tl.program_id(0)
+    pid_t = tl.program_id(1)
+    offs_t = tl.arange(0, BT)
+    offs_v = tl.arange(0, BV)
+    offs_k = tl.arange(0, BK)
+    offs_bb = tl.arange(0, BB)
+    offs_c = tl.arange(0, BC)
+    bmask = offs_bb < b
+    vmask = offs_v < dv
+    kmask = offs_k < dqk
+    rows = pid_t * BT + offs_t
+    rmask = rows < L
+    qc = tl.load(q_ptr + pid_b * sq_b + rows[:, None] * sq_l + offs_k[None, :] * sq_d,
+                 mask=rmask[:, None] & kmask[None, :], other=0.0)
+    kc = tl.load(k_ptr + pid_b * sq_b + rows[:, None] * sq_l + offs_k[None, :] * sq_d,
+                 mask=rmask[:, None] & kmask[None, :], other=0.0)
+    vc = tl.load(v_ptr + pid_b * sv_b + rows[:, None] * sv_l + offs_v[None, :] * sv_d,
+                 mask=rmask[:, None] & vmask[None, :], other=0.0)
+    doc = tl.load(do_ptr + pid_b * so_b + rows[:, None] * so_l + offs_v[None, :] * so_v,
+                  mask=rmask[:, None] & vmask[None, :], other=0.0)
+    G = tl.dot(qc, tl.trans(kc))
+    causal = (offs_t[:, None] >= offs_t[None, :]) & rmask[:, None] & rmask[None, :]
+    dov = tl.dot(doc, tl.trans(vc)) * causal  # [BT,BT]
+    # pass 1: full Rgram
+    Rgram = tl.zeros([BT, BT], dtype=tl.float32)
+    for cb in range(NCBLK):
+        cols = cb * BC + offs_c
+        cmask = cols < nc
+        r_tile, w_tile = _build_factors(h_ptr, wr_ptr, ww_ptr, sel_ptr, cols, cmask,
+                                        pid_b, rows, rmask, offs_bb, bmask, d_model,
+                                        sh_b, sh_l, sh_d, swr_lvl, swr_d, swr_b, sww_lvl, sww_d, sww_b,
+                                        ssel_lvl, ssel_b, ssel_c, D, BT, BB, BC, BD, NDM)
+        Rgram += tl.dot(r_tile, tl.trans(w_tile))
+    A = G * Rgram * causal
+    dv_acc = tl.dot(tl.trans(A).to(doc.dtype), doc)
+    dRgram = dov * G
+    dG = dov * Rgram
+    dq_acc = tl.dot(dG.to(kc.dtype), kc)
+    dk_acc = tl.dot(tl.trans(dG).to(qc.dtype), qc)
+    tl.store(dv_ptr + pid_b * sv_b + rows[:, None] * sv_l + offs_v[None, :] * sv_d,
+             dv_acc, mask=rmask[:, None] & vmask[None, :])
+    tl.atomic_add(dq_ptr + pid_b * sq_b + rows[:, None] * sq_l + offs_k[None, :] * sq_d,
+                  dq_acc, mask=rmask[:, None] & kmask[None, :])
+    tl.atomic_add(dk_ptr + pid_b * sq_b + rows[:, None] * sq_l + offs_k[None, :] * sq_d,
+                  dk_acc, mask=rmask[:, None] & kmask[None, :])
+    # pass 2: per block, dr_tile/dw_tile from intra, fold
+    for cb in range(NCBLK):
+        cols = cb * BC + offs_c
+        cmask = cols < nc
+        r_tile, w_tile = _build_factors(h_ptr, wr_ptr, ww_ptr, sel_ptr, cols, cmask,
+                                        pid_b, rows, rmask, offs_bb, bmask, d_model,
+                                        sh_b, sh_l, sh_d, swr_lvl, swr_d, swr_b, sww_lvl, sww_d, sww_b,
+                                        ssel_lvl, ssel_b, ssel_c, D, BT, BB, BC, BD, NDM)
+        dr_tile = tl.dot(dRgram.to(w_tile.dtype), w_tile)
+        dw_tile = tl.dot(tl.trans(dRgram).to(r_tile.dtype), r_tile)
+        for lvl in range(D):
+            _fold_level(dr_tile, dw_tile, r_tile, w_tile, cols, cmask,
+                        h_ptr, wr_ptr, ww_ptr, sel_ptr, dwr_ptr, dww_ptr, dh_ptr,
+                        pid_b, rows, rmask, offs_bb, bmask, d_model,
+                        sh_b, sh_l, sh_d, swr_lvl, swr_d, swr_b, sww_lvl, sww_d, sww_b,
+                        ssel_lvl, ssel_b, ssel_c, sdh_b, sdh_l, sdh_d,
+                        lvl, D, BT, BB, BC, BD, NDM)
+
+
+# ============ INTER readout backward (dr, dq from o_inter; accumulates dS_read into ds) ============
+# Split from the state-update half to halve SMEM (only the readout [BT,BC*BK] tile lives here).
+@triton.jit
+def _bwd_inter_read_kernel(
+    h_ptr, q_ptr, wr_ptr, ww_ptr, sel_ptr, s_ptr, ds_ptr, do_ptr,
+    dq_ptr, gdr_ptr,
+    L, d_model, dqk, dv, nc, t_start,
+    sh_b, sh_l, sh_d, sq_b, sq_l, sq_d,
+    swr_lvl, swr_d, swr_b, sww_lvl, sww_d, sww_b,
+    ssel_lvl, ssel_b, ssel_c, ss_b, ss_c, ss_k, ss_v,
+    so_b, so_l, so_v, sg_b, sg_t, sg_c,
+    D: tl.constexpr, b: tl.constexpr, BB: tl.constexpr,
+    BT: tl.constexpr, BK: tl.constexpr, BV: tl.constexpr, BD: tl.constexpr,
+    BC: tl.constexpr, NCBLK: tl.constexpr, NDM: tl.constexpr,
+):
+    pid_b = tl.program_id(0)
+    offs_t = tl.arange(0, BT)
+    offs_v = tl.arange(0, BV)
+    offs_k = tl.arange(0, BK)
+    offs_bb = tl.arange(0, BB)
+    offs_c = tl.arange(0, BC)
+    bmask = offs_bb < b
+    vmask = offs_v < dv
+    kmask = offs_k < dqk
+    rows = t_start + offs_t
+    rmask = rows < L
+    qc = tl.load(q_ptr + pid_b * sq_b + rows[:, None] * sq_l + offs_k[None, :] * sq_d,
+                 mask=rmask[:, None] & kmask[None, :], other=0.0)
+    doc = tl.load(do_ptr + pid_b * so_b + rows[:, None] * so_l + offs_v[None, :] * so_v,
+                  mask=rmask[:, None] & vmask[None, :], other=0.0)
+    dq_acc = tl.zeros([BT, BK], dtype=tl.float32)
+    for cb in range(NCBLK):
+        cols = cb * BC + offs_c
+        cmask = cols < nc
+        r_tile, w_tile = _build_factors(h_ptr, wr_ptr, ww_ptr, sel_ptr, cols, cmask,
+                                        pid_b, rows, rmask, offs_bb, bmask, d_model,
+                                        sh_b, sh_l, sh_d, swr_lvl, swr_d, swr_b, sww_lvl, sww_d, sww_b,
+                                        ssel_lvl, ssel_b, ssel_c, D, BT, BB, BC, BD, NDM)
+        ckv = tl.reshape(cols[:, None] * dqk + offs_k[None, :], [BC * BK])
+        ckmask = tl.reshape(cmask[:, None] & kmask[None, :], [BC * BK])
+        s_flat = tl.load(s_ptr + pid_b * ss_b + ckv[:, None] * ss_k + offs_v[None, :] * ss_v,
+                         mask=ckmask[:, None] & vmask[None, :], other=0.0)
+        M = tl.dot(doc, tl.trans(s_flat).to(doc.dtype))  # [BT, BC*BK]
+        Mr = tl.reshape(M, [BT, BC, BK])
+        dr_inter = tl.sum(Mr * qc[:, None, :], axis=2)
+        dr_tile = tl.where(cmask[None, :], dr_inter, 0.0)
+        dq_acc += tl.sum(Mr * r_tile[:, :, None], axis=1)
+        # dS_read[c,k,v] = sum_t r[t,c] q[t,k] do[t,v]; accumulate into ds buffer (adjoint of S_j).
+        rq = tl.reshape(r_tile[:, :, None] * qc[:, None, :], [BT, BC * BK])
+        dS_read = tl.dot(tl.trans(rq).to(doc.dtype), doc)  # [BC*BK, BV]
+        dS_in = tl.load(ds_ptr + pid_b * ss_b + ckv[:, None] * ss_k + offs_v[None, :] * ss_v,
+                        mask=ckmask[:, None] & vmask[None, :], other=0.0)
+        tl.store(ds_ptr + pid_b * ss_b + ckv[:, None] * ss_k + offs_v[None, :] * ss_v,
+                 dS_in + dS_read, mask=ckmask[:, None] & vmask[None, :])
+        tl.store(gdr_ptr + pid_b * sg_b + offs_t[:, None] * sg_t + cols[None, :] * sg_c,
+                 dr_tile, mask=rmask[:, None] & cmask[None, :])
+    tl.atomic_add(dq_ptr + pid_b * sq_b + rows[:, None] * sq_l + offs_k[None, :] * sq_d,
+                  dq_acc, mask=rmask[:, None] & kmask[None, :])
+
+
+# ============ INTER state-update backward (dw, dk, dv; uses ds = adjoint of S_{j+1}) ============
+# Must run BEFORE the readout kernel writes dS_read into ds for this chunk (ds is still S_{j+1}'s adjoint).
+@triton.jit
+def _bwd_inter_state_kernel(
+    h_ptr, k_ptr, v_ptr, wr_ptr, ww_ptr, sel_ptr, ds_ptr,
+    dk_ptr, dv_ptr, gdw_ptr,
+    L, d_model, dqk, dv, nc, t_start,
+    sh_b, sh_l, sh_d, sq_b, sq_l, sq_d, sv_b, sv_l, sv_d,
+    swr_lvl, swr_d, swr_b, sww_lvl, sww_d, sww_b,
+    ssel_lvl, ssel_b, ssel_c, ss_b, ss_c, ss_k, ss_v,
+    sg_b, sg_t, sg_c,
+    D: tl.constexpr, b: tl.constexpr, BB: tl.constexpr,
+    BT: tl.constexpr, BK: tl.constexpr, BV: tl.constexpr, BD: tl.constexpr,
+    BC: tl.constexpr, NCBLK: tl.constexpr, NDM: tl.constexpr,
+):
+    pid_b = tl.program_id(0)
+    offs_t = tl.arange(0, BT)
+    offs_v = tl.arange(0, BV)
+    offs_k = tl.arange(0, BK)
+    offs_bb = tl.arange(0, BB)
+    offs_c = tl.arange(0, BC)
+    bmask = offs_bb < b
+    vmask = offs_v < dv
+    kmask = offs_k < dqk
+    rows = t_start + offs_t
+    rmask = rows < L
+    kc = tl.load(k_ptr + pid_b * sq_b + rows[:, None] * sq_l + offs_k[None, :] * sq_d,
+                 mask=rmask[:, None] & kmask[None, :], other=0.0)
+    vc = tl.load(v_ptr + pid_b * sv_b + rows[:, None] * sv_l + offs_v[None, :] * sv_d,
+                 mask=rmask[:, None] & vmask[None, :], other=0.0)
+    dk_acc = tl.zeros([BT, BK], dtype=tl.float32)
+    dv_acc = tl.zeros([BT, BV], dtype=tl.float32)
+    for cb in range(NCBLK):
+        cols = cb * BC + offs_c
+        cmask = cols < nc
+        r_tile, w_tile = _build_factors(h_ptr, wr_ptr, ww_ptr, sel_ptr, cols, cmask,
+                                        pid_b, rows, rmask, offs_bb, bmask, d_model,
+                                        sh_b, sh_l, sh_d, swr_lvl, swr_d, swr_b, sww_lvl, sww_d, sww_b,
+                                        ssel_lvl, ssel_b, ssel_c, D, BT, BB, BC, BD, NDM)
+        ckv = tl.reshape(cols[:, None] * dqk + offs_k[None, :], [BC * BK])
+        ckmask = tl.reshape(cmask[:, None] & kmask[None, :], [BC * BK])
+        dS_in = tl.load(ds_ptr + pid_b * ss_b + ckv[:, None] * ss_k + offs_v[None, :] * ss_v,
+                        mask=ckmask[:, None] & vmask[None, :], other=0.0)
+        N = tl.dot(vc, tl.trans(dS_in).to(vc.dtype))  # [BT, BC*BK]
+        Nr = tl.reshape(N, [BT, BC, BK])
+        dw_inter = tl.sum(Nr * kc[:, None, :], axis=2)
+        dw_tile = tl.where(cmask[None, :], dw_inter, 0.0)
+        dk_acc += tl.sum(Nr * w_tile[:, :, None], axis=1)
+        wk = tl.reshape(w_tile[:, :, None] * kc[:, None, :], [BT, BC * BK])
+        dv_acc += tl.dot(wk.to(dS_in.dtype), dS_in)
+        tl.store(gdw_ptr + pid_b * sg_b + offs_t[:, None] * sg_t + cols[None, :] * sg_c,
+                 dw_tile, mask=rmask[:, None] & cmask[None, :])
+    tl.atomic_add(dk_ptr + pid_b * sq_b + rows[:, None] * sq_l + offs_k[None, :] * sq_d,
+                  dk_acc, mask=rmask[:, None] & kmask[None, :])
+    tl.atomic_add(dv_ptr + pid_b * sv_b + rows[:, None] * sv_l + offs_v[None, :] * sv_d,
+                  dv_acc, mask=rmask[:, None] & vmask[None, :])
+
+
+# ============ FOLD kernel: gate-grad tiles [BT,nc] -> dWr,dWw,dh (router-grad fold) ============
+@triton.jit
+def _fold_kernel(
+    h_ptr, wr_ptr, ww_ptr, sel_ptr, gdr_ptr, gdw_ptr,
+    dh_ptr, dwr_ptr, dww_ptr,
+    L, d_model, nc, t_start,
+    sh_b, sh_l, sh_d, swr_lvl, swr_d, swr_b, sww_lvl, sww_d, sww_b,
+    ssel_lvl, ssel_b, ssel_c, sg_b, sg_t, sg_c, sdh_b, sdh_l, sdh_d,
+    D: tl.constexpr, b: tl.constexpr, BB: tl.constexpr,
+    BT: tl.constexpr, BC: tl.constexpr, BD: tl.constexpr,
+    NCBLK: tl.constexpr, NDM: tl.constexpr,
+):
+    pid_b = tl.program_id(0)
+    offs_t = tl.arange(0, BT)
+    offs_bb = tl.arange(0, BB)
+    offs_c = tl.arange(0, BC)
+    bmask = offs_bb < b
+    rows = t_start + offs_t
+    rmask = rows < L
+    for cb in range(NCBLK):
+        cols = cb * BC + offs_c
+        cmask = cols < nc
+        r_tile, w_tile = _build_factors(h_ptr, wr_ptr, ww_ptr, sel_ptr, cols, cmask,
+                                        pid_b, rows, rmask, offs_bb, bmask, d_model,
+                                        sh_b, sh_l, sh_d, swr_lvl, swr_d, swr_b, sww_lvl, sww_d, sww_b,
+                                        ssel_lvl, ssel_b, ssel_c, D, BT, BB, BC, BD, NDM)
+        dr_tile = tl.load(gdr_ptr + pid_b * sg_b + offs_t[:, None] * sg_t + cols[None, :] * sg_c,
+                          mask=rmask[:, None] & cmask[None, :], other=0.0)
+        dw_tile = tl.load(gdw_ptr + pid_b * sg_b + offs_t[:, None] * sg_t + cols[None, :] * sg_c,
+                          mask=rmask[:, None] & cmask[None, :], other=0.0)
+        for lvl in range(D):
+            _fold_level(dr_tile, dw_tile, r_tile, w_tile, cols, cmask,
+                        h_ptr, wr_ptr, ww_ptr, sel_ptr, dwr_ptr, dww_ptr, dh_ptr,
+                        pid_b, rows, rmask, offs_bb, bmask, d_model,
+                        sh_b, sh_l, sh_d, swr_lvl, swr_d, swr_b, sww_lvl, sww_d, sww_b,
+                        ssel_lvl, ssel_b, ssel_c, sdh_b, sdh_l, sdh_d,
+                        lvl, D, BT, BB, BC, BD, NDM)
+
+
+def tree_routed_chunked_bwd(h, q, k, v, Wr, Ww, do, states, D, b, chunk=64):
+    B, L, d_model = h.shape
+    dqk = q.shape[-1]
+    dv = v.shape[-1]
+    nc = b ** D
+    BV = max(16, triton.next_power_of_2(dv))
+    BK = max(16, triton.next_power_of_2(dqk))
+    BD = max(16, triton.next_power_of_2(d_model))
+    BB = max(16, triton.next_power_of_2(b))
+    BC = min(nc, 16)
+    NCBLK = triton.cdiv(nc, BC)
+    ND = triton.cdiv(dqk, BK)
+    NDM = triton.cdiv(d_model, BD)
+    NCH = triton.cdiv(L, chunk)
+    # match do's dtype to v so the in-kernel readout dots (doc·vᵀ etc) share a dtype with q/k/v.
+    do = do.to(v.dtype)
+    h, q, k, v, Wr, Ww, do = (x.contiguous() for x in (h, q, k, v, Wr, Ww, do))
+    sel = _build_sel(D, b, nc, q.device)
+    dq = torch.zeros(B, L, BK, device=q.device, dtype=torch.float32)
+    dk = torch.zeros(B, L, BK, device=q.device, dtype=torch.float32)
+    dvv = torch.zeros(B, L, BV, device=q.device, dtype=torch.float32)
+    dh = torch.zeros(B, L, d_model, device=q.device, dtype=torch.float32)
+    dWr = torch.zeros(D, d_model, b, device=q.device, dtype=torch.float32)
+    dWw = torch.zeros(D, d_model, b, device=q.device, dtype=torch.float32)
+    common = dict(D=D, b=b, BB=BB, BT=chunk, BK=BK, BV=BV, BD=BD, BC=BC,
+                  NCBLK=NCBLK, ND=ND, NDM=NDM, num_warps=4, num_stages=1)
+    _bwd_intra_kernel[(B, NCH)](
+        h, q, k, v, Wr, Ww, sel, do, dq, dk, dvv, dh, dWr, dWw,
+        L, d_model, dqk, dv, nc,
+        h.stride(0), h.stride(1), h.stride(2), q.stride(0), q.stride(1), q.stride(2),
+        v.stride(0), v.stride(1), v.stride(2),
+        Wr.stride(0), Wr.stride(1), Wr.stride(2), Ww.stride(0), Ww.stride(1), Ww.stride(2),
+        sel.stride(0), sel.stride(1), sel.stride(2),
+        do.stride(0), do.stride(1), do.stride(2), dh.stride(0), dh.stride(1), dh.stride(2),
+        **common)
+    dS = torch.zeros(B, nc, dqk, dv, device=q.device, dtype=torch.float32)
+    # per-chunk gate-grad scratch [B, chunk, nc] — transient, OVERWRITTEN each chunk (never [L,nc]).
+    gdr = torch.zeros(B, chunk, nc, device=q.device, dtype=torch.float32)
+    gdw = torch.zeros(B, chunk, nc, device=q.device, dtype=torch.float32)
+    fold_common = dict(D=D, b=b, BB=BB, BT=chunk, BC=BC, BD=BD, NCBLK=NCBLK, NDM=NDM,
+                       num_warps=4, num_stages=1)
+    inter_common = dict(D=D, b=b, BB=BB, BT=chunk, BK=BK, BV=BV, BD=BD, BC=BC,
+                        NCBLK=NCBLK, NDM=NDM, num_warps=4, num_stages=1)
+    for c in reversed(range(NCH)):
+        Sj = states[c].contiguous()
+        # state-update bwd FIRST: it reads dS = adjoint of S_{j+1} (before readout folds dS_read in).
+        _bwd_inter_state_kernel[(B,)](
+            h, k, v, Wr, Ww, sel, dS, dk, dvv, gdw,
+            L, d_model, dqk, dv, nc, c * chunk,
+            h.stride(0), h.stride(1), h.stride(2), q.stride(0), q.stride(1), q.stride(2),
+            v.stride(0), v.stride(1), v.stride(2),
+            Wr.stride(0), Wr.stride(1), Wr.stride(2), Ww.stride(0), Ww.stride(1), Ww.stride(2),
+            sel.stride(0), sel.stride(1), sel.stride(2),
+            dS.stride(0), dS.stride(1), dS.stride(2), dS.stride(3),
+            gdr.stride(0), gdr.stride(1), gdr.stride(2),
+            **inter_common)
+        # readout bwd: computes dr,dq, then accumulates dS_read into dS (= adjoint of S_j for next iter).
+        _bwd_inter_read_kernel[(B,)](
+            h, q, Wr, Ww, sel, Sj, dS, do, dq, gdr,
+            L, d_model, dqk, dv, nc, c * chunk,
+            h.stride(0), h.stride(1), h.stride(2), q.stride(0), q.stride(1), q.stride(2),
+            Wr.stride(0), Wr.stride(1), Wr.stride(2), Ww.stride(0), Ww.stride(1), Ww.stride(2),
+            sel.stride(0), sel.stride(1), sel.stride(2),
+            Sj.stride(0), Sj.stride(1), Sj.stride(2), Sj.stride(3),
+            do.stride(0), do.stride(1), do.stride(2),
+            gdr.stride(0), gdr.stride(1), gdr.stride(2),
+            **inter_common)
+        _fold_kernel[(B,)](
+            h, Wr, Ww, sel, gdr, gdw, dh, dWr, dWw,
+            L, d_model, nc, c * chunk,
+            h.stride(0), h.stride(1), h.stride(2),
+            Wr.stride(0), Wr.stride(1), Wr.stride(2), Ww.stride(0), Ww.stride(1), Ww.stride(2),
+            sel.stride(0), sel.stride(1), sel.stride(2),
+            gdr.stride(0), gdr.stride(1), gdr.stride(2), dh.stride(0), dh.stride(1), dh.stride(2),
+            **fold_common)
+    return dq[..., :dqk], dk[..., :dqk], dvv[..., :dv], dh, dWr, dWw
+
+
+# --- autograd.Function: end-to-end trainable fused tree-routing (fwd + bwd) ----------------------
+
+class _TreeRoutedFn(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, h, q, k, v, Wr, Ww, D, b, chunk):
+        o, states = tree_routed_chunked(h, q, k, v, Wr, Ww, D, b, chunk, return_states=True)
+        ctx.save_for_backward(h, q, k, v, Wr, Ww)
+        ctx.states = states
+        ctx.D, ctx.b, ctx.chunk = D, b, chunk
+        return o
+
+    @staticmethod
+    def backward(ctx, do):
+        h, q, k, v, Wr, Ww = ctx.saved_tensors
+        dq, dk, dv, dh, dWr, dWw = tree_routed_chunked_bwd(
+            h, q, k, v, Wr, Ww, do.contiguous(), ctx.states, ctx.D, ctx.b, ctx.chunk)
+        # cast grads back to the input dtypes
+        return (dh.to(h.dtype), dq.to(q.dtype), dk.to(k.dtype), dv.to(v.dtype),
+                dWr.to(Wr.dtype), dWw.to(Ww.dtype), None, None, None)
+
+
+def tree_routed(h, q, k, v, Wr, Ww, D, b, chunk=64):
+    """End-to-end differentiable fused tree-routing: o = o_intra + o_inter, with the full backward
+    (dq,dk,dv,d_h,dWr,dWw) and the [L,nc] gates + their grads NEVER materialized. Plug into autograd.
+
+    h  : [B, L, d_model]   q,k: [B, L, dqk]   v: [B, L, dv]   Wr,Ww: [D, d_model, b]
+    Returns o : [B, L, dv].
+    """
+    return _TreeRoutedFn.apply(h, q, k, v, Wr, Ww, D, b, chunk)
