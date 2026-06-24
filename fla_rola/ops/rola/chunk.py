@@ -94,6 +94,37 @@ def _bv_cap(dv):
     return max(16, triton.next_power_of_2(dv))
 
 
+# Feature/value tiling for the FUSED kappa/per_state kernels and the routed numerator backward. Unlike
+# the simpler numerator-only `_fwd_tiled`, these kernels build [BC*BK, BV] state slices and [BT, BC*BK]
+# read/write tiles with BC=16, so the dominant fp32 tile is BC·BK·BV·4 bytes (two copies live at the
+# state read+write). We tile BOTH axes: cap BK<=64 (loop ND=cdiv(dqk,BK)) AND cap the value tile BV (loop
+# ND_V=cdiv(dv,BV)) so BC·BK·BV stays under a conservative budget. BK=BV=16 always survives (the floor).
+# Both loops are pure reduction-order / output-block reassociations → bit-faithful. (`_kappa_bk_cap`
+# keeps the value-free backward — which has no BV loop — fitting by capping BK against max(BV,BT).)
+def _kappa_bk_cap(dqk, dv, chunk, bc=16):
+    bv = _bv_cap(dv)
+    want = min(64, max(16, triton.next_power_of_2(dqk)))
+    budget = 24 * 1024                       # bytes for ONE [BC*BK, max(BV,BT)] fp32 tile (several live +
+    span = bc * max(bv, chunk) * 4           # the fp32 backward operands + pipelining, within the ~100KB cap)
+    bk = want
+    while bk > 16 and bk * span > budget:
+        bk //= 2
+    return bk
+
+
+def _kappa_bv_tile(dqk, dv, bc=16, bk_cap=64):
+    """Value tile for the kappa FORWARD (whose [BC*BK,BV] state slice IS value-looped). Largest pow2 BV in
+    [16, next_pow2(dv)] keeping BC·BK·BV·4 under budget so the read + write copies of the slice both fit."""
+    bk = min(bk_cap, max(16, triton.next_power_of_2(dqk)))
+    want = max(16, triton.next_power_of_2(dv))
+    budget = 24 * 1024                       # one [BC*BK, BV] fp32 tile; the read+write pair + rq/wk fit
+    span = bc * bk * 4
+    bv = want
+    while bv > 16 and bv * span > budget:
+        bv //= 2
+    return bv
+
+
 def _prune_bv(configs, named_args, **kwargs):
     """Cap BV at next_pow2(d_v): a bigger value-tile than the value dim is pure waste (and would blow
     up the config grid). Floor 16 always survives. Mirrors _prune_bwd_bd for the value axis."""
@@ -646,7 +677,8 @@ def _rola_routed_snap_kernel(h_ptr, k_ptr, v_ptr, wr_ptr, ww_ptr, sel_ptr, s_ptr
                              sbr_lvl, sbr_b, sbw_lvl, sbw_b,
                              D: tl.constexpr, b: tl.constexpr, BB: tl.constexpr,
                              BT: tl.constexpr, BK: tl.constexpr, BV: tl.constexpr, BD: tl.constexpr,
-                             BG: tl.constexpr, NCBLK: tl.constexpr, NCH: tl.constexpr, NDM: tl.constexpr,
+                             BG: tl.constexpr, NCBLK: tl.constexpr, ND: tl.constexpr,
+                             NCH: tl.constexpr, NDM: tl.constexpr,
                              HAS_BIAS: tl.constexpr):
     """Per-chunk PRE-STATE snapshot scan for the routed backward. One program per batch carries the flat
     Kronecker state S[nc,dqk,dv] across chunks; BEFORE each chunk's write it copies S into snap[:,chunk]
@@ -654,43 +686,46 @@ def _rola_routed_snap_kernel(h_ptr, k_ptr, v_ptr, wr_ptr, ww_ptr, sel_ptr, s_ptr
     state-blocks (the [L,nc] gates are never materialized here either). Mirrors the proto chunk kernel's
     state update (S += Σ_t wₜᶜ kₜ⊗vₜ), at the production state-block width BG."""
     pid_b = tl.program_id(0)
+    ND_V = (dv + BV - 1) // BV       # value-blocks (BV is the value TILE; ND_V==1 ⇒ the un-tiled kernel)
     offs_t = tl.arange(0, BT)
-    offs_v = tl.arange(0, BV)
-    offs_k = tl.arange(0, BK)
     offs_bb = tl.arange(0, BB)
     offs_c = tl.arange(0, BG)
     bmask = offs_bb < b
-    vmask = offs_v < dv
-    kmask = offs_k < dqk
     for ci in range(NCH):
         t_start = ci * BT
         rows = t_start + offs_t
         rmask = rows < L
-        kc = tl.load(k_ptr + pid_b * sq_b + rows[:, None] * sq_l + offs_k[None, :] * sq_d,
-                     mask=rmask[:, None] & kmask[None, :], other=0.0)
-        vc = tl.load(v_ptr + pid_b * sv_b + rows[:, None] * sv_l + offs_v[None, :] * sv_d,
-                     mask=rmask[:, None] & vmask[None, :], other=0.0)
         for cb in range(NCBLK):
             cols = cb * BG + offs_c
             cmask = cols < nc
-            ckv = tl.reshape(cols[:, None] * dqk + offs_k[None, :], [BG * BK])
-            ckmask = tl.reshape(cmask[:, None] & kmask[None, :], [BG * BK])
-            s_flat = tl.load(s_ptr + pid_b * ss_b + ckv[:, None] * ss_k + offs_v[None, :] * ss_v,
-                             mask=ckmask[:, None] & vmask[None, :], other=0.0)
-            # snapshot the PRE-update state into snap[:, ci] (flat row c*dqk+k).
-            snkv = tl.reshape(cols[:, None] * dqk + offs_k[None, :], [BG * BK])
-            tl.store(snap_ptr + pid_b * snp_b + ci * snp_n + snkv[:, None] * snp_k + offs_v[None, :] * snp_v,
-                     s_flat, mask=ckmask[:, None] & vmask[None, :])
             _, w_tile = _build_rw_tile(h_ptr, wr_ptr, ww_ptr, sel_ptr, cols, cmask,
                                        pid_b, rows, rmask, offs_bb, bmask, d_model,
                                        sh_b, sh_l, sh_d, swr_lvl, swr_d, swr_b, sww_lvl, sww_d, sww_b,
                                        ssel_lvl, ssel_b, ssel_c,
-                                  br_ptr, bw_ptr, sbr_lvl, sbr_b, sbw_lvl, sbw_b,
-                                  D, BT, BB, BG, BD, NDM, HAS_BIAS)
-            wk = tl.reshape(w_tile[:, :, None] * kc[:, None, :], [BT, BG * BK])
-            dS = tl.dot(tl.trans(wk).to(vc.dtype), vc)
-            tl.store(s_ptr + pid_b * ss_b + ckv[:, None] * ss_k + offs_v[None, :] * ss_v,
-                     s_flat + dS, mask=ckmask[:, None] & vmask[None, :])
+                                       br_ptr, bw_ptr, sbr_lvl, sbr_b, sbw_lvl, sbw_b,
+                                       D, BT, BB, BG, BD, NDM, HAS_BIAS)
+            # snapshot PRE-update state + the state write (S += Σ wᶜ k⊗v); dqk → loop BK-blocks AND value →
+            # loop ND_V so the [BG*BK,BV] s_flat slice stays bounded by BK·BV. wk[BT,BG*BK] value-free.
+            for d0 in range(ND):
+                offs_k = d0 * BK + tl.arange(0, BK)
+                kmask = offs_k < dqk
+                kc = tl.load(k_ptr + pid_b * sq_b + rows[:, None] * sq_l + offs_k[None, :] * sq_d,
+                             mask=rmask[:, None] & kmask[None, :], other=0.0)
+                ckv = tl.reshape(cols[:, None] * dqk + offs_k[None, :], [BG * BK])
+                ckmask = tl.reshape(cmask[:, None] & kmask[None, :], [BG * BK])
+                wk = tl.reshape(w_tile[:, :, None] * kc[:, None, :], [BT, BG * BK])
+                for vb in range(ND_V):
+                    offs_v = vb * BV + tl.arange(0, BV)
+                    vmask = offs_v < dv
+                    vc = tl.load(v_ptr + pid_b * sv_b + rows[:, None] * sv_l + offs_v[None, :] * sv_d,
+                                 mask=rmask[:, None] & vmask[None, :], other=0.0)
+                    s_flat = tl.load(s_ptr + pid_b * ss_b + ckv[:, None] * ss_k + offs_v[None, :] * ss_v,
+                                     mask=ckmask[:, None] & vmask[None, :], other=0.0)
+                    tl.store(snap_ptr + pid_b * snp_b + ci * snp_n + ckv[:, None] * snp_k
+                             + offs_v[None, :] * snp_v, s_flat, mask=ckmask[:, None] & vmask[None, :])
+                    dS = tl.dot(tl.trans(wk).to(vc.dtype), vc)
+                    tl.store(s_ptr + pid_b * ss_b + ckv[:, None] * ss_k + offs_v[None, :] * ss_v,
+                             s_flat + dS, mask=ckmask[:, None] & vmask[None, :])
 
 
 def _routed_snapshots(q, k, v, h, Wr, Ww, D, b, sel, chunk, BG, br=None, bw=None, has_bias=False):
@@ -701,11 +736,12 @@ def _routed_snapshots(q, k, v, h, Wr, Ww, D, b, sel, chunk, BG, br=None, bw=None
     dv = v.shape[-1]
     d_model = h.shape[-1]
     nc = b ** D
-    BV = max(16, triton.next_power_of_2(dv))
-    BK = max(16, triton.next_power_of_2(dqk))
+    BK = _kappa_bk_cap(dqk, dv, chunk, BG)   # feature-tile (loop ND) — bounds the [BT,BG*BK] tiles
+    BV = _kappa_bv_tile(dqk, dv, BG, BK)     # value-tile (loop ND_V) so the [BG*BK,BV] state slice fits
     BD = max(16, triton.next_power_of_2(d_model))
     BB = max(16, triton.next_power_of_2(b))
     NCBLK = triton.cdiv(nc, BG)
+    ND = triton.cdiv(dqk, BK)
     NDM = triton.cdiv(d_model, BD)
     NCH = triton.cdiv(L, chunk)
     if br is None:
@@ -723,7 +759,7 @@ def _routed_snapshots(q, k, v, h, Wr, Ww, D, b, sel, chunk, BG, br=None, bw=None
         S.stride(0), S.stride(1), S.stride(2), S.stride(3),
         snap.stride(0), snap.stride(1), snap.stride(2), snap.stride(3), snap.stride(4),
         *sbias,
-        D=D, b=b, BB=BB, BT=chunk, BK=BK, BV=BV, BD=BD, BG=BG, NCBLK=NCBLK, NCH=NCH, NDM=NDM,
+        D=D, b=b, BB=BB, BT=chunk, BK=BK, BV=BV, BD=BD, BG=BG, NCBLK=NCBLK, ND=ND, NCH=NCH, NDM=NDM,
         HAS_BIAS=has_bias, num_warps=4, num_stages=1)
     return snap
 
@@ -739,11 +775,16 @@ def _rola_rla_routed_bwd(q, k, v, h, Wr, Ww, do, D, b, chunk, BG, b_r=None, b_w=
     dqk = q.shape[-1]
     dv = v.shape[-1]
     nc = b ** D
-    BV = max(16, triton.next_power_of_2(dv))
-    BK = max(16, triton.next_power_of_2(dqk))
+    BVO = max(16, triton.next_power_of_2(dv))   # full padded value width (intra bwd + buffer alloc)
     BD = max(16, triton.next_power_of_2(d_model))
     BB = max(16, triton.next_power_of_2(b))
     BC = BG                                  # PRODUCTION tile width (the adaptation; proto used fixed 16)
+    # intra bwd builds only [BT,BK]/[BT,BT] tiles (no BC*BK), so it keeps the FULL feature/value width (no
+    # ND/ND_V loop). The inter state/read + snapshot kernels build [BC*BK,BV]/[BT,BC*BK] tiles → cap BK
+    # (loop ND) AND tile the value axis BV (loop ND_V) so the state slices fit; mirrors `_kappa_routed_bwd`.
+    BK_full = max(16, triton.next_power_of_2(dqk))
+    BK = _kappa_bk_cap(dqk, dv, min(chunk, _CHUNK), BC)   # feature-tile (loop ND)
+    BV = _kappa_bv_tile(dqk, dv, BC, BK)                 # value-tile (loop ND_V) so [BC*BK,BV] fits
     NCBLK = triton.cdiv(nc, BC)
     ND = triton.cdiv(dqk, BK)
     NDM = triton.cdiv(d_model, BD)
@@ -760,6 +801,11 @@ def _rola_rla_routed_bwd(q, k, v, h, Wr, Ww, do, D, b, chunk, BG, b_r=None, b_w=
     # GLA/all-backwards device constant — independent of the forward chunk (each is just a tiling of the
     # SAME sequence; the chunked readout is chunk-size invariant). Avoids the BT=64-fp32 SMEM wall.
     chunk = min(chunk, _CHUNK)
+    # The inter [BT,BC*BK] read/write tiles scale with BT; at large dqk (small BK, many ND) the fp32
+    # tiles + 3D elementwise temporaries exceed the cap at BT=32, so cap BT further when BC*BK is large
+    # (the chunked reverse-scan is chunk-size invariant). Cheap dims keep the full _CHUNK.
+    if BK * BC * chunk * 4 > 16 * 1024:
+        chunk = min(chunk, _KAPPA_BWD_CHUNK)
     NCH = triton.cdiv(L, chunk)
     sel = _build_sel(D, b, nc, q.device)
     # per-chunk pre-state snapshots (the recurrent STATE, not gates) for the reverse-scan — recomputed
@@ -777,8 +823,9 @@ def _rola_rla_routed_bwd(q, k, v, h, Wr, Ww, do, D, b, chunk, BG, b_r=None, b_w=
     dWw = torch.zeros(D, d_model, b, device=q.device, dtype=torch.float32)
     dbr = torch.zeros(D, b, device=q.device, dtype=torch.float32)   # routing-bias grads [D,b] (transient fold)
     dbw = torch.zeros(D, b, device=q.device, dtype=torch.float32)
-    common = dict(D=D, b=b, BB=BB, BT=chunk, BK=BK, BV=BV, BD=BD, BC=BC,
-                  NCBLK=NCBLK, ND=ND, NDM=NDM, HAS_BIAS=has_bias, num_warps=4, num_stages=1)
+    common = dict(D=D, b=b, BB=BB, BT=chunk, BK=BK_full, BV=BVO, BD=BD, BC=BC,
+                  NCBLK=NCBLK, ND=triton.cdiv(dqk, BK_full), NDM=NDM, HAS_BIAS=has_bias,
+                  num_warps=4, num_stages=1)
     _proto_bwd_intra[(B, NCH)](
         h, q, k, v, Wr, Ww, sel, do, dq, dk, dvv, dh, dWr, dWw,
         br, bw, dbr, dbw,
@@ -796,7 +843,7 @@ def _rola_rla_routed_bwd(q, k, v, h, Wr, Ww, do, D, b, chunk, BG, b_r=None, b_w=
     fold_common = dict(D=D, b=b, BB=BB, BT=chunk, BC=BC, BD=BD, NCBLK=NCBLK, NDM=NDM,
                        HAS_BIAS=has_bias, num_warps=4, num_stages=1)
     inter_common = dict(D=D, b=b, BB=BB, BT=chunk, BK=BK, BV=BV, BD=BD, BC=BC,
-                        NCBLK=NCBLK, NDM=NDM, HAS_BIAS=has_bias, num_warps=4, num_stages=1)
+                        NCBLK=NCBLK, ND=ND, NDM=NDM, HAS_BIAS=has_bias, num_warps=4, num_stages=1)
     for c in reversed(range(NCH)):
         Sj = snap[:, c].contiguous()
         _proto_bwd_inter_state[(B,)](
@@ -914,6 +961,28 @@ def rola_rla_routed_triton(q, k, v, h, Wr, Ww, D, b, chunk=None, BG=16, b_r=None
 
 
 @triton.jit
+def _kappa_d_tile(q_ptr, sden_ptr, Gc, w_tile, cols, cmask,
+                  pid_b, rows, rmask, dqk, nc, sq_b, sq_l, sq_d, ssd_b, ssd_k,
+                  BT: tl.constexpr, BK: tl.constexpr, BC: tl.constexpr, ND: tl.constexpr):
+    """Per-state den d[BT,BC] = (G⊙causal)·w (intra) + q·Sden^c (inter). The inter term contracts dqk →
+    accumulate over BK-feature-blocks so the [BC,BK] Sden slice stays bounded by BK<=64. Gc = G⊙causal is
+    passed in (value-free, reused). BV-free; recomputed identically in each numerator value-block pass."""
+    d_inter = tl.zeros([BT, BC], dtype=tl.float32)
+    for d0 in range(ND):
+        offs_k = d0 * BK + tl.arange(0, BK)
+        kmask = offs_k < dqk
+        qc = tl.load(q_ptr + pid_b*sq_b + rows[:, None]*sq_l + offs_k[None, :]*sq_d,
+                     mask=rmask[:, None] & kmask[None, :], other=0.0)
+        ck = tl.reshape(cols[:, None] * dqk + offs_k[None, :], [BC * BK])
+        ckmask = tl.reshape(cmask[:, None] & kmask[None, :], [BC * BK])
+        sden = tl.load(sden_ptr + pid_b*ssd_b + ck*ssd_k, mask=ckmask, other=0.0)
+        sden2 = tl.reshape(sden, [BC, BK])
+        d_inter += tl.dot(qc, tl.trans(sden2).to(qc.dtype))                         # [BT,BC]
+    d_intra = tl.dot(Gc.to(w_tile.dtype), w_tile)
+    return tl.where(cmask[None, :], d_intra + d_inter, 0.0)
+
+
+@triton.jit
 def _kappa_rescale(r_tile, d_tile, kap, cmask, GLOBAL: tl.constexpr,
                    PER_STATE: tl.constexpr, EPS: tl.constexpr):
     """r_tilde = r (global) | r/(d+eps) (per_state) | r*(d+eps)^(-kappa) (kappa). Transient [BT,BC].
@@ -947,26 +1016,28 @@ def _kappa_fwd_chunk(h_ptr, q_ptr, k_ptr, v_ptr, wr_ptr, ww_ptr, sel_ptr, kap_pt
     den, carries Sval[k,v] AND Sden[k] across chunks. One program per batch. Mirrors the proto chunk
     kernel + the den pre-pass, with the read gate rescaled by the transient per-state den."""
     pid_b = tl.program_id(0)
+    ND_V = (dv + BV - 1) // BV       # value-blocks (BV is the value TILE; ND_V==1 ⇒ the un-tiled kernel)
     offs_t = tl.arange(0, BT)
-    offs_v = tl.arange(0, BV)
-    offs_k = tl.arange(0, BK)
     offs_bb = tl.arange(0, BB)
     offs_c = tl.arange(0, BC)
     bmask = offs_bb < b
-    vmask = offs_v < dv
-    kmask = offs_k < dqk
     rows = t_start + offs_t
     rmask = rows < L
-    qc = tl.load(q_ptr + pid_b*sq_b + rows[:, None]*sq_l + offs_k[None, :]*sq_d,
-                 mask=rmask[:, None] & kmask[None, :], other=0.0)
-    kc = tl.load(k_ptr + pid_b*sq_b + rows[:, None]*sq_l + offs_k[None, :]*sq_d,
-                 mask=rmask[:, None] & kmask[None, :], other=0.0)
-    vc = tl.load(v_ptr + pid_b*sv_b + rows[:, None]*sv_l + offs_v[None, :]*sv_d,
-                 mask=rmask[:, None] & vmask[None, :], other=0.0)
     kap = tl.load(kap_ptr + pid_b*sk_b + rows*sk_l, mask=rmask, other=0.0)
-    G = tl.dot(qc, tl.trans(kc))
     causal = (offs_t[:, None] >= offs_t[None, :]) & rmask[:, None] & rmask[None, :]
-    o_num = tl.zeros([BT, BV], dtype=tl.float32)
+    # content gram G = q·kᵀ accumulated over BK-feature-blocks (so the [BT,BK] q/k tiles stay <=64).
+    G = tl.zeros([BT, BT], dtype=tl.float32)
+    for d0 in range(ND):
+        offs_k = d0 * BK + tl.arange(0, BK)
+        kmask = offs_k < dqk
+        qc = tl.load(q_ptr + pid_b*sq_b + rows[:, None]*sq_l + offs_k[None, :]*sq_d,
+                     mask=rmask[:, None] & kmask[None, :], other=0.0)
+        kc = tl.load(k_ptr + pid_b*sq_b + rows[:, None]*sq_l + offs_k[None, :]*sq_d,
+                     mask=rmask[:, None] & kmask[None, :], other=0.0)
+        G += tl.dot(qc, tl.trans(kc))
+    Gc = G * causal
+    # ---- Pass 1 (value-free): global den o_den = Σ_c r̃^c d^c (read carried-in Sden; do NOT update it
+    # yet — Pass 2 re-reads it for the same d). The [BC*BK,*] / [BT,BC*BK] tiles avoid the BV axis here.
     o_den = tl.zeros([BT], dtype=tl.float32)
     for cb in range(NCBLK):
         cols = cb * BC + offs_c
@@ -977,34 +1048,79 @@ def _kappa_fwd_chunk(h_ptr, q_ptr, k_ptr, v_ptr, wr_ptr, ww_ptr, sel_ptr, kap_pt
                                         ssel_lvl, ssel_b, ssel_c,
                                         br_ptr, bw_ptr, sbr_lvl, sbr_b, sbw_lvl, sbw_b,
                                         D, BT, BB, BC, BD, NDM, HAS_BIAS)
-        # per-state den d[BT,BC] = (G⊙causal)·w  +  q·Sden^c.
-        ck = tl.reshape(cols[:, None] * dqk + offs_k[None, :], [BC * BK])
-        ckmask = tl.reshape(cmask[:, None] & kmask[None, :], [BC * BK])
-        sden = tl.load(sden_ptr + pid_b*ssd_b + ck*ssd_k, mask=ckmask, other=0.0)   # [BC*BK]
-        sden2 = tl.reshape(sden, [BC, BK])
-        d_inter = tl.dot(qc, tl.trans(sden2).to(qc.dtype))                          # [BT,BC]
-        d_intra = tl.dot((G * causal).to(w_tile.dtype), w_tile)
-        d_tile = tl.where(cmask[None, :], d_intra + d_inter, 0.0)
+        d_tile = _kappa_d_tile(q_ptr, sden_ptr, Gc, w_tile, cols, cmask,
+                               pid_b, rows, rmask, dqk, nc, sq_b, sq_l, sq_d, ssd_b, ssd_k,
+                               BT, BK, BC, ND)
         rt_tile = _kappa_rescale(r_tile, d_tile, kap, cmask, GLOBAL, PER_STATE, EPS)
-        # numerator intra: A = G⊙(r̃·wᵀ)⊙causal; o_num += A·v.
-        Rg = tl.dot(rt_tile, tl.trans(w_tile))
-        A = G * Rg * causal
-        o_num += tl.dot(A.to(vc.dtype), vc)
-        # numerator inter: Σ_c r̃^c (q·Sval^c).
-        sflat = tl.load(sval_ptr + pid_b*ssv_b + ck[:, None]*ssv_k + offs_v[None, :]*ssv_v,
-                        mask=ckmask[:, None] & vmask[None, :], other=0.0)            # [BC*BK,BV]
-        rq = tl.reshape(rt_tile[:, :, None] * qc[:, None, :], [BT, BC * BK])
-        o_num += tl.dot(rq.to(sflat.dtype), sflat)
-        # global den += Σ_c r̃^c d^c.
         o_den += tl.sum(rt_tile * d_tile, axis=1)
-        # state updates (w only). Sval^c += Σ wᶜ k⊗v ;  Sden^c += Σ wᶜ k.
-        wk = tl.reshape(w_tile[:, :, None] * kc[:, None, :], [BT, BC * BK])
-        tl.store(sval_ptr + pid_b*ssv_b + ck[:, None]*ssv_k + offs_v[None, :]*ssv_v,
-                 sflat + tl.dot(tl.trans(wk).to(vc.dtype), vc), mask=ckmask[:, None] & vmask[None, :])
-        dsden = tl.sum(wk, axis=0)                                                  # [BC*BK]
-        tl.store(sden_ptr + pid_b*ssd_b + ck*ssd_k, sden + dsden, mask=ckmask)
-    tl.store(num_ptr + pid_b*snm_b + rows[:, None]*snm_l + offs_v[None, :]*snm_v,
-             o_num, mask=rmask[:, None] & vmask[None, :])
+    # ---- Pass 2 (value-tiled): numerator num = intra (A·v) + inter (Σ_c r̃^c q·Sval^c), AND the Sval
+    # state write — all value-tiled over ND_V blocks so the [BC*BK,BV] state slice stays bounded by BK·BV.
+    for vb in range(ND_V):
+        offs_v = vb * BV + tl.arange(0, BV)
+        vmask = offs_v < dv
+        vc = tl.load(v_ptr + pid_b*sv_b + rows[:, None]*sv_l + offs_v[None, :]*sv_d,
+                     mask=rmask[:, None] & vmask[None, :], other=0.0)
+        o_num = tl.zeros([BT, BV], dtype=tl.float32)
+        for cb in range(NCBLK):
+            cols = cb * BC + offs_c
+            cmask = cols < nc
+            r_tile, w_tile = _build_rw_tile(h_ptr, wr_ptr, ww_ptr, sel_ptr, cols, cmask,
+                                            pid_b, rows, rmask, offs_bb, bmask, d_model,
+                                            sh_b, sh_l, sh_d, swr_lvl, swr_d, swr_b, sww_lvl, sww_d, sww_b,
+                                            ssel_lvl, ssel_b, ssel_c,
+                                            br_ptr, bw_ptr, sbr_lvl, sbr_b, sbw_lvl, sbw_b,
+                                            D, BT, BB, BC, BD, NDM, HAS_BIAS)
+            d_tile = _kappa_d_tile(q_ptr, sden_ptr, Gc, w_tile, cols, cmask,
+                                   pid_b, rows, rmask, dqk, nc, sq_b, sq_l, sq_d, ssd_b, ssd_k,
+                                   BT, BK, BC, ND)
+            rt_tile = _kappa_rescale(r_tile, d_tile, kap, cmask, GLOBAL, PER_STATE, EPS)
+            # numerator intra: A = G⊙(r̃·wᵀ)⊙causal; o_num += A·v.
+            Rg = tl.dot(rt_tile, tl.trans(w_tile))
+            A = G * Rg * causal
+            o_num += tl.dot(A.to(vc.dtype), vc)
+            # numerator inter Σ_c r̃^c (q·Sval^c) + the Sval write (Sval^c += Σ wᶜ k⊗v); both index dqk →
+            # loop BK-blocks. rt_tile/w_tile [BT,BC] dqk-free, reused; the [BC*BK,BV] sval slice fits.
+            for d0 in range(ND):
+                offs_k = d0 * BK + tl.arange(0, BK)
+                kmask = offs_k < dqk
+                qc = tl.load(q_ptr + pid_b*sq_b + rows[:, None]*sq_l + offs_k[None, :]*sq_d,
+                             mask=rmask[:, None] & kmask[None, :], other=0.0)
+                kc = tl.load(k_ptr + pid_b*sq_b + rows[:, None]*sq_l + offs_k[None, :]*sq_d,
+                             mask=rmask[:, None] & kmask[None, :], other=0.0)
+                ck = tl.reshape(cols[:, None] * dqk + offs_k[None, :], [BC * BK])
+                ckmask = tl.reshape(cmask[:, None] & kmask[None, :], [BC * BK])
+                sflat = tl.load(sval_ptr + pid_b*ssv_b + ck[:, None]*ssv_k + offs_v[None, :]*ssv_v,
+                                mask=ckmask[:, None] & vmask[None, :], other=0.0)        # [BC*BK,BV]
+                rq = tl.reshape(rt_tile[:, :, None] * qc[:, None, :], [BT, BC * BK])
+                o_num += tl.dot(rq.to(sflat.dtype), sflat)
+                wk = tl.reshape(w_tile[:, :, None] * kc[:, None, :], [BT, BC * BK])
+                tl.store(sval_ptr + pid_b*ssv_b + ck[:, None]*ssv_k + offs_v[None, :]*ssv_v,
+                         sflat + tl.dot(tl.trans(wk).to(vc.dtype), vc),
+                         mask=ckmask[:, None] & vmask[None, :])
+        tl.store(num_ptr + pid_b*snm_b + rows[:, None]*snm_l + offs_v[None, :]*snm_v,
+                 o_num, mask=rmask[:, None] & vmask[None, :])
+    # ---- Pass 3 (value-free): Sden state write (Sden^c += Σ wᶜ k). Done LAST so Pass 1/2's d-recompute
+    # read the carried-in Sden. Loops BK-blocks; the [BC*BK] tiles are tiny.
+    for cb in range(NCBLK):
+        cols = cb * BC + offs_c
+        cmask = cols < nc
+        _r, w_tile = _build_rw_tile(h_ptr, wr_ptr, ww_ptr, sel_ptr, cols, cmask,
+                                    pid_b, rows, rmask, offs_bb, bmask, d_model,
+                                    sh_b, sh_l, sh_d, swr_lvl, swr_d, swr_b, sww_lvl, sww_d, sww_b,
+                                    ssel_lvl, ssel_b, ssel_c,
+                                    br_ptr, bw_ptr, sbr_lvl, sbr_b, sbw_lvl, sbw_b,
+                                    D, BT, BB, BC, BD, NDM, HAS_BIAS)
+        for d0 in range(ND):
+            offs_k = d0 * BK + tl.arange(0, BK)
+            kmask = offs_k < dqk
+            kc = tl.load(k_ptr + pid_b*sq_b + rows[:, None]*sq_l + offs_k[None, :]*sq_d,
+                         mask=rmask[:, None] & kmask[None, :], other=0.0)
+            ck = tl.reshape(cols[:, None] * dqk + offs_k[None, :], [BC * BK])
+            ckmask = tl.reshape(cmask[:, None] & kmask[None, :], [BC * BK])
+            wk = tl.reshape(w_tile[:, :, None] * kc[:, None, :], [BT, BC * BK])
+            dsden = tl.sum(wk, axis=0)                                                  # [BC*BK]
+            sden = tl.load(sden_ptr + pid_b*ssd_b + ck*ssd_k, mask=ckmask, other=0.0)   # [BC*BK]
+            tl.store(sden_ptr + pid_b*ssd_b + ck*ssd_k, sden + dsden, mask=ckmask)
     tl.store(den_ptr + pid_b*sdn_b + rows*sdn_l, o_den, mask=rmask)
 
 
@@ -1017,18 +1133,22 @@ def _kappa_routed_fwd(q, k, v, h, Wr, Ww, kap, D, b, sel, chunk, global_norm, pe
     dv = v.shape[-1]
     d_model = h.shape[-1]
     nc = b ** D
-    BV = max(16, triton.next_power_of_2(dv))
-    BK = max(16, triton.next_power_of_2(dqk))
+    BC = max(16, min(nc, 16))   # tl.dot needs the gram dim >=16; the nc tail is cmask'd
+    BK = _kappa_bk_cap(dqk, dv, _KAPPA_BWD_CHUNK, BC)    # feature-tile (loop ND) — bounds the [BT,BC*BK] tiles
+    BV = _kappa_bv_tile(dqk, dv, BC)                     # value-tile (loop ND_V) so [BC*BK,BV] fits SRAM
+    BVO = max(16, triton.next_power_of_2(dv))            # num buffer width (full padded value dim)
     BD = max(16, triton.next_power_of_2(d_model))
     BB = max(16, triton.next_power_of_2(b))
-    BC = max(16, min(nc, 16))   # tl.dot needs the gram dim >=16; the nc tail is cmask'd
+    # The [BT,BC*BK] rq/wk tiles scale with BT, so the heavy-tile fwd chunk is capped like the bwd (the
+    # chunked scan is chunk-size invariant). Cheap dqk/dv keep the full fwd chunk (BC*BK*BT then fits).
+    chunk = chunk if BK * BC * chunk * 4 <= 24 * 1024 else min(chunk, _KAPPA_BWD_CHUNK)
     NCBLK = triton.cdiv(nc, BC)
     ND = triton.cdiv(dqk, BK)
     NDM = triton.cdiv(d_model, BD)
     NCH = triton.cdiv(L, chunk)
     Sval = torch.zeros(B, nc, dqk, dv, device=q.device, dtype=torch.float32)
     Sden = torch.zeros(B, nc, dqk, device=q.device, dtype=torch.float32)
-    num = torch.zeros(B, L, BV, device=q.device, dtype=torch.float32)
+    num = torch.zeros(B, L, BVO, device=q.device, dtype=torch.float32)   # full padded width; BV tiles it
     den = torch.zeros(B, L, device=q.device, dtype=torch.float32)
     snap_val = torch.zeros(B, NCH, nc, dqk, dv, device=q.device, dtype=torch.float32)
     snap_den = torch.zeros(B, NCH, nc, dqk, device=q.device, dtype=torch.float32)
@@ -1094,28 +1214,19 @@ def _kappa_bwd_state(h_ptr, k_ptr, v_ptr, wr_ptr, ww_ptr, sel_ptr,
                      sbr_lvl, sbr_b, sbw_lvl, sbw_b,
                      D: tl.constexpr, b: tl.constexpr, BB: tl.constexpr,
                      BT: tl.constexpr, BK: tl.constexpr, BV: tl.constexpr, BD: tl.constexpr,
-                     BC: tl.constexpr, NCBLK: tl.constexpr, NDM: tl.constexpr,
+                     BC: tl.constexpr, NCBLK: tl.constexpr, ND: tl.constexpr, NDM: tl.constexpr,
                      HAS_BIAS: tl.constexpr):
     """State-update backward (split #1, SMEM-bound by the dSval tile). Uses the INCOMING adjoint
     (= Sval_{j+1}, Sden_{j+1}) to backprop the two writes Sval^c += Σ wᶜ k⊗v and Sden^c += Σ wᶜ k.
     Produces dk,dv (atomic) and the state half of dw (stored to gdw). w rebuilt in-kernel; no [L,nc]."""
     pid_b = tl.program_id(0)
+    ND_V = (dv + BV - 1) // BV       # value-blocks (BV is the value TILE; ND_V==1 ⇒ the un-tiled kernel)
     offs_t = tl.arange(0, BT)
-    offs_v = tl.arange(0, BV)
-    offs_k = tl.arange(0, BK)
     offs_bb = tl.arange(0, BB)
     offs_c = tl.arange(0, BC)
     bmask = offs_bb < b
-    vmask = offs_v < dv
-    kmask = offs_k < dqk
     rows = t_start + offs_t
     rmask = rows < L
-    kc = tl.load(k_ptr + pid_b*sq_b + rows[:, None]*sq_l + offs_k[None, :]*sq_d,
-                 mask=rmask[:, None] & kmask[None, :], other=0.0)
-    vc = tl.load(v_ptr + pid_b*sv_b + rows[:, None]*sv_l + offs_v[None, :]*sv_d,
-                 mask=rmask[:, None] & vmask[None, :], other=0.0)
-    dk_acc = tl.zeros([BT, BK], dtype=tl.float32)
-    dv_acc = tl.zeros([BT, BV], dtype=tl.float32)
     for cb in range(NCBLK):
         cols = cb * BC + offs_c
         cmask = cols < nc
@@ -1125,26 +1236,42 @@ def _kappa_bwd_state(h_ptr, k_ptr, v_ptr, wr_ptr, ww_ptr, sel_ptr,
                                     ssel_lvl, ssel_b, ssel_c,
                                     br_ptr, bw_ptr, sbr_lvl, sbr_b, sbw_lvl, sbw_b,
                                     D, BT, BB, BC, BD, NDM, HAS_BIAS)
-        ck = tl.reshape(cols[:, None] * dqk + offs_k[None, :], [BC * BK])
-        ckmask = tl.reshape(cmask[:, None] & kmask[None, :], [BC * BK])
-        dSval = tl.load(dsval_ptr + pid_b*ssv_b + ck[:, None]*ssv_k + offs_v[None, :]*ssv_v,
-                        mask=ckmask[:, None] & vmask[None, :], other=0.0)
-        dSden = tl.load(dsden_ptr + pid_b*ssd_b + ck*ssd_k, mask=ckmask, other=0.0)
-        dSden2 = tl.reshape(dSden, [BC, BK])
-        Nval = tl.dot(vc, tl.trans(dSval).to(vc.dtype))   # [BT, BC*BK]
-        Nvr = tl.reshape(Nval, [BT, BC, BK])
-        dw = tl.sum(Nvr * kc[:, None, :], axis=2)
-        dk_acc += tl.sum(Nvr * w_tile[:, :, None], axis=1)
-        wk = tl.reshape(w_tile[:, :, None] * kc[:, None, :], [BT, BC * BK])
-        dv_acc += tl.dot(wk.to(dSval.dtype), dSval)
-        dw += tl.where(cmask[None, :], tl.sum(dSden2[None, :, :] * kc[:, None, :], axis=2), 0.0)
-        dk_acc += tl.dot(w_tile.to(dSden2.dtype), dSden2)
+        # dw[BT,BC] sums over dqk → accumulate across BK-feature-blocks. dk[BT,BK] is per-feature-block
+        # (offs_k), stored per d0. dv[BT,BV] is per value-block (offs_v), atomic-added per (d0,vb). The
+        # value-contracted Nval=v·dSvalᵀ is summed over value-blocks; the [BC*BK,BV] dSval slice stays
+        # bounded by BK·BV<=64·BV. w_tile[BT,BC] / wk[BT,BC*BK] are value-free, reused across vb.
+        dw = tl.zeros([BT, BC], dtype=tl.float32)
+        for d0 in range(ND):
+            offs_k = d0 * BK + tl.arange(0, BK)
+            kmask = offs_k < dqk
+            kc = tl.load(k_ptr + pid_b*sq_b + rows[:, None]*sq_l + offs_k[None, :]*sq_d,
+                         mask=rmask[:, None] & kmask[None, :], other=0.0)
+            ck = tl.reshape(cols[:, None] * dqk + offs_k[None, :], [BC * BK])
+            ckmask = tl.reshape(cmask[:, None] & kmask[None, :], [BC * BK])
+            wk = tl.reshape(w_tile[:, :, None] * kc[:, None, :], [BT, BC * BK])
+            Nval = tl.zeros([BT, BC * BK], dtype=tl.float32)   # v·dSvalᵀ, value-contracted → sum over vb
+            for vb in range(ND_V):
+                offs_v = vb * BV + tl.arange(0, BV)
+                vmask = offs_v < dv
+                vc = tl.load(v_ptr + pid_b*sv_b + rows[:, None]*sv_l + offs_v[None, :]*sv_d,
+                             mask=rmask[:, None] & vmask[None, :], other=0.0)
+                dSval = tl.load(dsval_ptr + pid_b*ssv_b + ck[:, None]*ssv_k + offs_v[None, :]*ssv_v,
+                                mask=ckmask[:, None] & vmask[None, :], other=0.0)
+                Nval += tl.dot(vc, tl.trans(dSval).to(vc.dtype))   # [BT, BC*BK]
+                dv_vb = tl.dot(wk.to(dSval.dtype), dSval)          # [BT,BV] for this value-block
+                tl.atomic_add(dv_ptr + pid_b*sv_b + rows[:, None]*sv_l + offs_v[None, :]*sv_d,
+                              dv_vb, mask=rmask[:, None] & vmask[None, :])
+            Nvr = tl.reshape(Nval, [BT, BC, BK])
+            dw += tl.sum(Nvr * kc[:, None, :], axis=2)
+            dk_acc = tl.sum(Nvr * w_tile[:, :, None], axis=1)
+            dSden = tl.load(dsden_ptr + pid_b*ssd_b + ck*ssd_k, mask=ckmask, other=0.0)
+            dSden2 = tl.reshape(dSden, [BC, BK])
+            dw += tl.where(cmask[None, :], tl.sum(dSden2[None, :, :] * kc[:, None, :], axis=2), 0.0)
+            dk_acc += tl.dot(w_tile.to(dSden2.dtype), dSden2)
+            tl.atomic_add(dk_ptr + pid_b*sq_b + rows[:, None]*sq_l + offs_k[None, :]*sq_d,
+                          dk_acc, mask=rmask[:, None] & kmask[None, :])
         tl.store(gdw_ptr + pid_b*sgd_b + offs_t[:, None]*sgd_t + cols[None, :]*sgd_c,
                  dw, mask=rmask[:, None] & cmask[None, :])
-    tl.atomic_add(dk_ptr + pid_b*sq_b + rows[:, None]*sq_l + offs_k[None, :]*sq_d,
-                  dk_acc, mask=rmask[:, None] & kmask[None, :])
-    tl.atomic_add(dv_ptr + pid_b*sv_b + rows[:, None]*sv_l + offs_v[None, :]*sv_d,
-                  dv_acc, mask=rmask[:, None] & vmask[None, :])
 
 
 @triton.jit
@@ -1168,31 +1295,29 @@ def _kappa_bwd_read(h_ptr, q_ptr, k_ptr, v_ptr, wr_ptr, ww_ptr, sel_ptr, kap_ptr
     dkappa, the read+intra+d half of dw (atomic-added into gdw), and the readout contribution to the
     carried dSval/dSden adjoints. dG -> dq,dk. The [L,nc] gates / d / r_tilde are never materialized."""
     pid_b = tl.program_id(0)
+    ND_V = (dv + BV - 1) // BV       # value-blocks (BV is the value TILE; ND_V==1 ⇒ the un-tiled kernel)
     offs_t = tl.arange(0, BT)
-    offs_v = tl.arange(0, BV)
-    offs_k = tl.arange(0, BK)
     offs_bb = tl.arange(0, BB)
     offs_c = tl.arange(0, BC)
     bmask = offs_bb < b
-    vmask = offs_v < dv
-    kmask = offs_k < dqk
     rows = t_start + offs_t
     rmask = rows < L
-    qc = tl.load(q_ptr + pid_b*sq_b + rows[:, None]*sq_l + offs_k[None, :]*sq_d,
-                 mask=rmask[:, None] & kmask[None, :], other=0.0)
-    kc = tl.load(k_ptr + pid_b*sq_b + rows[:, None]*sq_l + offs_k[None, :]*sq_d,
-                 mask=rmask[:, None] & kmask[None, :], other=0.0)
-    vc = tl.load(v_ptr + pid_b*sv_b + rows[:, None]*sv_l + offs_v[None, :]*sv_d,
-                 mask=rmask[:, None] & vmask[None, :], other=0.0)
     kap = tl.load(kap_ptr + pid_b*sk_b + rows*sk_l, mask=rmask, other=0.0)
-    dnum = tl.load(dnum_ptr + pid_b*sdo_b + rows[:, None]*sdo_l + offs_v[None, :]*sdo_v,
-                   mask=rmask[:, None] & vmask[None, :], other=0.0)
     dden = tl.load(dden_ptr + pid_b*sdd_b + rows*sdd_l, mask=rmask, other=0.0)
-    G = tl.dot(qc, tl.trans(kc))
     causal = ((offs_t[:, None] >= offs_t[None, :]) & rmask[:, None] & rmask[None, :]).to(tl.float32)
-    dq_acc = tl.zeros([BT, BK], dtype=tl.float32)
-    dk_acc = tl.zeros([BT, BK], dtype=tl.float32)
-    dv_acc = tl.zeros([BT, BV], dtype=tl.float32)
+    # content gram G = q·kᵀ accumulated over BK-feature-blocks (keeps the [BT,BK] q/k tiles <=64).
+    G = tl.zeros([BT, BT], dtype=tl.float32)
+    for d0 in range(ND):
+        offs_k = d0 * BK + tl.arange(0, BK)
+        kmask = offs_k < dqk
+        qc = tl.load(q_ptr + pid_b*sq_b + rows[:, None]*sq_l + offs_k[None, :]*sq_d,
+                     mask=rmask[:, None] & kmask[None, :], other=0.0)
+        kc = tl.load(k_ptr + pid_b*sq_b + rows[:, None]*sq_l + offs_k[None, :]*sq_d,
+                     mask=rmask[:, None] & kmask[None, :], other=0.0)
+        G += tl.dot(qc, tl.trans(kc))
+    Gc = G * causal
+    # accumulators over BT/BV (and the [BT,BT] gram) sum ACROSS the BK/value-blocks; dq/dk (over BK) and
+    # dv (over BV) are atomic-added per d0/vb-block at each producing site (their HBM offset uses offs_k/v).
     dkap_acc = tl.zeros([BT], dtype=tl.float32)
     dG = tl.zeros([BT, BT], dtype=tl.float32)
     for cb in range(NCBLK):
@@ -1204,62 +1329,104 @@ def _kappa_bwd_read(h_ptr, q_ptr, k_ptr, v_ptr, wr_ptr, ww_ptr, sel_ptr, kap_ptr
                                         ssel_lvl, ssel_b, ssel_c,
                                         br_ptr, bw_ptr, sbr_lvl, sbr_b, sbw_lvl, sbw_b,
                                         D, BT, BB, BC, BD, NDM, HAS_BIAS)
-        ck = tl.reshape(cols[:, None] * dqk + offs_k[None, :], [BC * BK])
-        ckmask = tl.reshape(cmask[:, None] & kmask[None, :], [BC * BK])
-        sden = tl.load(sden_ptr + pid_b*ssd_b + ck*ssd_k, mask=ckmask, other=0.0)
-        sden2 = tl.reshape(sden, [BC, BK])
-        sval = tl.load(sval_ptr + pid_b*ssv_b + ck[:, None]*ssv_k + offs_v[None, :]*ssv_v,
-                       mask=ckmask[:, None] & vmask[None, :], other=0.0)            # [BC*BK,BV]
-        # recompute forward intermediates.
-        d_inter = tl.dot(qc, tl.trans(sden2).to(qc.dtype))
-        d_intra = tl.dot((G * causal).to(w_tile.dtype), w_tile)
-        d_tile = tl.where(cmask[None, :], d_intra + d_inter, 0.0)
+        # d_tile/rt_tile are value-FREE (from G,Sden,r) → compute once, reused for every value-block.
+        d_tile = _kappa_d_tile(q_ptr, sden_ptr, Gc, w_tile, cols, cmask,
+                               pid_b, rows, rmask, dqk, nc, sq_b, sq_l, sq_d, ssd_b, ssd_k,
+                               BT, BK, BC, ND)
         rt_tile = _kappa_rescale(r_tile, d_tile, kap, cmask, GLOBAL, PER_STATE, EPS)
         drt = dden[:, None] * d_tile          # d(r_tilde) from den
         dd = dden[:, None] * rt_tile          # d(d) from den
-        # num intra: A=G*Rg*causal ; o_num += A v.  dA = (dnum@v^T)⊙causal.
+        # num intra: A=G*Rg*causal ; o_num += A v. dA=(dnum·vᵀ)⊙causal (value-contracted → sum over vb);
+        # dv=Aᵀ·dnum (per value-block → atomic). A/Rg/dG/dw are value-free; dnum,vc loaded per vb.
         Rg = tl.dot(rt_tile, tl.trans(w_tile))
         A = G * Rg * causal
-        dv_acc += tl.dot(tl.trans(A).to(dnum.dtype), dnum)   # dv[j,v]=sum_i A[i,j] dnum[i,v]
-        dA = tl.dot(dnum, tl.trans(vc)) * causal
+        dA = tl.zeros([BT, BT], dtype=tl.float32)
+        for vb in range(ND_V):
+            offs_v = vb * BV + tl.arange(0, BV)
+            vmask = offs_v < dv
+            vc = tl.load(v_ptr + pid_b*sv_b + rows[:, None]*sv_l + offs_v[None, :]*sv_d,
+                         mask=rmask[:, None] & vmask[None, :], other=0.0)
+            dnum = tl.load(dnum_ptr + pid_b*sdo_b + rows[:, None]*sdo_l + offs_v[None, :]*sdo_v,
+                           mask=rmask[:, None] & vmask[None, :], other=0.0)
+            dv_vb = tl.dot(tl.trans(A).to(dnum.dtype), dnum)   # dv[j,v]=sum_i A[i,j] dnum[i,v]
+            tl.atomic_add(dv_ptr + pid_b*sv_b + rows[:, None]*sv_l + offs_v[None, :]*sv_d,
+                          dv_vb, mask=rmask[:, None] & vmask[None, :])
+            dA += tl.dot(dnum, tl.trans(vc))
+        dA = dA * causal
         dRg = dA * G                          # dRg_ij = dA_ij G_ij (causal already in dA)
         dG += dA * Rg                          # dG_ij  += dA_ij Rg_ij (causal already in dA)
         drt += tl.dot(dRg.to(w_tile.dtype), w_tile)
         dw = tl.dot(tl.trans(dRg).to(rt_tile.dtype), rt_tile)
-        # num inter readout: o_num += sum_c r_tilde^c (q.Sval_j^c).
-        M = tl.dot(dnum, tl.trans(sval).to(dnum.dtype))   # [BT, BC*BK]
-        Mr = tl.reshape(M, [BT, BC, BK])
-        drt += tl.sum(Mr * qc[:, None, :], axis=2)
-        dq_acc += tl.sum(Mr * rt_tile[:, :, None], axis=1)
-        rq = tl.reshape(rt_tile[:, :, None] * qc[:, None, :], [BT, BC * BK])
-        dSval = tl.load(dsval_ptr + pid_b*ssv_b + ck[:, None]*ssv_k + offs_v[None, :]*ssv_v,
-                        mask=ckmask[:, None] & vmask[None, :], other=0.0)
-        tl.store(dsval_ptr + pid_b*ssv_b + ck[:, None]*ssv_k + offs_v[None, :]*ssv_v,
-                 dSval + tl.dot(tl.trans(rq).to(dnum.dtype), dnum), mask=ckmask[:, None] & vmask[None, :])
-        # rescale bwd.
+        # num inter readout: o_num += sum_c r_tilde^c (q.Sval_j^c). M=dnum·svalᵀ is value-contracted (sum
+        # over vb); dq + the dSval-store are per-(BK,value)-block; drt's inter contribution sums over d0.
+        for d0 in range(ND):
+            offs_k = d0 * BK + tl.arange(0, BK)
+            kmask = offs_k < dqk
+            qc = tl.load(q_ptr + pid_b*sq_b + rows[:, None]*sq_l + offs_k[None, :]*sq_d,
+                         mask=rmask[:, None] & kmask[None, :], other=0.0)
+            ck = tl.reshape(cols[:, None] * dqk + offs_k[None, :], [BC * BK])
+            ckmask = tl.reshape(cmask[:, None] & kmask[None, :], [BC * BK])
+            rq = tl.reshape(rt_tile[:, :, None] * qc[:, None, :], [BT, BC * BK])
+            M = tl.zeros([BT, BC * BK], dtype=tl.float32)
+            for vb in range(ND_V):
+                offs_v = vb * BV + tl.arange(0, BV)
+                vmask = offs_v < dv
+                dnum = tl.load(dnum_ptr + pid_b*sdo_b + rows[:, None]*sdo_l + offs_v[None, :]*sdo_v,
+                               mask=rmask[:, None] & vmask[None, :], other=0.0)
+                sval = tl.load(sval_ptr + pid_b*ssv_b + ck[:, None]*ssv_k + offs_v[None, :]*ssv_v,
+                               mask=ckmask[:, None] & vmask[None, :], other=0.0)         # [BC*BK,BV]
+                M += tl.dot(dnum, tl.trans(sval).to(dnum.dtype))   # [BT, BC*BK]
+                dSval = tl.load(dsval_ptr + pid_b*ssv_b + ck[:, None]*ssv_k + offs_v[None, :]*ssv_v,
+                                mask=ckmask[:, None] & vmask[None, :], other=0.0)
+                tl.store(dsval_ptr + pid_b*ssv_b + ck[:, None]*ssv_k + offs_v[None, :]*ssv_v,
+                         dSval + tl.dot(tl.trans(rq).to(dnum.dtype), dnum),
+                         mask=ckmask[:, None] & vmask[None, :])
+            Mr = tl.reshape(M, [BT, BC, BK])
+            drt += tl.sum(Mr * qc[:, None, :], axis=2)
+            dq_read = tl.sum(Mr * rt_tile[:, :, None], axis=1)   # [BT,BK]
+            tl.atomic_add(dq_ptr + pid_b*sq_b + rows[:, None]*sq_l + offs_k[None, :]*sq_d,
+                          dq_read, mask=rmask[:, None] & kmask[None, :])
+        # rescale bwd (drt now complete).
         dr_resc, dd_resc, dkap_c = _kappa_rescale_bwd(drt, r_tile, d_tile, kap, cmask,
                                                       GLOBAL, PER_STATE, EPS)
         dd += dd_resc
         dkap_acc += dkap_c
-        # d bwd: d = (G*causal) w + q.Sden_j.
+        # d bwd: d = (G*causal) w + q.Sden_j.  dG/dw are dqk-free; dq + dSden contract dqk → loop d0.
         dG += tl.dot(dd.to(w_tile.dtype), tl.trans(w_tile)) * causal
-        dw += tl.dot(tl.trans(G * causal).to(dd.dtype), dd)
-        dq_acc += tl.dot(dd.to(sden2.dtype), sden2)
-        dSden = tl.load(dsden_ptr + pid_b*ssd_b + ck*ssd_k, mask=ckmask, other=0.0)
-        dSden_read = tl.reshape(tl.dot(tl.trans(dd).to(qc.dtype), qc), [BC * BK])
-        tl.store(dsden_ptr + pid_b*ssd_b + ck*ssd_k, dSden + dSden_read, mask=ckmask)
+        dw += tl.dot(tl.trans(Gc).to(dd.dtype), dd)
+        for d0 in range(ND):
+            offs_k = d0 * BK + tl.arange(0, BK)
+            kmask = offs_k < dqk
+            qc = tl.load(q_ptr + pid_b*sq_b + rows[:, None]*sq_l + offs_k[None, :]*sq_d,
+                         mask=rmask[:, None] & kmask[None, :], other=0.0)
+            ck = tl.reshape(cols[:, None] * dqk + offs_k[None, :], [BC * BK])
+            ckmask = tl.reshape(cmask[:, None] & kmask[None, :], [BC * BK])
+            sden = tl.load(sden_ptr + pid_b*ssd_b + ck*ssd_k, mask=ckmask, other=0.0)
+            sden2 = tl.reshape(sden, [BC, BK])
+            dq_d = tl.dot(dd.to(sden2.dtype), sden2)             # [BT,BK]
+            tl.atomic_add(dq_ptr + pid_b*sq_b + rows[:, None]*sq_l + offs_k[None, :]*sq_d,
+                          dq_d, mask=rmask[:, None] & kmask[None, :])
+            dSden = tl.load(dsden_ptr + pid_b*ssd_b + ck*ssd_k, mask=ckmask, other=0.0)
+            dSden_read = tl.reshape(tl.dot(tl.trans(dd).to(qc.dtype), qc), [BC * BK])
+            tl.store(dsden_ptr + pid_b*ssd_b + ck*ssd_k, dSden + dSden_read, mask=ckmask)
         tl.store(gdr_ptr + pid_b*sgd_b + offs_t[:, None]*sgd_t + cols[None, :]*sgd_c,
                  dr_resc, mask=rmask[:, None] & cmask[None, :])
         tl.atomic_add(gdw_ptr + pid_b*sgd_b + offs_t[:, None]*sgd_t + cols[None, :]*sgd_c,
                       dw, mask=rmask[:, None] & cmask[None, :])
-    dq_acc += tl.dot(dG.to(kc.dtype), kc)
-    dk_acc += tl.dot(tl.trans(dG).to(qc.dtype), qc)
-    tl.atomic_add(dq_ptr + pid_b*sq_b + rows[:, None]*sq_l + offs_k[None, :]*sq_d,
-                  dq_acc, mask=rmask[:, None] & kmask[None, :])
-    tl.atomic_add(dk_ptr + pid_b*sq_b + rows[:, None]*sq_l + offs_k[None, :]*sq_d,
-                  dk_acc, mask=rmask[:, None] & kmask[None, :])
-    tl.atomic_add(dv_ptr + pid_b*sv_b + rows[:, None]*sv_l + offs_v[None, :]*sv_d,
-                  dv_acc, mask=rmask[:, None] & vmask[None, :])
+    # dG -> dq,dk: contract over BT (dG is [BT,BT]) producing [BT,BK] per feature-block → loop d0.
+    for d0 in range(ND):
+        offs_k = d0 * BK + tl.arange(0, BK)
+        kmask = offs_k < dqk
+        qc = tl.load(q_ptr + pid_b*sq_b + rows[:, None]*sq_l + offs_k[None, :]*sq_d,
+                     mask=rmask[:, None] & kmask[None, :], other=0.0)
+        kc = tl.load(k_ptr + pid_b*sq_b + rows[:, None]*sq_l + offs_k[None, :]*sq_d,
+                     mask=rmask[:, None] & kmask[None, :], other=0.0)
+        dq_g = tl.dot(dG.to(kc.dtype), kc)
+        dk_g = tl.dot(tl.trans(dG).to(qc.dtype), qc)
+        tl.atomic_add(dq_ptr + pid_b*sq_b + rows[:, None]*sq_l + offs_k[None, :]*sq_d,
+                      dq_g, mask=rmask[:, None] & kmask[None, :])
+        tl.atomic_add(dk_ptr + pid_b*sq_b + rows[:, None]*sq_l + offs_k[None, :]*sq_d,
+                      dk_g, mask=rmask[:, None] & kmask[None, :])
     tl.atomic_add(dkap_ptr + pid_b*sk_b + rows*sk_l, dkap_acc, mask=rmask)
 
 
@@ -1273,11 +1440,11 @@ def _kappa_routed_bwd(q, k, v, h, Wr, Ww, kap, snap_val, snap_den, dnum, dden,
     dqk = q.shape[-1]
     dv = v.shape[-1]
     nc = b ** D
-    BV = max(16, triton.next_power_of_2(dv))
-    BK = max(16, triton.next_power_of_2(dqk))
+    BC = max(16, min(nc, 16))
+    BK = _kappa_bk_cap(dqk, dv, chunk, BC)   # feature-tile (loop ND) — bounds the [BT,BC*BK] tiles
+    BV = _kappa_bv_tile(dqk, dv, BC, BK)     # value-tile (loop ND_V) so the [BC*BK,BV] state slices fit
     BD = max(16, triton.next_power_of_2(d_model))
     BB = max(16, triton.next_power_of_2(b))
-    BC = max(16, min(nc, 16))
     NCBLK = triton.cdiv(nc, BC)
     ND = triton.cdiv(dqk, BK)
     NDM = triton.cdiv(d_model, BD)
@@ -1312,8 +1479,8 @@ def _kappa_routed_bwd(q, k, v, h, Wr, Ww, kap, snap_val, snap_den, dnum, dden,
     sSD = (dSden.stride(0), dSden.stride(2))                    # (B, flat-k)
     sGD = (gdr.stride(0), gdr.stride(1), gdr.stride(2))
     sBias = _bias_strides(br, bw, has_bias)
-    state_common = dict(D=D, b=b, BB=BB, BT=chunk, BK=BK, BV=BV, BD=BD, BC=BC, NCBLK=NCBLK, NDM=NDM,
-                        HAS_BIAS=has_bias, num_warps=4, num_stages=1)
+    state_common = dict(D=D, b=b, BB=BB, BT=chunk, BK=BK, BV=BV, BD=BD, BC=BC, NCBLK=NCBLK, ND=ND,
+                        NDM=NDM, HAS_BIAS=has_bias, num_warps=4, num_stages=1)
     read_common = dict(GLOBAL=global_norm, PER_STATE=per_state, EPS=eps, D=D, b=b, BB=BB, BT=chunk,
                        BK=BK, BV=BV, BD=BD, BC=BC, NCBLK=NCBLK, ND=ND, NDM=NDM,
                        HAS_BIAS=has_bias, num_warps=4, num_stages=1)
