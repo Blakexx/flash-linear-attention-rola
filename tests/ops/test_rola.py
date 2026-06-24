@@ -1162,8 +1162,9 @@ def test_gla_compile_grad_noise(norm):
 # (rel at the GLA fp32 decay floor), flat/square/tree, and never allocates a [*,L,nc] routed-gate buffer
 # (ld is an INPUT, not an allocation). USE_G=False (ld=None) is byte-identical to the RLA routed fwd.
 # ============================================================================
+@pytest.mark.parametrize('chunk', [64, 16])  # 64 = single-chunk (NCH=1); 16 = multi-chunk (NCH=4) — exercises the inter-chunk decay (decvec/w_end/Lam), which NCH=1 leaves dead
 @pytest.mark.parametrize('D,b', [(1, 16), (2, 4), (4, 2)])
-def test_gla_routed_fwd_faithful(D, b):
+def test_gla_routed_fwd_faithful(D, b, chunk):
     """Routed GLA numerator forward == naive_rola_gla oracle (on the tree-materialized gates), the
     [L,nc]-free fused readout faithful to the explicit-gate math. flat/square/tree."""
     if device != 'cuda':
@@ -1182,7 +1183,7 @@ def test_gla_routed_fwd_faithful(D, b):
     Ww = torch.randn(D, dm, b, device=device, generator=g_) * 0.4
     ld = (-torch.rand(BH, L, nc, device=device, generator=g_) * 0.5).clamp(min=-2.5)
     sel = C._build_sel(D, b, nc, device)
-    o_routed = C._routed_fwd_tiled(q, k, v, h, Wr, Ww, D, b, sel, chunk=L, BG=16, ld=ld)
+    o_routed = C._routed_fwd_tiled(q, k, v, h, Wr, Ww, D, b, sel, chunk=chunk, BG=16, ld=ld)
     r, w = C._tree_gates_torch(h, Wr, Ww, D, b)
 
     def unf(t):

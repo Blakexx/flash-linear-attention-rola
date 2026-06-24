@@ -3730,10 +3730,10 @@ _chunk_rola_compiled = None
 
 def chunk_rola(q, k, v, r, w, g=None, norm='kappa', kappa=None, scale=None, eps=1e-5,
                initial_state=None, output_final_state=False):
-    """Routed RoLA readout (see `_chunk_rola_impl`). torch.compile is the DEFAULT for the RLA path
-    (lazily compiled on first call); set ROLA_NO_COMPILE=1 to force eager. Compile is skipped for the
-    GLA path (g≠None, un-opaque autotuner — see header), on CPU (the eager fallback), and whenever
-    Dynamo is already tracing (avoid nested-compile recursion)."""
+    """Routed RoLA readout (see `_chunk_rola_impl`). torch.compile is the DEFAULT for BOTH the RLA and
+    GLA paths (lazily compiled on first call; the GLA readout/den are custom_op-wrapped — #30 V2 — so
+    Dynamo stays fullgraph). Set ROLA_NO_COMPILE=1 to force eager. Compile is skipped only on CPU (the
+    eager fallback) and whenever Dynamo is already tracing (avoid nested-compile recursion)."""
     global _chunk_rola_compiled
     kw = dict(g=g, norm=norm, kappa=kappa, scale=scale, eps=eps,
               initial_state=initial_state, output_final_state=output_final_state)
