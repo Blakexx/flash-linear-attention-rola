@@ -72,20 +72,6 @@ _BWD_CFGS = [triton.Config({'BD': bk}, num_warps=w, num_stages=s)   # BD-only (d
 # value-looped grad kernels additionally tile the value axis: BD × BV.
 _BWD_CFGS_BV = [triton.Config({'BD': bk, 'BV': bv}, num_warps=w, num_stages=s)
                 for bk in _BWD_BK for bv in _BWD_BV for w in _WARPS for s in _STAGES]
-# GLA-recompute grad kernels (_par_grad_gla_{qr,kwv}) carry an IN-KERNEL decay-replay sub-scan
-# (_recompute_{S,dS}_gla) on top of the value-looped body — a much larger kernel than the RLA grads.
-# Each surviving config compiles AND benchmarks the full replay, so the cold autotune of the un-pruned
-# BD×BV×warp×stage grid (the same _BWD_CFGS_BV the RLA grads use) ran ~40 min and stalled the GLA gate.
-# These two kernels do NOT benefit from a deep software pipeline: the replay's wide fp32 Kronecker-state
-# tensors (BG·BV·BD) already pin SMEM/registers to a single resident block (see the latency profile —
-# occupancy is state-tensor-SMEM-bound, not stage-bound), so num_stages>1 only multiplies compile/bench
-# cost with no perf upside, and 8 warps over-subscribes the same starved block. So this set caps
-# num_stages=1 and trims warps to (2,4) — keeping the BD/BV fit knobs (the ones that actually decide
-# whether a config runs at all) at full range. ~4-5x fewer configs ⇒ single-digit-minute cold compile,
-# correctness unchanged (every surviving config computes identical math; stages/warps are perf-only).
-_GLA_BWD_WARPS = (2, 4)
-_BWD_CFGS_GLA = [triton.Config({'BD': bk, 'BV': bv}, num_warps=w, num_stages=1)
-                 for bk in _BWD_BK for bv in _BWD_BV for w in _GLA_BWD_WARPS]
 # scans have no BD knob (Sflat is a register carry, own fixed feature block) but DO need the BV knob.
 _SCAN_CFGS = [triton.Config({'BV': bv}, num_warps=w, num_stages=s)
               for bv in _BWD_BV for w in _WARPS for s in _STAGES]
@@ -1042,7 +1028,7 @@ def _par_grad_rla_kwv(q_ptr, k_ptr, v_ptr, wg_ptr, rg_ptr, g_ptr, dSa_ptr, dk_pt
                  dw_intra + dw_wr, mask=rmask[:, None] & cmask[None, :])
 
 
-@triton.autotune(configs=_BWD_CFGS_GLA, key=_AT_KEY,   # slim recompute grid (stages=1, warps 2/4) — see _BWD_CFGS_GLA
+@triton.autotune(configs=_BWD_CFGS_BV, key=_AT_KEY,
                  prune_configs_by={'early_config_prune': _prune_bwd}, **autotune_cache_kwargs)
 @triton.jit
 def _par_grad_gla_qr(q_ptr, k_ptr, v_ptr, wg_ptr, rg_ptr, ld_ptr, g_ptr, Sb_ptr,
@@ -1162,7 +1148,7 @@ def _par_grad_gla_qr(q_ptr, k_ptr, v_ptr, wg_ptr, rg_ptr, ld_ptr, g_ptr, Sb_ptr,
     tl.store(dart_ptr + b*sda_b + rows[:, None]*sda_l + offs_c[None, :]*sda_c, drt * rt, mask=rmask[:, None] & cmask[None, :])
 
 
-@triton.autotune(configs=_BWD_CFGS_GLA, key=_AT_KEY,   # slim recompute grid (stages=1, warps 2/4) — see _BWD_CFGS_GLA
+@triton.autotune(configs=_BWD_CFGS_BV, key=_AT_KEY,
                  prune_configs_by={'early_config_prune': _prune_bwd}, **autotune_cache_kwargs)
 @triton.jit
 def _par_grad_gla_kwv(q_ptr, k_ptr, v_ptr, wg_ptr, rg_ptr, ld_ptr, g_ptr, Sb_ptr, dSa_ptr, dart_ptr,
