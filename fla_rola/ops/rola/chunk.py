@@ -55,6 +55,12 @@ _WARPS = (2, 4, 8)
 _STAGES = (1, 2, 3)
 _AT_CFGS = [triton.Config({}, num_warps=w, num_stages=s) for w in _WARPS for s in _STAGES]
 _AT_KEY = ['dqk', 'dv', 'nc']
+# The scans (_scan_S/_scan_dS) are SHARED by RLA (USE_G=False) and GLA (USE_G=True) at the SAME
+# (dqk,dv,nc); without USE_G in the key the autotune config-cache collides → RLA and GLA reuse each
+# other's tuned warps/stages/BV. USE_G is a constexpr (so it specializes the compile regardless), but
+# it must also gate config SELECTION so each variant tunes its own (the GLA decay-replay has a heavier
+# SMEM profile than RLA, so the best config differs). Perf-only; no correctness change. (#22)
+_SCAN_KEY = ['dqk', 'dv', 'nc', 'USE_G']
 _CHUNK_FWD = 64 if _BIG_SMEM else 16     # RLA forward
 _CHUNK = 32 if _BIG_SMEM else 16         # GLA forward + all backwards (GLA fp32 decay floor caps BT<=32)
 _KAPPA_BWD_CHUNK = 16                     # fused kappa backward (single mega-kernel, heavy fp32 SMEM)
@@ -80,14 +86,38 @@ _KAPPA_BWD_CHUNK = 16                     # fused kappa backward (single mega-ke
 # cdiv(d_v,BV)=1 at d_v<=BV UNROLLS to byte-identical code — zero perf impact for the configs we run.
 _BWD_BV = (16, 32, 64)                     # value-tile candidates; pruned to <= next_pow2(d_v)
 _BWD_BK = (16, 32, 64, 128)               # feature-tile candidates; autotuner keeps the largest fitting
+
+
+# --- CURATED warp/stage candidates, paired to the tile FOOTPRINT (FLA discipline, #22) ----------------
+# The full BK×BV×WARPS(3)×STAGES(3) cross-product is 108 configs (54 survive the dqk/dv prune at the
+# bench cells) — the autotuner cold-compiles EVERY survivor, so the config count is the dominant cold-
+# compile multiplier (each large-dqk fp32 grad config is tens of seconds). Trimming warps/stages NAIVELY
+# and GLOBALLY is INFEASIBLE — it breaks the SMEM fit: at frontier dqk the big tiles NEED 8 warps (to
+# spread the wide fp32 Kronecker state across the register file) AND num_stages>=2 (the software pipeline
+# LOWERS peak SMEM via buffer reuse; stages=1 RAISES it). So instead of dropping warp/stage VALUES, we
+# pair them to the tile size: a SMALL tile (BD*BV<=512) doesn't need 8 warps or a 3-deep pipeline (pure
+# waste there), a LARGE tile keeps the fit-critical 8-warp/stages>=2 set. Every config that is fit-
+# critical at large dqk survives; only the redundant small-tile combos are cut. ~2x fewer configs,
+# zero fit loss. (Mirrors how FLA ships curated lists + heuristics, not a combinatorial sweep.)
+def _bwd_ws(bd, bv):
+    """(num_warps, num_stages) candidates for a BD×BV grad tile, by footprint (see above)."""
+    fp = bd * bv
+    if fp <= 16 * 32:            # small: 2/4 warps, shallow pipeline
+        return [(2, 1), (2, 2), (4, 1), (4, 2)]
+    if fp <= 64 * 32:            # medium: 4/8 warps
+        return [(4, 1), (4, 2), (8, 1), (8, 2)]
+    return [(4, 2), (4, 3), (8, 2), (8, 3)]   # large: keep the fit-critical 8-warp/deep-pipeline set
+
+
 _BWD_CFGS = [triton.Config({'BD': bk}, num_warps=w, num_stages=s)   # BD-only (den kernels, BV-free)
-             for bk in _BWD_BK for w in _WARPS for s in _STAGES]
+             for bk in _BWD_BK for (w, s) in _bwd_ws(bk, 16)]
 # value-looped grad kernels additionally tile the value axis: BD × BV.
 _BWD_CFGS_BV = [triton.Config({'BD': bk, 'BV': bv}, num_warps=w, num_stages=s)
-                for bk in _BWD_BK for bv in _BWD_BV for w in _WARPS for s in _STAGES]
+                for bk in _BWD_BK for bv in _BWD_BV for (w, s) in _bwd_ws(bk, bv)]
 # scans have no BD knob (Sflat is a register carry, own fixed feature block) but DO need the BV knob.
+# The scan footprint is BD_scan(<=64)×BV; treat as the medium/large class by BV alone.
 _SCAN_CFGS = [triton.Config({'BV': bv}, num_warps=w, num_stages=s)
-              for bv in _BWD_BV for w in _WARPS for s in _STAGES]
+              for bv in _BWD_BV for (w, s) in _bwd_ws(64, bv)]
 
 
 def _bv_cap(dv):
@@ -476,7 +506,7 @@ def _build_rw_tile(h_ptr, wr_ptr, ww_ptr, sel_ptr, offs_c, cmask,
     return r_tile, w_tile
 
 
-@triton.autotune(configs=_AT_CFGS, key=_AT_KEY, **autotune_cache_kwargs)
+@triton.autotune(configs=_AT_CFGS, key=_SCAN_KEY, **autotune_cache_kwargs)  # _SCAN_KEY: +USE_G (RLA/GLA split)
 @triton.jit
 def _rola_routed_fwd_intra(q_ptr, k_ptr, v_ptr, h_ptr, wr_ptr, ww_ptr, sel_ptr, ld_ptr, outa_ptr,
                            br_ptr, bw_ptr,
@@ -540,7 +570,7 @@ def _rola_routed_fwd_intra(q_ptr, k_ptr, v_ptr, h_ptr, wr_ptr, ww_ptr, sel_ptr, 
              o, mask=rmask[:, None] & (offs_v[None, :] < dv))
 
 
-@triton.autotune(configs=_SCAN_CFGS, key=_AT_KEY, reset_to_zero=['outa_ptr'],
+@triton.autotune(configs=_SCAN_CFGS, key=_SCAN_KEY, reset_to_zero=['outa_ptr'],  # _SCAN_KEY: +USE_G
                  prune_configs_by={'early_config_prune': _prune_bv}, **autotune_cache_kwargs)
 @triton.jit
 def _rola_routed_fwd_inter(q_ptr, k_ptr, v_ptr, h_ptr, wr_ptr, ww_ptr, sel_ptr, ld_ptr, outa_ptr,
@@ -1922,7 +1952,7 @@ def rola_gla_readout_op(q, k, v, r, w, ld, chunk=None, BG=16, compute_dtype=None
 # ============================================================================
 
 
-@triton.autotune(configs=_SCAN_CFGS, key=_AT_KEY,
+@triton.autotune(configs=_SCAN_CFGS, key=_SCAN_KEY,
                  prune_configs_by={'early_config_prune': _prune_bv}, **autotune_cache_kwargs)
 @triton.jit
 def _scan_S(k_ptr, v_ptr, wg_ptr, ld_ptr, Sb_ptr, L, dqk, dv: tl.constexpr, nc,
@@ -1933,6 +1963,7 @@ def _scan_S(k_ptr, v_ptr, wg_ptr, ld_ptr, Sb_ptr, L, dqk, dv: tl.constexpr, nc,
     # Value-OUTER over cdiv(dv,BV) blocks: each block carries its own [BD, BG*BV] state slice, bounding
     # smem+regs by BV (the autotuned value-tile). ND_V==1 (BV==BVF, the fits-everywhere case the
     # autotuner picks on A100 / at d_v<=32) runs ONE full scan == the un-tiled kernel byte-for-byte.
+    # dv constexpr → the value loop unrolls (the de-nest was dropped — runtime cost; see _par_grad_rla_qr).
     # Snapshot is full-width BVF (state-major g*BVF+v); a value-block writes the strided e-slice.
     # SNAPSHOT-GRANULARITY: store the boundary state only at coarse anchors (chunk t with t%KSNAP==0,
     # into slot t//KSNAP) → 1/KSNAP the snapshot HBM. The grad kernel reads the nearest coarse anchor at
@@ -1978,7 +2009,7 @@ def _scan_S(k_ptr, v_ptr, wg_ptr, ld_ptr, Sb_ptr, L, dqk, dv: tl.constexpr, nc,
                 Sflat += tl.dot(tl.trans(kc), WV.to(kc.dtype))
 
 
-@triton.autotune(configs=_SCAN_CFGS, key=_AT_KEY,
+@triton.autotune(configs=_SCAN_CFGS, key=_SCAN_KEY,
                  prune_configs_by={'early_config_prune': _prune_bv}, **autotune_cache_kwargs)
 @triton.jit
 def _scan_dS(q_ptr, rg_ptr, ld_ptr, g_ptr, dSa_ptr, L, dqk, dv: tl.constexpr, nc,
@@ -1987,6 +2018,7 @@ def _scan_dS(q_ptr, rg_ptr, ld_ptr, g_ptr, dSa_ptr, L, dqk, dv: tl.constexpr, nc
              USE_G: tl.constexpr, BT: tl.constexpr, BD: tl.constexpr, BV: tl.constexpr,
              BVF: tl.constexpr, BG: tl.constexpr, NCH: tl.constexpr, KSNAP: tl.constexpr):
     # value-OUTER (mirror of _scan_S); ND_V==1 == the un-tiled reverse scan byte-for-byte.
+    # dv constexpr → value loop unrolls (de-nest dropped — runtime cost; see _par_grad_rla_qr).
     # SNAPSHOT-GRANULARITY (reverse): dSa[t] = Σ_{t'>t} contrib(t'). Anchor at the TOP of each coarse
     # block (chunk t with t%KSNAP==KSNAP-1, or the final chunk) into slot t//KSNAP — that holds Σ_{t'>top} = the
     # state entering the block from above. The grad kernel reads its block's anchor and reverse-
@@ -2220,6 +2252,10 @@ def _par_grad_rla_qr(q_ptr, k_ptr, v_ptr, wg_ptr, rg_ptr, g_ptr, Sb_ptr, dq_ptr,
     # body byte-for-byte. ND_V>=2 takes the value-OUTER path: P is value-contracted (built first), dq's
     # inter and dr's inter are value-summed (looped), each value-block's state slice read strided from
     # the BVF-wide snapshot. See [[branch-on-structure-not-thresholds]].
+    # dqk/dv stay constexpr so the feature/value loops UNROLL. A runtime-ND de-nest (#22) was measured to
+    # shrink codegen but cost +52% step-time (this kernel is compute-bound — it needs the unroll's ILP; even
+    # the ND==1 fast path slowed). The codegen cut is delivered by the config curation (`_bwd_ws`, runtime-
+    # neutral) instead, so the loops are left unrolled.
     ND = tl.cdiv(dqk, BD)
     ND_V = (dv + BV - 1) // BV
     b = tl.program_id(0)
@@ -2346,6 +2382,7 @@ def _par_grad_rla_kwv(q_ptr, k_ptr, v_ptr, wg_ptr, rg_ptr, g_ptr, dSa_ptr, dk_pt
     # D-tiled (BD) over features, V-tiled (BV) over the value axis. ND_V==1 runs the un-tiled fused body
     # byte-for-byte; ND_V>=2 is value-OUTER: P value-contracted, dk/dw value-summed (looped), dv
     # value-indexed (per block), KS rebuilt per value-block. See [[branch-on-structure-not-thresholds]].
+    # dqk/dv constexpr (loops unrolled) — see _par_grad_rla_qr on why de-nest was dropped (runtime cost).
     ND = tl.cdiv(dqk, BD)
     ND_V = (dv + BV - 1) // BV
     b = tl.program_id(0)
@@ -2488,6 +2525,7 @@ def _par_grad_gla_qr(q_ptr, k_ptr, v_ptr, wg_ptr, rg_ptr, ld_ptr, g_ptr, Sb_ptr,
                      BG: tl.constexpr, NCH: tl.constexpr, KSNAP: tl.constexpr):
     # GLA mirror of _par_grad_rla_qr: decayed gates rt=rg·eᵃ, wt=wg·e⁻ᵃ, D=rt·wtᵀ. ND_V==1 == un-tiled
     # fused body; ND_V>=2 value-OUTER (P value-contracted; dq/drt inter value-summed, looped).
+    # dqk/dv constexpr (loops unrolled) — see _par_grad_rla_qr on why de-nest was dropped (runtime cost).
     ND = tl.cdiv(dqk, BD)
     ND_V = (dv + BV - 1) // BV
     b = tl.program_id(0)
@@ -2610,6 +2648,7 @@ def _par_grad_gla_kwv(q_ptr, k_ptr, v_ptr, wg_ptr, rg_ptr, ld_ptr, g_ptr, Sb_ptr
     # GLA mirror of _par_grad_rla_kwv + the dLam reverse-cumsum. Both ND_V branches produce dw_end[BT,BG]
     # (value-summed), ZdZ[BG] = Σ_{d,v}(Sb∘dSa), and dwt[BT,BG]; the shared tail folds dLam into da and
     # reverse-cumsums to dld. ND_V==1 == the un-tiled fused body; ND_V>=2 is value-OUTER.
+    # dqk/dv constexpr (loops unrolled) — see _par_grad_rla_qr on why de-nest was dropped (runtime cost).
     ND = tl.cdiv(dqk, BD)
     ND_V = (dv + BV - 1) // BV
     b = tl.program_id(0)
@@ -2924,9 +2963,12 @@ def _bwd_split_gla(q, k, v, wg, rg, ld, g, chunk=None, BG=16, nb_tile=None):
 # is the same scan+parallel pattern as the main backward at [BD,BG] state scale (tiny buffers).
 # ============================================================================
 _DEN_KEY = ['dqk', 'nc']
+# The den FORWARD kernels (_den_fwd_intra/_den_fwd_inter) are RLA/GLA-shared (single fn, USE_G param), so
+# they key on USE_G too; the den BACKWARD kernels are separate RLA/GLA fns (no USE_G arg) → plain _DEN_KEY.
+_DEN_FWD_KEY = ['dqk', 'nc', 'USE_G']
 
 
-@triton.autotune(configs=_BWD_CFGS, key=_DEN_KEY,
+@triton.autotune(configs=_BWD_CFGS, key=_DEN_FWD_KEY,
                  prune_configs_by={'early_config_prune': _prune_bwd_bd}, **autotune_cache_kwargs)
 @triton.jit
 def _den_fwd_intra(q_ptr, k_ptr, wg_ptr, ld_ptr, d_ptr, L, dqk: tl.constexpr, nc,
@@ -2970,7 +3012,7 @@ def _den_fwd_intra(q_ptr, k_ptr, wg_ptr, ld_ptr, d_ptr, L, dqk: tl.constexpr, nc
     tl.store(d_ptr + b*sd_b + rows[:, None]*sd_l + offs_c[None, :]*sd_c, dch, mask=rmask[:, None] & cmask[None, :])
 
 
-@triton.autotune(configs=_BWD_CFGS, key=_DEN_KEY, reset_to_zero=['d_ptr'],
+@triton.autotune(configs=_BWD_CFGS, key=_DEN_FWD_KEY, reset_to_zero=['d_ptr'],
                  prune_configs_by={'early_config_prune': _prune_bwd_bd}, **autotune_cache_kwargs)
 @triton.jit
 def _den_fwd_inter(q_ptr, k_ptr, wg_ptr, ld_ptr, d_ptr, Zb_ptr, L, dqk, nc,
