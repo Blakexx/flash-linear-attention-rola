@@ -1090,3 +1090,67 @@ def test_routed_bias_none_backcompat(norm, D, b):
         o_explicit = C.chunk_rola_routed(q, k, v, h, Wr, Ww, D, b, b_r=None, b_w=None, **kw)
         diff = (o_implicit.float() - o_explicit.float()).abs().max().item()
         assert diff == 0.0, f'{norm} {dt} bias=None not bit-identical: {diff}'
+
+
+# ============================================================================
+# V2 (#30): GLA torch.compile parity. The GLA readout + per-state den are now `rola::readout_gla` /
+# `rola::den_gla` custom_ops (the in-op `cdt` fp32-cast twins of the RLA ops), so chunk_rola with
+# g!=None compiles like RLA: 0 graph breaks (fullgraph), and compiled-vs-eager grads at the same
+# <0.5% noise floor (the in-op bf16 round is eager-deterministic, not inductor-reordered).
+# ============================================================================
+@pytest.mark.parametrize('norm', ['raw', 'global', 'per_state', 'kappa'])
+def test_gla_compile_fullgraph(norm):
+    """chunk_rola(g!=None) compiles fullgraph (0 graph breaks) for every norm — the V2 compile gate."""
+    if device != 'cuda':
+        pytest.skip('RoLA Triton kernels require CUDA')
+    B, H, T, K, V, nc = 2, 4, 128, 16, 32, 64
+    g_ = torch.Generator(device=device).manual_seed(0)
+
+    def mk(*s):
+        return torch.randn(*s, device=device, generator=g_)
+    q, k, v = mk(B, T, H, K), mk(B, T, H, K), mk(B, T, H, V)
+    r = torch.softmax(mk(B, T, H, nc), -1)
+    w = torch.softmax(mk(B, T, H, nc), -1)
+    ld = (-torch.rand(B, T, H, nc, device=device, generator=g_) * 0.5).clamp(min=-2.5)
+    kappa = torch.rand(B, T, H, 1, device=device, generator=g_) * 0.3
+    torch._dynamo.reset()
+    fn = torch.compile(C._chunk_rola_impl, fullgraph=True)
+    with torch.autocast('cuda', dtype=torch.bfloat16):
+        o = fn(q, k, v, r, w, g=ld, norm=norm, kappa=(kappa if norm == 'kappa' else None), scale=1.0)
+    assert o.shape == (B, T, H, V)
+
+
+@pytest.mark.parametrize('norm', ['global', 'per_state'])
+def test_gla_compile_grad_noise(norm):
+    """Compiled-vs-eager GLA grads under bf16 autocast land <0.5% (mirrors the RLA compile grad-noise
+    gate) — the in-op `cdt` cast keeps the bf16 round out of the compile-visible normalize glue."""
+    if device != 'cuda':
+        pytest.skip('RoLA Triton kernels require CUDA')
+    B, H, T, K, V, nc = 2, 4, 128, 16, 32, 64
+
+    def run(fn, seed):
+        g_ = torch.Generator(device=device).manual_seed(seed)
+
+        def mk(*s):
+            return torch.randn(*s, device=device, generator=g_)
+        q, k, v = mk(B, T, H, K), mk(B, T, H, K), mk(B, T, H, V)
+        r = torch.softmax(mk(B, T, H, nc), -1)
+        w = torch.softmax(mk(B, T, H, nc), -1)
+        ld = (-torch.rand(B, T, H, nc, device=device, generator=g_) * 0.5).clamp(min=-2.5)
+        ts = [q, k, v, r, w, ld]
+        for t in ts:
+            t.requires_grad_()
+        with torch.autocast('cuda', dtype=torch.bfloat16):
+            o = fn(q, k, v, r, w, g=ld, norm=norm, kappa=None, scale=1.0)
+        o.float().sum().backward()
+        return o.detach().float(), [t.grad.detach().float() for t in ts]
+
+    def rel(a, b):
+        return ((a - b).norm() / (b.norm() + 1e-12)).item()
+    torch._dynamo.reset()
+    comp = torch.compile(C._chunk_rola_impl)
+    oe, ge = run(C._chunk_rola_impl, 7)
+    oc, gc = run(comp, 7)
+    grads = [rel(a, b) for a, b in zip(gc, ge)]
+    assert rel(oc, oe) < 5e-3, f'{norm} fwd noise {rel(oc, oe):.2e}'
+    assert max(grads) < 5e-3, f'{norm} grad noise {grads}'
