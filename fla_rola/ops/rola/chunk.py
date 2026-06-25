@@ -4010,6 +4010,8 @@ def _chunk_rola_impl(q, k, v, r, w, g=None, norm='kappa', kappa=None, scale=None
     # is the fp32 pass-through. ld/gf stays fp32 (the decay exp is precision-sensitive, read fp32 in-op).
     qf, kf, vf, wf = fold(q).float() * scale, fold(k).float(), fold(v).float(), fold(w).float()
     gf = fold(g).float() if g is not None else None
+    if gf is not None:
+        gf = _floor_ld(gf)   # enforce the fp32-safe decay floor once (#33); the CUDA ops re-floor idempotently
     cdt = compute_dtype  # the kernel compute dtype (bf16 under autocast, else q.dtype)
 
     if norm == 'raw':
@@ -4207,6 +4209,8 @@ def chunk_rola_routed(q, k, v, h, Wr, Ww, D, b, norm='kappa', kappa=None, scale=
         b_r, b_w = b_r.to(compute_dtype), b_w.to(compute_dtype)
     # ld stays fp32 (the decay exp is precision-sensitive; the kernel reads it as a separate fp32 buffer).
     gf = fold(g).float() if g is not None else None
+    if gf is not None:
+        gf = _floor_ld(gf)   # enforce the fp32-safe decay floor once (#33); the CUDA kernels re-floor idempotently
 
     if norm == 'raw':
         return unfold(_rola_routed_readout(qf, kf, vf, hf, Wr, Ww, D, b, chunk_size,
