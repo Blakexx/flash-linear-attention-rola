@@ -25,9 +25,11 @@ decomposable inner kernel, and the normalization's placement is a learned per-to
 - **`states_per_head`** (nc), plus `qk_norm`, `router_bias`, `router_zloss_coef`, `use_short_conv`.
 
 The full normalization pipeline (per-state denominator pre-pass, read-gate rescale, shared-Gram
-numerator-only readout) lives in the fused operator `chunk_rola` (`fla_rola/ops/rola/`); the lower-level
-Triton kernels (`rola_rla_triton`, `rola_gla_triton`, and the per-state denominator kernels) are exposed
-there for the correctness harness. The unrouted path stays bit-identical to upstream FLA.
+numerator-only readout) lives in `fla_rola/ops/rola/`. The production training/prefill path is the
+in-kernel tree-routed operator `chunk_rola_routed` (the `[L,nc]` routing gates are never materialized),
+and decode runs `fused_recurrent_rola`; `chunk_rola` is the pure-torch naive reference (the explicit-gate
+ground truth the routed op and the correctness harness validate against). The unrouted path stays
+bit-identical to upstream FLA.
 
 ## Using it
 
