@@ -1952,8 +1952,15 @@ def _floor_ld(ld):
     """Enforce the GLA log-decay floor (#33). ld below `_GLA_FLOOR` would overflow the factored fp32
     decay gram (e^{BT·|FLOOR|}); by default RAISE (no silent semantic rewrite). With
     ROLA_GLA_FLOOR_CLAMP=1, clamp to the floor and warn ONCE. Returns a tensor safe for the chunk
-    kernels (dtype/contiguity left to the caller)."""
+    kernels (dtype/contiguity left to the caller).
+
+    Under torch.compile the data-dependent min-check is a graph break, so skip it while tracing — the
+    public entrypoints (`chunk_rola`/`chunk_rola_routed`/`fused_recurrent_rola`) run the EAGER guard
+    once before dispatching to the compiled region (`_guard_ld`). When compiling we only apply the
+    cheap CLAMP (clamp-mode) or pass through (default), trusting that eager guard."""
     global _gla_floor_warned
+    if torch.compiler.is_compiling():
+        return ld.clamp(min=_GLA_FLOOR) if _GLA_FLOOR_CLAMP else ld
     mn = ld.detach().min()
     if mn < _GLA_FLOOR:
         if not _GLA_FLOOR_CLAMP:
@@ -1975,6 +1982,15 @@ def _floor_ld(ld):
             _gla_floor_warned = True
         return ld.clamp(min=_GLA_FLOOR)
     return ld
+
+
+def _guard_ld(g):
+    """EAGER floor guard for the public entrypoints (runs before the compiled region so the
+    data-dependent `_floor_ld` min-check never graph-breaks inside torch.compile). Raises/warns
+    identically to `_floor_ld`; the value is discarded (the compiled impl re-floors compile-safely)."""
+    if g is not None:
+        _floor_ld(g)
+
 
 # Snapshot-GRANULARITY stride (#1): the backward boundary-state snapshots Sb/dSa are written only every
 # KSNAP chunks (slot = chunk//KSNAP), 1/KSNAP the dominant backward HBM. The grad kernels read the
@@ -4082,6 +4098,7 @@ def chunk_rola(q, k, v, r, w, g=None, norm='kappa', kappa=None, scale=None, eps=
     Dynamo stays fullgraph). Set ROLA_NO_COMPILE=1 to force eager. Compile is skipped only on CPU (the
     eager fallback) and whenever Dynamo is already tracing (avoid nested-compile recursion)."""
     global _chunk_rola_compiled
+    _guard_ld(g)   # eager floor guard (raises out-of-range) BEFORE the compiled region — no graph break (#33)
     kw = dict(g=g, norm=norm, kappa=kappa, scale=scale, eps=eps,
               initial_state=initial_state, output_final_state=output_final_state)
     if _ROLA_NO_COMPILE or not q.is_cuda or torch.compiler.is_compiling():
