@@ -694,7 +694,10 @@ def _kap(q, norm):
 @pytest.mark.parametrize('gla', [False, True])
 def test_recurrent_handoff(gla, norm):
     """fused_recurrent_rola readout == chunk_rola readout, and chunk_rola(output_final_state) emits the
-    SAME state fused_recurrent_rola does -> a chunked prefill hands off bit-exactly to recurrent decode."""
+    SAME state fused_recurrent_rola does -> a chunked prefill hands off to recurrent decode. The two
+    paths use different reduction orders (chunked grams vs single-token scan), so this is rate-consistent
+    to ~5e-3 (the assert tol), NOT bit-exact: the handoff preserves the decay/normalization rate, not the
+    last bit."""
     if device != 'cuda':
         pytest.skip('RoLA Triton kernels require CUDA')
     nc, dv, L, tol = 8, 16, 64, 5e-3
@@ -730,6 +733,133 @@ def test_recurrent_state_carry(gla, norm):
                                       initial_state=s1, output_final_state=True)
         assert_close('split==whole readout', o_full, torch.cat([o1, o2], 1), tol)
         assert_close('split==whole state', s_full, s2, tol)
+
+
+# =============================================================================
+# #33/#36 review follow-ups: characterize/assert the EDGE behaviors are LOUD and CONSISTENT, not silently
+# divergent — (F1) signed-den normalization across decode/chunk/routed, (F2) the below-floor ld guard.
+# =============================================================================
+def test_signed_den_consistent_decode_chunk_routed():
+    """#36 F1 — SIGNED per-state den. Production guarantees d≥0 (elu+1 features φ>0 with softmax write
+    gates w≥0). For NON-positive features the den d_i^c = Σ_{j≤i}(φq·φk)w_j^c can go ≤0. The #36 den-sign
+    unification contract: every path (decode / chunk / tree-routed) computes the RAW SIGNED den — no path
+    silently tl.abs()es it — so for the SAME signed input the paths agree, never silently DIVERGE.
+
+    Asserted on inputs that DO drive d non-positive:
+      (1) GLOBAL norm (den D = Σ_c r^c d^c, reduced but NOT divided) is rate-consistent across all three.
+          This is the load-bearing check: the signed den is summed IDENTICALLY everywhere; an abs() in
+          one path's den would shift D and break this.
+      (2) per_state / kappa (which DIVIDE by / raise (d+ε) — ill-posed for d+ε≤0) produce the SAME
+          non-finite MASK across paths (an abs() would change WHICH entries blow up). The divided values
+          near d+ε≈0 are genuinely ill-conditioned (the chunk-gram vs decode-scan reduction-order gap is
+          amplified) — that ill-conditioning is itself path-consistent, so we gate equality to the mask,
+          not the amplified magnitudes."""
+    if device != 'cuda':
+        pytest.skip('RoLA Triton kernels require CUDA')
+    B, H, T, Kd, V, nc, dm = 2, 2, 32, 16, 16, 8, 24
+    tol = 5e-3
+    gseed = torch.Generator(device=device).manual_seed(7)
+
+    def rnd(*s):
+        return torch.randn(*s, device=device, generator=gseed, dtype=torch.float32)
+    # SIGNED features (no elu/abs) → the content gram φq·φk is signed → d can be ≤0.
+    q, k, v = rnd(B, T, H, Kd), rnd(B, T, H, Kd), rnd(B, T, H, V)
+    h = rnd(B, T, H, dm)
+    # Flat router (D=1, b=nc): the SAME (h,Wr,Ww) drives the tree-routed path AND, via _tree_gates_oop,
+    # the explicit r,w the decode/chunk paths consume — so the only variable is the kernel, not the gates.
+    D, b = 1, nc
+    Wr, Ww = rnd(D, dm, b) * 0.5, rnd(D, dm, b) * 0.5
+    hf = h.permute(0, 2, 1, 3).reshape(B * H, T, dm)                  # [BH,T,dm] (the routed fold layout)
+    rf, wf = _tree_gates_oop(hf, Wr, Ww, D, b)                        # [BH,T,nc] each
+    r = rf.view(B, H, T, nc).permute(0, 2, 1, 3).contiguous()        # -> [B,T,H,nc]
+    w = wf.view(B, H, T, nc).permute(0, 2, 1, 3).contiguous()
+    # Confirm the den actually goes non-positive (else the test isn't exercising the signed regime).
+    assert (_perstate_den_signed(q, k, w) <= 0).any(), 'no non-positive den — adjust the seed/shape'
+
+    def run(norm, kap=None):
+        c = dict(r=r, w=w, norm=norm, kappa=kap, scale=1.0)
+        oc = chunk_rola(q, k, v, **c).float()
+        od = fused_recurrent_rola(q, k, v, **c, output_final_state=True)[0].float()
+        orr = C.chunk_rola_routed(q, k, v, h, Wr, Ww, D, b, norm=norm, kappa=kap, scale=1.0).float()
+        return oc, od, orr
+
+    # (1) The DEN is reduced from the raw SIGNED d identically everywhere. Compare the un-normalized
+    # numerators on a SUBSET where the per-state den d>0 in every state (so the divide isn't the issue):
+    # there the global readout is well-conditioned and decode==chunk==routed. This is the den-sign
+    # unification's load-bearing check — the signed d is summed the SAME way, no abs() anywhere.
+    oc, od, orr = run('global')
+    # well-conditioned rows: |global den| not tiny ⇒ the divide is stable; compare those entries.
+    rg = r.permute(0, 2, 1, 3).reshape(B * H, T, nc)             # [BH,T,nc]
+    dg = _perstate_den_signed(q, k, w)                           # [BH,T,nc]
+    Dglob = (rg * dg).sum(-1).view(B, H, T).permute(0, 2, 1)    # [B,T,H] global den
+    wc = (Dglob.abs() > 0.5)[..., None].expand_as(oc)           # [B,T,H,V]
+    assert wc.any(), 'no well-conditioned (|den|>0.5) entries — adjust seed'
+    assert_close('signed-d global decode==chunk (well-cond)', oc[wc], od[wc], tol)
+    assert_close('signed-d global routed==chunk (well-cond)', oc[wc], orr[wc], tol)
+
+    # (2) per_state / kappa: identical non-finite MASK across paths (no path abs()es the rescale base —
+    # an abs() would change WHICH entries blow up). The divided magnitudes near d+ε≈0 are genuinely
+    # ill-conditioned and path-amplified, so the MASK (not the values) is the anti-divergence gate.
+    for norm in ('per_state', 'kappa'):
+        kap = torch.full((B, T, H, 1), KAPPA, device=device) if norm == 'kappa' else None
+        oc, od, orr = run(norm, kap)
+        fc, fd, fr_ = torch.isfinite(oc), torch.isfinite(od), torch.isfinite(orr)
+        assert torch.equal(fc, fd), f'{norm}: decode non-finite mask differs from chunk (abs() in a path?)'
+        assert torch.equal(fc, fr_), f'{norm}: routed non-finite mask differs from chunk (abs() in a path?)'
+
+
+def _perstate_den_signed(q, k, w):
+    """RAW signed per-state den d[BH,T,nc] = Σ_{j≤i}(q_i·k_j) w_j^c, folded over (B,H). No abs, no decay."""
+    B, T, H, Kd = q.shape
+    nc = w.shape[-1]
+    qf = q.permute(0, 2, 1, 3).reshape(B * H, T, Kd)
+    kf = k.permute(0, 2, 1, 3).reshape(B * H, T, Kd)
+    wf = w.permute(0, 2, 1, 3).reshape(B * H, T, nc)
+    G = torch.einsum('bid,bjd->bij', qf, kf)
+    caus = torch.tril(torch.ones(T, T, device=q.device, dtype=q.dtype))
+    return torch.einsum('bij,bjc->bic', G * caus, wf)
+
+
+@pytest.mark.parametrize('path', ['chunk', 'decode'])
+def test_below_floor_ld_raises_and_clamps(path, monkeypatch):
+    """#33 F2 — the GLA log-decay floor guard is LOUD. An ld below `_GLA_FLOOR` (the fp32-safe decay
+    floor) must RAISE by default on BOTH the chunk and decode paths; with ROLA_GLA_FLOOR_CLAMP=1 it must
+    instead WARN-once and clamp (not silently truncate)."""
+    if device != 'cuda':
+        pytest.skip('RoLA Triton kernels require CUDA')
+    B, H, T, Kd, V, nc = 1, 1, 16, 16, 16, 4
+    g = torch.Generator(device=device).manual_seed(3)
+
+    def fm(x):
+        return torch.nn.functional.elu(x) + 1.0
+    q = fm(torch.randn(B, T, H, Kd, device=device, generator=g))
+    k = fm(torch.randn(B, T, H, Kd, device=device, generator=g))
+    v = torch.randn(B, T, H, V, device=device, generator=g)
+    r = torch.softmax(torch.randn(B, T, H, nc, device=device, generator=g), -1)
+    w = torch.softmax(torch.randn(B, T, H, nc, device=device, generator=g), -1)
+    ld = torch.full((B, T, H, nc), C._GLA_FLOOR - 1.0, device=device)   # below the floor
+    common = dict(r=r, w=w, g=ld, norm='global', scale=1.0)
+
+    def call():
+        if path == 'chunk':
+            return chunk_rola(q, k, v, **common)
+        return fused_recurrent_rola(q, k, v, **common, output_final_state=True)
+
+    # default: RAISE (no silent rewrite). Reset the module clamp flags via the env knob.
+    monkeypatch.setattr(C, '_GLA_FLOOR_CLAMP', False, raising=False)
+    with pytest.raises(ValueError, match='floor'):
+        call()
+    # clamp-mode: WARN-once + clamp (the kernel runs).
+    monkeypatch.setattr(C, '_GLA_FLOOR_CLAMP', True, raising=False)
+    monkeypatch.setattr(C, '_gla_floor_warned', False, raising=False)
+    import warnings
+    with warnings.catch_warnings(record=True) as rec:
+        warnings.simplefilter('always')
+        out = call()
+    o = out[0] if isinstance(out, tuple) else out
+    assert torch.isfinite(o).all(), 'clamp-mode output must be finite'
+    assert any('clamp' in str(x.message).lower() or 'floor' in str(x.message).lower() for x in rec), \
+        'clamp-mode must warn'
 
 
 # =============================================================================

@@ -40,6 +40,12 @@ from fla_rola.modules import RMSNorm, ShortConvolution
 from fla_rola.ops.rola import chunk_rola, fused_recurrent_rola
 from fla_rola.ops.rola.chunk import _GLA_FLOOR
 
+# One-time-per-process flag for the layer-side decay-floor truncation warning (#33 F4). The kernel's
+# `_floor_ld` raises (or warns in clamp-mode) on out-of-range ld; but the layer floors the LEARNED decay
+# silently with `.clamp(min=_GLA_FLOOR)` BEFORE the kernel ever sees it, so the kernel's loud signal is
+# dead in production. We restore the signal here: warn ONCE when the learned decay actually hits the floor.
+_rola_layer_floor_warned = False
+
 if TYPE_CHECKING:
     from transformers.processing_utils import Unpack
 
@@ -198,7 +204,25 @@ class RoLA(nn.Module):
         # overflows fp32 for BT·|ld|≳88.7 (see ops/rola/chunk.py `_floor_ld`, #33). The kernel RAISES on
         # ld below the floor (no silent rewrite); the layer floors explicitly here so the supported
         # decay range is an overt architectural choice, not a kernel-internal surprise.
-        return alpha_chunk.clamp(min=1e-8).log().clamp(min=_GLA_FLOOR)
+        ld = alpha_chunk.clamp(min=1e-8).log()
+        # #33 F4: the kernel's loud raise is dead in production because we floor BEFORE the kernel sees
+        # ld. Restore the signal: warn ONCE (per process) the first time a LEARNED decay actually dips
+        # below the floor and gets truncated — consistent with the kernel's clamp-mode one-time warn, so
+        # the truncation is loud (no silent rewrite of a learned parameter).
+        global _rola_layer_floor_warned
+        if not _rola_layer_floor_warned and bool((ld.detach() < _GLA_FLOOR).any()):
+            import warnings
+            mn = ld.detach().min().item()
+            warnings.warn(
+                f"RoLA learned log-decay floored to _GLA_FLOOR={_GLA_FLOOR} (min ld={mn:.4f} truncated). "
+                f"This clamps the learned per-state forget gate to the kernel's fp32-safe retention floor "
+                f"(≥8.2%/tok) — the learned decay rate below the floor is altered. Reduce the decay (raise "
+                f"alpha / lower the write gate) if this is unintended; the floor is a deliberate modeling "
+                f"choice (see ops/rola/chunk.py `_floor_ld`, #33).",
+                stacklevel=2,
+            )
+            _rola_layer_floor_warned = True
+        return ld.clamp(min=_GLA_FLOOR)
 
     def forward(
         self,
