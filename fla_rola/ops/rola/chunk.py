@@ -3980,8 +3980,17 @@ def _rola_readout(qf, kf, vf, rf, wf, gf, chunk_size, compute_dtype=None):
 
 @input_guard
 def _chunk_rola_impl(q, k, v, r, w, g=None, norm='kappa', kappa=None, scale=None, eps=1e-5,
-                     initial_state=None, output_final_state=False):
+                     output_final_state=False):
     """Routed RoLA (shared-gram) readout with built-in normalization.
+
+    The chunked pass ALWAYS starts from a zero recurrent state — there is no `initial_state`
+    ingestion (#34). The chunked inter scan would have to seed its per-state value AND den carries
+    across every readout/den kernel (RLA + GLA, numerator + denominator) and provide a backward
+    through the carried state; that is decode-only territory. The bidirectional handoff is therefore
+    one-directional here: `output_final_state` IS honored (a chunked prefill emits the recurrent state
+    for `fused_recurrent_rola` to seed via ITS `initial_state`), but the input counterpart is NOT
+    accepted — `chunk_rola` RAISES on a non-None `initial_state` rather than silently ignoring it
+    (the continuation-decode path is `fused_recurrent_rola`, auto-selected for short sequences).
 
     Args:
         q, k:  φ-mapped queries/keys [B, T, H, K] (the feature map φ stays in the caller — the
@@ -4096,11 +4105,24 @@ def chunk_rola(q, k, v, r, w, g=None, norm='kappa', kappa=None, scale=None, eps=
     """Routed RoLA readout (see `_chunk_rola_impl`). torch.compile is the DEFAULT for BOTH the RLA and
     GLA paths (lazily compiled on first call; the GLA readout/den are custom_op-wrapped — #30 V2 — so
     Dynamo stays fullgraph). Set ROLA_NO_COMPILE=1 to force eager. Compile is skipped only on CPU (the
-    eager fallback) and whenever Dynamo is already tracing (avoid nested-compile recursion)."""
+    eager fallback) and whenever Dynamo is already tracing (avoid nested-compile recursion).
+
+    `initial_state` is NOT ingested by the chunked pass (#34): seeding the inter scan from a carried
+    state is decode-only territory (the chunked readout/den kernels start from zero state and provide
+    no backward through a carried state). The param is kept only to RAISE loudly on a non-None value —
+    rather than silently dropping it and returning wrong results — so a caller meaning to continue from
+    a prefilled state is told to use `fused_recurrent_rola` (which DOES ingest `initial_state`)."""
     global _chunk_rola_compiled
+    if initial_state is not None:
+        raise NotImplementedError(
+            "chunk_rola does not ingest an initial_state — the chunked pass always starts from a zero "
+            "recurrent state (#34). output_final_state IS honored (a chunked prefill emits the state), "
+            "but to CONTINUE from a prefilled state use fused_recurrent_rola(..., initial_state=...), "
+            "which carries it. Passing initial_state here would have been silently ignored."
+        )
     _guard_ld(g)   # eager floor guard (raises out-of-range) BEFORE the compiled region — no graph break (#33)
     kw = dict(g=g, norm=norm, kappa=kappa, scale=scale, eps=eps,
-              initial_state=initial_state, output_final_state=output_final_state)
+              output_final_state=output_final_state)
     if _ROLA_NO_COMPILE or not q.is_cuda or torch.compiler.is_compiling():
         return _chunk_rola_impl(q, k, v, r, w, **kw)
     if _chunk_rola_compiled is None:
