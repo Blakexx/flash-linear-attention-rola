@@ -1052,10 +1052,13 @@ def _rola_rla_routed_bwd(q, k, v, h, Wr, Ww, do, D, b, chunk, BG, b_r=None, b_w=
             # decay the running dS adjoint by decvec=e^{Λ_c} (per state, broadcast over dqk×dv) — the
             # reverse of the forward's state carry S_{j+1}=e^Λ S_j + ΔS. Must run AFTER state-bwd reads
             # the S_{j+1} adjoint (and its ZdZ) and BEFORE read-bwd folds dS_read → adjoint S_j. The
-            # chunk-total Λ_c is recomputed from gda? No — it is the in-kernel ld's chunk-total; recompute
-            # it here from Wg + the write gates (chunk-local [B,len,nc], never [L,nc]).
+            # chunk-total Λ_c is the in-kernel ld's chunk-total; recompute it here from Wg + the write
+            # gates (chunk-local [B,len,nc], never [L,nc]). The write gates MUST honor the routing bias
+            # (softmax(h·Ww+b_w)) to match the in-kernel ld (`_build_rw_tile` runs HAS_BIAS=True) — else the
+            # dS-adjoint decay uses un-biased gates while the kernels use biased ones (the #45 bias bug).
             r0, r1 = c * chunk, min(c * chunk + chunk, L)
-            ld_c = _ld_chunk(h[:, r0:r1], Wr, Ww, Wg, D, b, H)     # [B,len,nc] (chunk-local)
+            ld_c = _ld_chunk(h[:, r0:r1], Wr, Ww, Wg, D, b, H,
+                             b_r=br if has_bias else None, b_w=bw if has_bias else None)  # [B,len,nc]
             Lam_c = ld_c.sum(dim=1)                                 # [B,nc] chunk-total per state
             dS = dS * torch.exp(Lam_c)[:, :, None, None]
         _routed_bwd_inter_read[(B,)](

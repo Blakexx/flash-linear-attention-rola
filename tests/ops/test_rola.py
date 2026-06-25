@@ -1508,18 +1508,21 @@ def test_gla_routed_fwd_no_LNC_materialization():
 # on the tree-materialized gates — q/k/v TIGHT, the gate/decay grads (drg/dwg/dld) to the GLA fp32 floor.
 # USE_G=False (ld=None) is byte-identical to the RLA routed backward (see test_routed_bwd_nonpow2_dv).
 # ============================================================================
-def _gla_routed_ref(q, k, v, h, Wr, Ww, Wg, D, b, scale):
+def _gla_routed_ref(q, k, v, h, Wr, Ww, Wg, D, b, scale, b_r=None, b_w=None):
     """fp64 explicit-gate GLA reference for the routed un-normalized numerator (the decayed math
     `rola_gla_routed_triton` reproduces) — `naive_rola_gla` on the tree-materialized gates + the per-state
     log-decay built from the per-head decay weight Wg the LAYER's `_log_decay` way (#45). Differentiable
-    w.r.t. Wg/h/Ww so the in-kernel dWg/dh/dWw can be gated against autograd of this single truth."""
+    w.r.t. Wg/h/Ww (and b_r/b_w when biased) so the in-kernel dWg/dh/dWw/db_w can be gated against
+    autograd of this single truth. The OPTIONAL per-head routing bias b_r/b_w threads into BOTH the gates
+    AND the decay (ld is built from the BIASED write gate — the #45 bias-threading bug surfaced exactly
+    when Wg crossed b_r/b_w: the bwd Λ_c decay must use the biased write gates, like the in-kernel ld)."""
     B, T, H, Kd = q.shape
 
     def fold(t):
         return t.permute(0, 2, 1, 3).reshape(B * H, T, t.shape[-1])
     qf, kf, vf, hf = fold(q) * scale, fold(k), fold(v), fold(h)
-    rf, wf = _per_head_gates(hf, Wr, Ww, D, b, H)         # [B*H, T, nc], fp64, per-head
-    ld = _ld_from_Wg(hf, wf, Wg, H)                        # ld(Wg) — the LAYER's per-state log-decay
+    rf, wf = _per_head_gates(hf, Wr, Ww, D, b, H, b_r=b_r, b_w=b_w)   # [B*H, T, nc], fp64, per-head (+bias)
+    ld = _ld_from_Wg(hf, wf, Wg, H)                        # ld(Wg) on the BIASED write gate — LAYER's decay
 
     def unf(t):
         return t.view(B * H, T, 1, -1)
@@ -1572,6 +1575,86 @@ def test_gla_routed_bwd_faithful(D, b, dv, Kd):
     for n in ('q', 'k', 'v'):
         assert rels[n] < 8e-3, f'{n} grad {rels[n]:.2e} (rels={rels})'
     for n in ('h', 'Wr', 'Ww', 'Wg'):
+        assert rels[n] < _GLA_BWD_TOL, f'{n} grad {rels[n]:.2e} (rels={rels})'
+
+
+def _gla_bias_norm_ref(q, k, v, h, Wr, Ww, Wg, kappa, D, b, norm, scale, b_r, b_w):
+    """fp64 NORMALIZED GLA+bias reference for the kappa-path norms (global|per_state|kappa): the per-state
+    decayed den + the decayed numerator on the BIASED per-head gates, with ld from the LAYER's _log_decay
+    on those biased write gates. Differentiable w.r.t. all of (q,k,v,h,Wr,Ww,Wg,b_r,b_w[,kappa])."""
+    B, T, H, _ = q.shape
+
+    def fold(t):
+        return t.permute(0, 2, 1, 3).reshape(B * H, T, t.shape[-1])
+
+    def unfold(t):
+        return t.view(B, H, T, -1).permute(0, 2, 1, 3).contiguous()
+    qf, kf, vf, hf = fold(q) * scale, fold(k), fold(v), fold(h)
+    rf, wf = _per_head_gates(hf, Wr, Ww, D, b, H, b_r=b_r, b_w=b_w)
+    ld = _ld_from_Wg(hf, wf, Wg, H)                                  # ld(Wg) on the BIASED write gate
+    chunk = min(64, max(16, T))
+    d = C._perstate_den_torch(qf, kf, wf, ld, chunk, EPS)           # decayed per-state den
+    if norm == 'kappa':
+        rt = rf * (d + EPS).pow(-fold(kappa))
+    elif norm == 'per_state':
+        rt = rf / (d + EPS)
+    else:  # global
+        rt = rf
+    num = C._rola_chunk_core(qf, kf, vf, wf, rt, ld, chunk)
+    den = (rt * d).sum(-1, keepdim=True)
+    return unfold(num / (den + EPS))
+
+
+# GLA × ROUTING-BIAS BACKWARD — the untested cross-product that hid the #45 bias-threading bug.
+# `_rola_rla_routed_bwd` (the raw GLA numerator bwd that backs norm='raw') recomputes the inter-chunk Λ_c
+# decay from `_ld_chunk(...)`; it MUST pass the routing bias so the dS-adjoint decay uses the SAME biased
+# write gates the in-kernel ld (`_build_rw_tile` HAS_BIAS=True) uses. Dropping it gave k≈2e-1/v≈3e-1 (a
+# real algorithmic error, NOT the fp32 floor). The kappa-path norms (global/per_state/kappa) route through
+# `_kappa_routed_bwd`, which already threads the bias — crossed here to lock BOTH bwd drivers under
+# GLA+bias. All validated against the LAYER's decay on the BIASED gates (the unified naive, not a re-encode).
+@pytest.mark.parametrize('norm', ['raw', 'global', 'per_state', 'kappa'])
+@pytest.mark.parametrize('D,b', [(1, 8), (2, 3), (3, 2)])     # flat, square(nc=9), tree(nc=8)
+def test_gla_routed_bias_bwd_faithful(norm, D, b):
+    """GLA decay (Wg) CROSSED with the routing bias (b_r/b_w), BACKWARD. fused chunk_rola_routed(Wg, b_r,
+    b_w) grads (incl. dWg, db_r, db_w, and the bias-coupled dh/dWw[,dkappa]) == autograd of the fp64 oracle
+    whose ld is built from the BIASED write gate. Regression for #45: norm='raw' is the exact bug site
+    (`_rola_rla_routed_bwd` Λ_c recompute used un-biased gates → wrong k/v/dWw/db_w); the normalized norms
+    confirm the kappa bwd's bias-threading under decay too."""
+    if device != 'cuda':
+        pytest.skip('RoLA Triton kernels require CUDA')
+    B, H, T, Kd, dv, dm = 2, 2, 64, 16, 24, 40
+    scale = Kd ** -0.5
+    g = torch.Generator(device=device).manual_seed(1)
+
+    def mk(*s, f=False):
+        x = torch.randn(*s, device=device, dtype=torch.float64, generator=g)
+        return ((torch.nn.functional.elu(x) + 1.0) if f else x).requires_grad_()
+    q, k = mk(B, T, H, Kd, f=True), mk(B, T, H, Kd, f=True)
+    v, h = mk(B, T, H, dv), mk(B, T, H, dm)
+    Wr = (torch.randn(H, D, dm, b, device=device, dtype=torch.float64, generator=g) * 0.4).requires_grad_()
+    Ww = (torch.randn(H, D, dm, b, device=device, dtype=torch.float64, generator=g) * 0.4).requires_grad_()
+    Wg = (torch.randn(H, dm, device=device, dtype=torch.float64, generator=g) * 0.4).requires_grad_()
+    b_r = (torch.randn(H, D, b, device=device, dtype=torch.float64, generator=g) * 0.7).requires_grad_()  # NON-TRIVIAL bias
+    b_w = (torch.randn(H, D, b, device=device, dtype=torch.float64, generator=g) * 0.7).requires_grad_()
+    kappa = (torch.rand(B, T, H, 1, device=device, dtype=torch.float64, generator=g) * 0.5 + 0.5).requires_grad_()
+    go = torch.randn(B, T, H, dv, device=device, dtype=torch.float64, generator=g)
+    sel = [q, k, v, h, Wr, Ww, Wg, b_r, b_w] + ([kappa] if norm == 'kappa' else [])
+    of = C.chunk_rola_routed(q.float(), k.float(), v.float(), h.float(), Wr.float(), Ww.float(), D, b,
+                             norm=norm, kappa=(kappa.float() if norm == 'kappa' else None),
+                             scale=scale, Wg=Wg.float(), b_r=b_r.float(), b_w=b_w.float())
+    gf = torch.autograd.grad(of, sel, go.float())
+    if norm == 'raw':
+        oe = _gla_routed_ref(q, k, v, h, Wr, Ww, Wg, D, b, scale, b_r=b_r, b_w=b_w)  # un-normalized numerator
+    else:
+        oe = _gla_bias_norm_ref(q, k, v, h, Wr, Ww, Wg, kappa, D, b, norm, scale, b_r, b_w)
+    ge = torch.autograd.grad(oe, sel, go)
+    names = ['q', 'k', 'v', 'h', 'Wr', 'Ww', 'Wg', 'b_r', 'b_w'] + (['kappa'] if norm == 'kappa' else [])
+    rels = {n: _relmax(a.float(), c.float()) for n, a, c in zip(names, gf, ge)}
+    assert _relmax(of.float(), oe.float()) < 1e-2, f'out {_relmax(of.float(), oe.float()):.2e}'
+    # q/k/v TIGHT (the bug spiked these to ~2-3e-1); the gate/decay/bias grads to the GLA fp32 floor.
+    for n in ('q', 'k', 'v'):
+        assert rels[n] < 8e-3, f'{n} grad {rels[n]:.2e} (rels={rels})'
+    for n in ('h', 'Wr', 'Ww', 'Wg', 'b_r', 'b_w'):
         assert rels[n] < _GLA_BWD_TOL, f'{n} grad {rels[n]:.2e} (rels={rels})'
 
 
