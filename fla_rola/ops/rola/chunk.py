@@ -24,16 +24,16 @@ import triton
 import triton.language as tl
 
 from fla_rola.ops.rola.routed_bwd_kernels import (  # production tree-routed backward kernels (the in-kernel router-grad fold)
-    _bwd_inter_read_kernel as _proto_bwd_inter_read,
+    _bwd_inter_read_kernel as _routed_bwd_inter_read,
 )
 from fla_rola.ops.rola.routed_bwd_kernels import (
-    _bwd_inter_state_kernel as _proto_bwd_inter_state,
+    _bwd_inter_state_kernel as _routed_bwd_inter_state,
 )
 from fla_rola.ops.rola.routed_bwd_kernels import (
-    _bwd_intra_kernel as _proto_bwd_intra,
+    _bwd_intra_kernel as _routed_bwd_intra,
 )
 from fla_rola.ops.rola.routed_bwd_kernels import (
-    _fold_kernel as _proto_fold,
+    _fold_kernel as _routed_bwd_fold,
 )
 from fla_rola.utils import (
     autocast_custom_bwd,
@@ -749,7 +749,7 @@ def _rola_rla_routed_fwd(q, k, v, h, Wr, Ww, D, b, chunk=None, BG=16):
 # (NOT the gates), built by a dedicated in-kernel snapshot scan `_rola_routed_snap` (write gates built
 # in-kernel via `_build_rw_tile` — gates never materialized in the snapshot pass either). The forward
 # saves these snapshots; backward consumes them. The validated fold kernels are imported at module top
-# (_proto_bwd_intra / _proto_bwd_inter_state / _proto_bwd_inter_read / _proto_fold), reused VERBATIM.
+# (_routed_bwd_intra / _routed_bwd_inter_state / _routed_bwd_inter_read / _routed_bwd_fold), reused VERBATIM.
 # ============================================================================
 
 
@@ -947,7 +947,7 @@ def _rola_rla_routed_bwd(q, k, v, h, Wr, Ww, do, D, b, chunk, BG, b_r=None, b_w=
     common = dict(D=D, b=b, BB=BB, BT=chunk, BK=BK_full, BV=BVO, BD=BD, BC=BC,
                   NCBLK=NCBLK, ND=triton.cdiv(dqk, BK_full), NDM=NDM, HAS_BIAS=has_bias,
                   USE_G=use_g, num_warps=4, num_stages=1)
-    _proto_bwd_intra[(B, NCH)](
+    _routed_bwd_intra[(B, NCH)](
         h, q, k, v, Wr, Ww, sel, ld, do, dq, dk, dvv, dh, dWr, dWw, gda,
         br, bw, dbr, dbw,
         L, d_model, dqk, dv, nc,
@@ -970,7 +970,7 @@ def _rola_rla_routed_bwd(q, k, v, h, Wr, Ww, do, D, b, chunk, BG, b_r=None, b_w=
     for c in reversed(range(NCH)):
         Sj = snap[:, c].contiguous()
         # state-bwd reads dS = adjoint S_{j+1} (pre-decvec) → dk,dv,gdw + (USE_G) the carry/w_end da-pieces.
-        _proto_bwd_inter_state[(B,)](
+        _routed_bwd_inter_state[(B,)](
             h, k, v, Wr, Ww, sel, ld, Sj, dS, dk, dvv, gdw, gda, br, bw,
             L, d_model, dqk, dv, nc, c * chunk,
             h.stride(0), h.stride(1), h.stride(2), q.stride(0), q.stride(1), q.stride(2),
@@ -987,7 +987,7 @@ def _rola_rla_routed_bwd(q, k, v, h, Wr, Ww, do, D, b, chunk, BG, b_r=None, b_w=
             rows = slice(c * chunk, min(c * chunk + chunk, L))
             Lam_c = ld[:, rows].sum(dim=1)                          # [B,nc] chunk-total per state
             dS = dS * torch.exp(Lam_c)[:, :, None, None]
-        _proto_bwd_inter_read[(B,)](
+        _routed_bwd_inter_read[(B,)](
             h, q, Wr, Ww, sel, ld, Sj, dS, do, dq, gdr, gda, br, bw,
             L, d_model, dqk, dv, nc, c * chunk,
             h.stride(0), h.stride(1), h.stride(2), q.stride(0), q.stride(1), q.stride(2),
@@ -997,7 +997,7 @@ def _rola_rla_routed_bwd(q, k, v, h, Wr, Ww, do, D, b, chunk, BG, b_r=None, b_w=
             do.stride(0), do.stride(1), do.stride(2),
             gdr.stride(0), gdr.stride(1), gdr.stride(2), *sga, *sbias,
             **inter_common)
-        _proto_fold[(B,)](
+        _routed_bwd_fold[(B,)](
             h, Wr, Ww, sel, gdr, gdw, dh, dWr, dWw, br, bw, dbr, dbw,
             L, d_model, nc, c * chunk,
             h.stride(0), h.stride(1), h.stride(2),
@@ -1832,7 +1832,7 @@ def _kappa_routed_bwd(q, k, v, h, Wr, Ww, kap, snap_val, snap_den, dnum, dden,
             *sBias,
             **read_common)
         # fold the transient gate-grads -> dWr,dWw,dh (+db; proto fold; factor-rebuild SMEM isolated here).
-        _proto_fold[(B,)](
+        _routed_bwd_fold[(B,)](
             h, Wr, Ww, sel, gdr, gdw, dh, dWr, dWw, br, bw, dbr, dbw,
             L, d_model, nc, c * chunk, *sH, *sWr, *sWw, *sSel,
             gdr.stride(0), gdr.stride(1), gdr.stride(2), dh.stride(0), dh.stride(1), dh.stride(2),
@@ -3933,7 +3933,7 @@ _NORMS = ('raw', 'global', 'per_state', 'kappa')
 
 
 def _rola_chunk_core(q, k, v, w, r, ld, chunk_size):
-    """Eager (CPU / capability-fallback) shared-gram routed readout on folded [BH, T, *] tensors.
+    """Eager (CPU reference path) shared-gram routed readout on folded [BH, T, *] tensors.
     ld=None ⇒ RLA (chunk-parallel cumsum scan); ld given ⇒ scalar-gated GLA (decayed scan). Returns
     the un-normalized readout [BH, T, v.shape[-1]] (numerator; the den is a separate pre-pass)."""
     BH, T, K = q.shape
@@ -3984,7 +3984,7 @@ def _rola_chunk_core(q, k, v, w, r, ld, chunk_size):
 
 def _perstate_den_torch(q, k, w, ld, chunk_size, eps=1e-5):
     """Eager per-state denominator dᵢᶜ = Σ_{j≤i} (φqᵢ·φkⱼ) wⱼᶜ [· e^{Λᵢᶜ−Λⱼᶜ} under decay], folded
-    [BH,T,*] → [BH,T,nc]. CPU/capability fallback for the Triton den kernels."""
+    [BH,T,*] → [BH,T,nc]. CPU reference path for the Triton den kernels."""
     BH, T, K = q.shape
     G = torch.einsum('bid,bjd->bij', q, k)
     causal = torch.tril(torch.ones(T, T, device=q.device, dtype=q.dtype))
@@ -4223,7 +4223,7 @@ def _tree_gates_torch(hf, Wr, Ww, D, b, b_r=None, b_w=None):
 
 def _rola_routed_readout(qf, kf, vf, hf, Wr, Ww, D, b, chunk_size, b_r=None, b_w=None, ld=None):
     """Folded tree-routed numerator-only readout. CUDA → in-kernel routed Triton kernels (gates never
-    materialized); else → eager core on explicit gates (capability fallback). Optional bias b_r/b_w.
+    materialized); else → eager core on explicit gates (CPU reference path). Optional bias b_r/b_w.
     Optional per-state log-decay ld:[BH,L,nc] (GLA) → the decayed routed readout; ld=None is RLA."""
     if qf.is_cuda:
         if ld is not None:
@@ -4311,7 +4311,7 @@ def chunk_rola_routed(q, k, v, h, Wr, Ww, D, b, norm='kappa', kappa=None, scale=
                                          b_r=b_r, b_w=b_w, ld=gf)
         return unfold(num.float() / (den.float() + eps)).to(v.dtype)
 
-    # CPU/capability fallback (qf not on CUDA) for all normalized norms: the per-state den pre-pass on
+    # CPU reference path (qf not on CUDA) for all normalized norms: the per-state den pre-pass on
     # explicit gates + the eager-core numerator. ALL CUDA normalized norms (incl. 'global') route through
     # the fused in-kernel den path above, so `_tree_gates_torch` is never on the production CUDA path.
     # The bias is threaded here too (out-of-place gates) so the fallback honors softmax(h·W+b).

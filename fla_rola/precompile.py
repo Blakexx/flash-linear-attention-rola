@@ -143,7 +143,15 @@ def capture_shape(spec: ShapeSpec) -> dict:
     record per-kernel arg descriptors. Returns {kernel_name: _Captured}. Requires CUDA.
 
     This is the only GPU-touching step; it runs once per shape and is cheap relative to the
-    codegen it enables to be parallelized."""
+    codegen it enables to be parallelized.
+
+    COVERAGE: the capture drives ``chunk_rola`` — the LAYER / production path (the RoLA layer
+    runs ``chunk_rola`` for training/prefill), so its autotuned RLA/GLA fwd+bwd kernels are
+    warmed. It does NOT yet warm the tree-routed training kernels (``chunk_rola_routed`` — the
+    in-kernel router-grad fold) nor the non-autotuned ``fused_recurrent_rola`` decode kernel
+    (decode has fixed launch params, so there is no autotuner codegen wall to amortize). Extend
+    the capture to also drive ``chunk_rola_routed`` once #39 wires the fused routed path into the
+    layer."""
     import torch
     import triton.runtime.jit as jitmod
 
