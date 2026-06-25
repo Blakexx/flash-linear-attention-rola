@@ -603,19 +603,25 @@ def _build_factors(h_ptr, wr_ptr, ww_ptr, sel_ptr, cols, cmask,
 # ============ INTRA backward kernel ============
 @triton.jit
 def _bwd_intra_kernel(
-    h_ptr, q_ptr, k_ptr, v_ptr, wr_ptr, ww_ptr, sel_ptr, do_ptr,
-    dq_ptr, dk_ptr, dv_ptr, dh_ptr, dwr_ptr, dww_ptr,
+    h_ptr, q_ptr, k_ptr, v_ptr, wr_ptr, ww_ptr, sel_ptr, ld_ptr, do_ptr,
+    dq_ptr, dk_ptr, dv_ptr, dh_ptr, dwr_ptr, dww_ptr, gda_ptr,
     br_ptr, bw_ptr, dbr_ptr, dbw_ptr,
     L, d_model, dqk, dv, nc,
     sh_b, sh_l, sh_d, sq_b, sq_l, sq_d, sv_b, sv_l, sv_d,
     swr_lvl, swr_d, swr_b, sww_lvl, sww_d, sww_b,
-    ssel_lvl, ssel_b, ssel_c, so_b, so_l, so_v, sdh_b, sdh_l, sdh_d,
+    ssel_lvl, ssel_b, ssel_c, sg_b, sg_l, sg_c, sga_b, sga_l, sga_c,
+    so_b, so_l, so_v, sdh_b, sdh_l, sdh_d,
     sbr_lvl, sbr_b, sbw_lvl, sbw_b,
     D: tl.constexpr, b: tl.constexpr, BB: tl.constexpr,
     BT: tl.constexpr, BK: tl.constexpr, BV: tl.constexpr, BD: tl.constexpr,
     BC: tl.constexpr, NCBLK: tl.constexpr, ND: tl.constexpr, NDM: tl.constexpr,
-    HAS_BIAS: tl.constexpr,
+    HAS_BIAS: tl.constexpr, USE_G: tl.constexpr = False,
 ):
+    # USE_G (GLA, #30): the routing factors r_tile/w_tile feed the DECAYED intra gram rt=r·eᵃ, wt=w·e⁻ᵃ
+    # (a = intra-chunk cumsum of ld over this block's c-columns), mirroring `_rola_routed_fwd_intra`.
+    # The fold then consumes the routing-factor grads (drt·eᵃ, dwt·e⁻ᵃ), and the per-token log-decay
+    # adjoints (dart_intra = drt·rt, da_wt = −dwt·wt) are accumulated into the persistent gda[B,L,nc]
+    # buffer (the read/state kernels add their da-pieces; the driver reverse-cumsums gda → dld).
     pid_b = tl.program_id(0)
     pid_t = tl.program_id(1)
     offs_t = tl.arange(0, BT)
@@ -639,7 +645,7 @@ def _bwd_intra_kernel(
     G = tl.dot(qc, tl.trans(kc))
     causal = (offs_t[:, None] >= offs_t[None, :]) & rmask[:, None] & rmask[None, :]
     dov = tl.dot(doc, tl.trans(vc)) * causal  # [BT,BT]
-    # pass 1: full Rgram
+    # pass 1: full Rgram (USE_G: decayed gram rt·wtᵀ per block)
     Rgram = tl.zeros([BT, BT], dtype=tl.float32)
     for cb in range(NCBLK):
         cols = cb * BC + offs_c
@@ -650,6 +656,12 @@ def _bwd_intra_kernel(
                                         ssel_lvl, ssel_b, ssel_c,
                                         br_ptr, bw_ptr, sbr_lvl, sbr_b, sbw_lvl, sbw_b,
                                         D, BT, BB, BC, BD, NDM, HAS_BIAS)
+        if USE_G:
+            ldc = tl.load(ld_ptr + pid_b * sg_b + rows[:, None] * sg_l + cols[None, :] * sg_c,
+                          mask=rmask[:, None] & cmask[None, :], other=0.0)
+            a = tl.cumsum(ldc, axis=0)
+            r_tile = r_tile * tl.exp(a)
+            w_tile = w_tile * tl.exp(-a)
         Rgram += tl.dot(r_tile, tl.trans(w_tile))
     A = G * Rgram * causal
     dv_acc = tl.dot(tl.trans(A).to(doc.dtype), doc)
@@ -663,7 +675,7 @@ def _bwd_intra_kernel(
                   dq_acc, mask=rmask[:, None] & kmask[None, :])
     tl.atomic_add(dk_ptr + pid_b * sq_b + rows[:, None] * sq_l + offs_k[None, :] * sq_d,
                   dk_acc, mask=rmask[:, None] & kmask[None, :])
-    # pass 2: per block, dr_tile/dw_tile from intra, fold
+    # pass 2: per block, dr_tile/dw_tile from intra, fold (USE_G: chain through rt/wt + accumulate da)
     for cb in range(NCBLK):
         cols = cb * BC + offs_c
         cmask = cols < nc
@@ -673,8 +685,26 @@ def _bwd_intra_kernel(
                                         ssel_lvl, ssel_b, ssel_c,
                                         br_ptr, bw_ptr, sbr_lvl, sbr_b, sbw_lvl, sbw_b,
                                         D, BT, BB, BC, BD, NDM, HAS_BIAS)
-        dr_tile = tl.dot(dRgram.to(w_tile.dtype), w_tile)
-        dw_tile = tl.dot(tl.trans(dRgram).to(r_tile.dtype), r_tile)
+        if USE_G:
+            ldc = tl.load(ld_ptr + pid_b * sg_b + rows[:, None] * sg_l + cols[None, :] * sg_c,
+                          mask=rmask[:, None] & cmask[None, :], other=0.0)
+            a = tl.cumsum(ldc, axis=0)
+            ea = tl.exp(a)
+            ena = tl.exp(-a)
+            rt = r_tile * ea
+            wt = w_tile * ena
+            # grads w.r.t. the DECAYED gates rt/wt, then chain to the routing factors r/w for the fold.
+            drt = tl.dot(dRgram.to(wt.dtype), wt)            # [BT,BC]
+            dwt = tl.dot(tl.trans(dRgram).to(rt.dtype), rt)  # [BT,BC]
+            dr_tile = drt * ea                               # routing-factor grad (→ fold)
+            dw_tile = dwt * ena
+            # da-pieces: +dart_intra (=drt·rt), −da_wt (=dwt·wt); accumulate into the persistent gda buffer.
+            da = drt * rt - dwt * wt
+            tl.atomic_add(gda_ptr + pid_b * sga_b + rows[:, None] * sga_l + cols[None, :] * sga_c,
+                          tl.where(cmask[None, :], da, 0.0), mask=rmask[:, None] & cmask[None, :])
+        else:
+            dr_tile = tl.dot(dRgram.to(w_tile.dtype), w_tile)
+            dw_tile = tl.dot(tl.trans(dRgram).to(r_tile.dtype), r_tile)
         for lvl in range(D):
             _fold_level(dr_tile, dw_tile, r_tile, w_tile, cols, cmask,
                         h_ptr, wr_ptr, ww_ptr, sel_ptr, dwr_ptr, dww_ptr, dh_ptr,
@@ -689,18 +719,21 @@ def _bwd_intra_kernel(
 # Split from the state-update half to halve SMEM (only the readout [BT,BC*BK] tile lives here).
 @triton.jit
 def _bwd_inter_read_kernel(
-    h_ptr, q_ptr, wr_ptr, ww_ptr, sel_ptr, s_ptr, ds_ptr, do_ptr,
-    dq_ptr, gdr_ptr, br_ptr, bw_ptr,
+    h_ptr, q_ptr, wr_ptr, ww_ptr, sel_ptr, ld_ptr, s_ptr, ds_ptr, do_ptr,
+    dq_ptr, gdr_ptr, gda_ptr, br_ptr, bw_ptr,
     L, d_model, dqk, dv, nc, t_start,
     sh_b, sh_l, sh_d, sq_b, sq_l, sq_d,
     swr_lvl, swr_d, swr_b, sww_lvl, sww_d, sww_b,
-    ssel_lvl, ssel_b, ssel_c, ss_b, ss_c, ss_k, ss_v,
-    so_b, so_l, so_v, sg_b, sg_t, sg_c, sbr_lvl, sbr_b, sbw_lvl, sbw_b,
+    ssel_lvl, ssel_b, ssel_c, sgl_b, sgl_l, sgl_c, ss_b, ss_c, ss_k, ss_v,
+    so_b, so_l, so_v, sg_b, sg_t, sg_c, sga_b, sga_l, sga_c, sbr_lvl, sbr_b, sbw_lvl, sbw_b,
     D: tl.constexpr, b: tl.constexpr, BB: tl.constexpr,
     BT: tl.constexpr, BK: tl.constexpr, BV: tl.constexpr, BD: tl.constexpr,
     BC: tl.constexpr, NCBLK: tl.constexpr, ND: tl.constexpr, NDM: tl.constexpr,
-    HAS_BIAS: tl.constexpr,
+    HAS_BIAS: tl.constexpr, USE_G: tl.constexpr = False,
 ):
+    # USE_G (GLA, #30): the inter readout uses the DECAYED read gate rt=r·eᵃ (a=intra-chunk cumsum of ld).
+    # dq/dS_read flow through rt; the read routing-factor grad is drt·eᵃ (→ gdr) and the read-gate decay
+    # adjoint dart_inter=drt·rt is accumulated into the persistent gda buffer (the driver reverse-cumsums).
     pid_b = tl.program_id(0)
     ND_V = (dv + BV - 1) // BV       # value-blocks (BV is the value TILE; ND_V==1 ⇒ the un-tiled kernel)
     offs_t = tl.arange(0, BT)
@@ -718,10 +751,18 @@ def _bwd_inter_read_kernel(
                                         ssel_lvl, ssel_b, ssel_c,
                                         br_ptr, bw_ptr, sbr_lvl, sbr_b, sbw_lvl, sbw_b,
                                         D, BT, BB, BC, BD, NDM, HAS_BIAS)
+        if USE_G:
+            ldc = tl.load(ld_ptr + pid_b * sgl_b + rows[:, None] * sgl_l + cols[None, :] * sgl_c,
+                          mask=rmask[:, None] & cmask[None, :], other=0.0)
+            a = tl.cumsum(ldc, axis=0)
+            ea = tl.exp(a)
+            rt_tile = r_tile * ea            # decayed read gate (used in the readout/dS_read/dq)
+        else:
+            rt_tile = r_tile
         # dr[BT,BC] sums over dqk → accumulate across BK-feature-blocks; dq[BT,BK] is per-block (offs_k).
         # M=do·s_flatᵀ is value-contracted → sum over vb; the dS_read store is per (BK,value)-block. The
         # [BC*BK,BV] s_flat slice stays bounded by BK·BV; rq[BT,BC*BK] is value-free, reused across vb.
-        dr_inter = tl.zeros([BT, BC], dtype=tl.float32)
+        dr_inter = tl.zeros([BT, BC], dtype=tl.float32)   # grad w.r.t. rt (USE_G) | r (RLA)
         for d0 in range(ND):
             offs_k = d0 * BK + tl.arange(0, BK)
             kmask = offs_k < dqk
@@ -729,7 +770,7 @@ def _bwd_inter_read_kernel(
                          mask=rmask[:, None] & kmask[None, :], other=0.0)
             ckv = tl.reshape(cols[:, None] * dqk + offs_k[None, :], [BC * BK])
             ckmask = tl.reshape(cmask[:, None] & kmask[None, :], [BC * BK])
-            rq = tl.reshape(r_tile[:, :, None] * qc[:, None, :], [BT, BC * BK])
+            rq = tl.reshape(rt_tile[:, :, None] * qc[:, None, :], [BT, BC * BK])
             M = tl.zeros([BT, BC * BK], dtype=tl.float32)
             for vb in range(ND_V):
                 offs_v = vb * BV + tl.arange(0, BV)
@@ -739,7 +780,7 @@ def _bwd_inter_read_kernel(
                 s_flat = tl.load(s_ptr + pid_b * ss_b + ckv[:, None] * ss_k + offs_v[None, :] * ss_v,
                                  mask=ckmask[:, None] & vmask[None, :], other=0.0)
                 M += tl.dot(doc, tl.trans(s_flat).to(doc.dtype))  # [BT, BC*BK]
-                # dS_read[c,k,v] = sum_t r[t,c] q[t,k] do[t,v]; accumulate into ds (adjoint of S_j).
+                # dS_read[c,k,v] = sum_t rt[t,c] q[t,k] do[t,v]; accumulate into ds (adjoint of S_j).
                 dS_read = tl.dot(tl.trans(rq).to(doc.dtype), doc)  # [BC*BK, BV]
                 dS_in = tl.load(ds_ptr + pid_b * ss_b + ckv[:, None] * ss_k + offs_v[None, :] * ss_v,
                                 mask=ckmask[:, None] & vmask[None, :], other=0.0)
@@ -747,10 +788,17 @@ def _bwd_inter_read_kernel(
                          dS_in + dS_read, mask=ckmask[:, None] & vmask[None, :])
             Mr = tl.reshape(M, [BT, BC, BK])
             dr_inter += tl.sum(Mr * qc[:, None, :], axis=2)
-            dq_acc = tl.sum(Mr * r_tile[:, :, None], axis=1)
+            dq_acc = tl.sum(Mr * rt_tile[:, :, None], axis=1)
             tl.atomic_add(dq_ptr + pid_b * sq_b + rows[:, None] * sq_l + offs_k[None, :] * sq_d,
                           dq_acc, mask=rmask[:, None] & kmask[None, :])
-        dr_tile = tl.where(cmask[None, :], dr_inter, 0.0)
+        if USE_G:
+            # dr_inter is the grad w.r.t. rt; routing-factor grad = drt·eᵃ, da-piece dart_inter = drt·rt.
+            dr_tile = tl.where(cmask[None, :], dr_inter * ea, 0.0)
+            da = tl.where(cmask[None, :], dr_inter * rt_tile, 0.0)
+            tl.atomic_add(gda_ptr + pid_b * sga_b + rows[:, None] * sga_l + cols[None, :] * sga_c,
+                          da, mask=rmask[:, None] & cmask[None, :])
+        else:
+            dr_tile = tl.where(cmask[None, :], dr_inter, 0.0)
         tl.store(gdr_ptr + pid_b * sg_b + offs_t[:, None] * sg_t + cols[None, :] * sg_c,
                  dr_tile, mask=rmask[:, None] & cmask[None, :])
 
@@ -759,18 +807,23 @@ def _bwd_inter_read_kernel(
 # Must run BEFORE the readout kernel writes dS_read into ds for this chunk (ds is still S_{j+1}'s adjoint).
 @triton.jit
 def _bwd_inter_state_kernel(
-    h_ptr, k_ptr, v_ptr, wr_ptr, ww_ptr, sel_ptr, ds_ptr,
-    dk_ptr, dv_ptr, gdw_ptr, br_ptr, bw_ptr,
+    h_ptr, k_ptr, v_ptr, wr_ptr, ww_ptr, sel_ptr, ld_ptr, sj_ptr, ds_ptr,
+    dk_ptr, dv_ptr, gdw_ptr, gda_ptr, br_ptr, bw_ptr,
     L, d_model, dqk, dv, nc, t_start,
     sh_b, sh_l, sh_d, sq_b, sq_l, sq_d, sv_b, sv_l, sv_d,
     swr_lvl, swr_d, swr_b, sww_lvl, sww_d, sww_b,
-    ssel_lvl, ssel_b, ssel_c, ss_b, ss_c, ss_k, ss_v,
-    sg_b, sg_t, sg_c, sbr_lvl, sbr_b, sbw_lvl, sbw_b,
+    ssel_lvl, ssel_b, ssel_c, sgl_b, sgl_l, sgl_c, ss_b, ss_c, ss_k, ss_v,
+    sg_b, sg_t, sg_c, sga_b, sga_l, sga_c, sbr_lvl, sbr_b, sbw_lvl, sbw_b,
     D: tl.constexpr, b: tl.constexpr, BB: tl.constexpr,
     BT: tl.constexpr, BK: tl.constexpr, BV: tl.constexpr, BD: tl.constexpr,
     BC: tl.constexpr, NCBLK: tl.constexpr, ND: tl.constexpr, NDM: tl.constexpr,
-    HAS_BIAS: tl.constexpr,
+    HAS_BIAS: tl.constexpr, USE_G: tl.constexpr = False,
 ):
+    # USE_G (GLA, #30): the state write uses the DECAYED write gate w_end=w·e^{Λ−a} (Λ=chunk-total ld);
+    # dk/dv flow through w_end; the write routing-factor grad += dw_end·e^{Λ−a} (→ gdw). da-pieces:
+    # −da_wend (=dw_end·w_end), and the chunk-total Λ coupling dlam = e^Λ·Σ(S_j∘ds_in) − Σ_t da_wend
+    # placed on the LAST row of gda. ds_in MUST be the pre-decvec adjoint of S_{j+1} (the driver applies
+    # the e^Λ state-carry decay to ds AFTER this kernel, before the read kernel folds dS_read).
     pid_b = tl.program_id(0)
     ND_V = (dv + BV - 1) // BV       # value-blocks (BV is the value TILE; ND_V==1 ⇒ the un-tiled kernel)
     offs_t = tl.arange(0, BT)
@@ -788,10 +841,19 @@ def _bwd_inter_state_kernel(
                                         ssel_lvl, ssel_b, ssel_c,
                                         br_ptr, bw_ptr, sbr_lvl, sbr_b, sbw_lvl, sbw_b,
                                         D, BT, BB, BC, BD, NDM, HAS_BIAS)
+        if USE_G:
+            ldc = tl.load(ld_ptr + pid_b * sgl_b + rows[:, None] * sgl_l + cols[None, :] * sgl_c,
+                          mask=rmask[:, None] & cmask[None, :], other=0.0)
+            a = tl.cumsum(ldc, axis=0)
+            Lam = tl.sum(tl.where(offs_t[:, None] == (BT - 1), a, 0.0), axis=0)   # [BC] chunk-total
+            wend_tile = w_tile * tl.exp(Lam[None, :] - a)     # decayed write gate
+        else:
+            wend_tile = w_tile
         # dw[BT,BC] sums over dqk → accumulate across BK-feature-blocks; dk[BT,BK] per-block (offs_k); dv
         # [BT,BV] per value-block (offs_v, atomic). N=v·dSᵀ value-contracted → sum over vb; the [BC*BK,BV]
         # dS slice stays bounded by BK·BV. w_tile[BT,BC] / wk[BT,BC*BK] are value-free, reused across vb.
-        dw_inter = tl.zeros([BT, BC], dtype=tl.float32)
+        dw_inter = tl.zeros([BT, BC], dtype=tl.float32)   # grad w.r.t. w_end (USE_G) | w (RLA)
+        ZdZ = tl.zeros([BC], dtype=tl.float32)            # Σ_{k,v}(S_j ∘ ds_in), per state-column
         for d0 in range(ND):
             offs_k = d0 * BK + tl.arange(0, BK)
             kmask = offs_k < dqk
@@ -799,7 +861,7 @@ def _bwd_inter_state_kernel(
                          mask=rmask[:, None] & kmask[None, :], other=0.0)
             ckv = tl.reshape(cols[:, None] * dqk + offs_k[None, :], [BC * BK])
             ckmask = tl.reshape(cmask[:, None] & kmask[None, :], [BC * BK])
-            wk = tl.reshape(w_tile[:, :, None] * kc[:, None, :], [BT, BC * BK])
+            wk = tl.reshape(wend_tile[:, :, None] * kc[:, None, :], [BT, BC * BK])
             N = tl.zeros([BT, BC * BK], dtype=tl.float32)
             for vb in range(ND_V):
                 offs_v = vb * BV + tl.arange(0, BV)
@@ -812,12 +874,27 @@ def _bwd_inter_state_kernel(
                 dv_vb = tl.dot(wk.to(dS_in.dtype), dS_in)
                 tl.atomic_add(dv_ptr + pid_b * sv_b + rows[:, None] * sv_l + offs_v[None, :] * sv_d,
                               dv_vb, mask=rmask[:, None] & vmask[None, :])
+                if USE_G:
+                    # ZdZ_c += Σ_{k,v}(S_j[c,k,v] · ds_in[c,k,v]) — the e^Λ state-carry Λ-grad.
+                    sj = tl.load(sj_ptr + pid_b * ss_b + ckv[:, None] * ss_k + offs_v[None, :] * ss_v,
+                                 mask=ckmask[:, None] & vmask[None, :], other=0.0)
+                    sd = tl.where(ckmask[:, None] & vmask[None, :], sj * dS_in, 0.0)
+                    ZdZ += tl.sum(tl.reshape(tl.sum(sd, axis=1), [BC, BK]), axis=1)
             Nr = tl.reshape(N, [BT, BC, BK])
             dw_inter += tl.sum(Nr * kc[:, None, :], axis=2)
-            dk_acc = tl.sum(Nr * w_tile[:, :, None], axis=1)
+            dk_acc = tl.sum(Nr * wend_tile[:, :, None], axis=1)
             tl.atomic_add(dk_ptr + pid_b * sq_b + rows[:, None] * sq_l + offs_k[None, :] * sq_d,
                           dk_acc, mask=rmask[:, None] & kmask[None, :])
-        dw_tile = tl.where(cmask[None, :], dw_inter, 0.0)
+        if USE_G:
+            # dw_inter is the grad w.r.t. w_end; routing-factor grad = dw_end·e^{Λ−a}; da_wend = −dw_end·w_end.
+            dw_tile = tl.where(cmask[None, :], dw_inter * tl.exp(Lam[None, :] - a), 0.0)
+            da_wend = tl.where(cmask[None, :], -dw_inter * wend_tile, 0.0)
+            dlam = tl.exp(Lam) * ZdZ - tl.sum(da_wend, axis=0)                 # [BC]
+            da = da_wend + tl.where(offs_t[:, None] == (BT - 1), dlam[None, :], 0.0)
+            tl.atomic_add(gda_ptr + pid_b * sga_b + rows[:, None] * sga_l + cols[None, :] * sga_c,
+                          tl.where(cmask[None, :], da, 0.0), mask=rmask[:, None] & cmask[None, :])
+        else:
+            dw_tile = tl.where(cmask[None, :], dw_inter, 0.0)
         tl.store(gdw_ptr + pid_b * sg_b + offs_t[:, None] * sg_t + cols[None, :] * sg_c,
                  dw_tile, mask=rmask[:, None] & cmask[None, :])
 
@@ -895,16 +972,21 @@ def tree_routed_chunked_bwd(h, q, k, v, Wr, Ww, do, states, D, b, chunk=64, b_r=
     dWw = torch.zeros(D, d_model, b, device=q.device, dtype=torch.float32)
     dbr = torch.zeros(D, b, device=q.device, dtype=torch.float32)   # routing-bias grads [D,b] (transient fold)
     dbw = torch.zeros(D, b, device=q.device, dtype=torch.float32)
+    # RLA-only prototype path: ld/gda are unused stubs (USE_G defaults to False in the kernels).
+    ld = q.new_zeros(B, L, nc)
+    gda = q.new_zeros(B, 1, 1)
+    sgl = (ld.stride(0), ld.stride(1), ld.stride(2))
+    sga = (gda.stride(0), gda.stride(1), gda.stride(2))
     common = dict(D=D, b=b, BB=BB, BT=chunk, BK=BK, BV=BV, BD=BD, BC=BC,
                   NCBLK=NCBLK, ND=ND, NDM=NDM, HAS_BIAS=has_bias, num_warps=4, num_stages=1)
     _bwd_intra_kernel[(B, NCH)](
-        h, q, k, v, Wr, Ww, sel, do, dq, dk, dvv, dh, dWr, dWw,
+        h, q, k, v, Wr, Ww, sel, ld, do, dq, dk, dvv, dh, dWr, dWw, gda,
         br, bw, dbr, dbw,
         L, d_model, dqk, dv, nc,
         h.stride(0), h.stride(1), h.stride(2), q.stride(0), q.stride(1), q.stride(2),
         v.stride(0), v.stride(1), v.stride(2),
         Wr.stride(0), Wr.stride(1), Wr.stride(2), Ww.stride(0), Ww.stride(1), Ww.stride(2),
-        sel.stride(0), sel.stride(1), sel.stride(2),
+        sel.stride(0), sel.stride(1), sel.stride(2), *sgl, *sga,
         do.stride(0), do.stride(1), do.stride(2), dh.stride(0), dh.stride(1), dh.stride(2),
         *sbr, *sbw,
         **common)
@@ -920,25 +1002,25 @@ def tree_routed_chunked_bwd(h, q, k, v, Wr, Ww, do, states, D, b, chunk=64, b_r=
         Sj = states[c].contiguous()
         # state-update bwd FIRST: it reads dS = adjoint of S_{j+1} (before readout folds dS_read in).
         _bwd_inter_state_kernel[(B,)](
-            h, k, v, Wr, Ww, sel, dS, dk, dvv, gdw, br, bw,
+            h, k, v, Wr, Ww, sel, ld, Sj, dS, dk, dvv, gdw, gda, br, bw,
             L, d_model, dqk, dv, nc, c * chunk,
             h.stride(0), h.stride(1), h.stride(2), q.stride(0), q.stride(1), q.stride(2),
             v.stride(0), v.stride(1), v.stride(2),
             Wr.stride(0), Wr.stride(1), Wr.stride(2), Ww.stride(0), Ww.stride(1), Ww.stride(2),
-            sel.stride(0), sel.stride(1), sel.stride(2),
+            sel.stride(0), sel.stride(1), sel.stride(2), *sgl,
             dS.stride(0), dS.stride(1), dS.stride(2), dS.stride(3),
-            gdr.stride(0), gdr.stride(1), gdr.stride(2), *sbr, *sbw,
+            gdr.stride(0), gdr.stride(1), gdr.stride(2), *sga, *sbr, *sbw,
             **inter_common)
         # readout bwd: computes dr,dq, then accumulates dS_read into dS (= adjoint of S_j for next iter).
         _bwd_inter_read_kernel[(B,)](
-            h, q, Wr, Ww, sel, Sj, dS, do, dq, gdr, br, bw,
+            h, q, Wr, Ww, sel, ld, Sj, dS, do, dq, gdr, gda, br, bw,
             L, d_model, dqk, dv, nc, c * chunk,
             h.stride(0), h.stride(1), h.stride(2), q.stride(0), q.stride(1), q.stride(2),
             Wr.stride(0), Wr.stride(1), Wr.stride(2), Ww.stride(0), Ww.stride(1), Ww.stride(2),
-            sel.stride(0), sel.stride(1), sel.stride(2),
+            sel.stride(0), sel.stride(1), sel.stride(2), *sgl,
             Sj.stride(0), Sj.stride(1), Sj.stride(2), Sj.stride(3),
             do.stride(0), do.stride(1), do.stride(2),
-            gdr.stride(0), gdr.stride(1), gdr.stride(2), *sbr, *sbw,
+            gdr.stride(0), gdr.stride(1), gdr.stride(2), *sga, *sbr, *sbw,
             **inter_common)
         _fold_kernel[(B,)](
             h, Wr, Ww, sel, gdr, gdw, dh, dWr, dWw, br, bw, dbr, dbw,
