@@ -51,7 +51,7 @@ def _fold_level(dr_tile, dw_tile, r_tile, w_tile, cols, cmask,
                 sh_b, sh_l, sh_d, swr_lvl, swr_d, swr_b, sww_lvl, sww_d, sww_b,
                 ssel_lvl, ssel_b, ssel_c, sdh_b, sdh_l, sdh_d,
                 br_ptr, bw_ptr, sbr_lvl, sbr_b, sbw_lvl, sbw_b, dbr_ptr, dbw_ptr,
-                lvl, D: tl.constexpr, BT: tl.constexpr, BB: tl.constexpr,
+                lvl, BT: tl.constexpr, BB: tl.constexpr,
                 BC: tl.constexpr, BD: tl.constexpr, NDM: tl.constexpr,
                 HAS_BIAS: tl.constexpr):
     # recompute fr,fw for this level (incl. optional bias), fold dr_tile,dw_tile -> dWr,dWw,dh (+db).
@@ -273,7 +273,7 @@ def _bwd_intra_kernel(
                         sh_b, sh_l, sh_d, swr_lvl, swr_d, swr_b, sww_lvl, sww_d, sww_b,
                         ssel_lvl, ssel_b, ssel_c, sdh_b, sdh_l, sdh_d,
                         br_ptr, bw_ptr, sbr_lvl, sbr_b, sbw_lvl, sbw_b, dbr_ptr, dbw_ptr,
-                        lvl, D, BT, BB, BC, BD, NDM, HAS_BIAS)
+                        lvl, BT, BB, BC, BD, NDM, HAS_BIAS)
 
 
 # ============ INTER readout backward (dr, dq from o_inter; accumulates dS_read into ds) ============
@@ -501,4 +501,4 @@ def _fold_kernel(
                         sh_b, sh_l, sh_d, swr_lvl, swr_d, swr_b, sww_lvl, sww_d, sww_b,
                         ssel_lvl, ssel_b, ssel_c, sdh_b, sdh_l, sdh_d,
                         br_ptr, bw_ptr, sbr_lvl, sbr_b, sbw_lvl, sbw_b, dbr_ptr, dbw_ptr,
-                        lvl, D, BT, BB, BC, BD, NDM, HAS_BIAS)
+                        lvl, BT, BB, BC, BD, NDM, HAS_BIAS)

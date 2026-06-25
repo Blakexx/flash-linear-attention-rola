@@ -690,14 +690,15 @@ def _kap(q, norm):
             if norm == 'kappa' else None)
 
 
-@pytest.mark.parametrize('norm', ['global', 'kappa', 'per_state'])
+@pytest.mark.parametrize('norm', ['raw', 'global', 'kappa', 'per_state'])
 @pytest.mark.parametrize('gla', [False, True])
 def test_recurrent_handoff(gla, norm):
     """fused_recurrent_rola readout == chunk_rola readout, and chunk_rola(output_final_state) emits the
     SAME state fused_recurrent_rola does -> a chunked prefill hands off to recurrent decode. The two
     paths use different reduction orders (chunked grams vs single-token scan), so this is rate-consistent
     to ~5e-3 (the assert tol), NOT bit-exact: the handoff preserves the decay/normalization rate, not the
-    last bit."""
+    last bit. 'raw' (the shipping gla-scalar default) is the un-normalized numerator readout: its
+    handoff state is [*,K,V] (NO +1 den column), exercised on BOTH RLA (gla=False) and GLA (gla=True)."""
     if device != 'cuda':
         pytest.skip('RoLA Triton kernels require CUDA')
     nc, dv, L, tol = 8, 16, 64, 5e-3

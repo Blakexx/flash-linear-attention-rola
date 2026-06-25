@@ -47,41 +47,50 @@ def _rola_decode_kernel(
     sk_b, sk_t, skap_b, skap_t,
     ss_b, ss_c, ss_k, ss_v, so_b, so_t, so_v,
     BK: tl.constexpr, BV: tl.constexpr, BC: tl.constexpr, NCB: tl.constexpr,
-    NORM: tl.constexpr, USE_G: tl.constexpr, USE_KAPPA: tl.constexpr):
+    NORM: tl.constexpr, USE_DEN: tl.constexpr, USE_G: tl.constexpr, USE_KAPPA: tl.constexpr):
     """One program per (batch, REAL head) — grid (B*H,). Steps T tokens; for each token streams the
     carried Kronecker state in nc-blocks (BC states × full feature/value tile), reading the SHARED q
-    ONCE and folding the read gate + normalization inline. The per-state denominator rides in the
-    `dv` (ones) column of the [dv+1]-wide value tile, so it decays/updates/reads alongside the value
-    state in ONE pass (no separate den loop, no double-write). NORM: 0 global / 1 per_state / 2 kappa.
-    The state buffer s_ptr is `[BH, nc, dqk, dv+1]` — handoff-compatible with chunk_rola's
-    [N, H*nc, K, V+1] (last value col = the per-state denominator), mutated in place across tokens."""
+    ONCE and folding the read gate + normalization inline. NORM: 0 global / 1 per_state / 2 kappa /
+    3 raw.
+
+    For the NORMALIZED reads (USE_DEN=True; global/per_state/kappa) the per-state denominator rides in
+    the `dv` (ones) column of the [dv+1]-wide value tile, so it decays/updates/reads alongside the
+    value state in ONE pass (no separate den loop, no double-write); the state buffer is `[BH, nc, dqk,
+    dv+1]` (last value col = the per-state denominator). For RAW (USE_DEN=False) the readout is
+    un-normalized — there is NO per-state denominator at all, so the `+1` ones-column is ENTIRELY
+    ABSENT: the value tile is `[dv]`, the state buffer is `[BH, nc, dqk, dv]`, the read gate is applied
+    raw (rt=b_r, no rescale) and the final divide is skipped (o = num directly). Both layouts are
+    handoff-compatible with chunk_rola's `output_final_state` ([N, H*nc, K, V+1] normalized;
+    [N, H*nc, K, V] raw), mutated in place across tokens."""
     bh = tl.program_id(0)
     offs_k = tl.arange(0, BK)
     kmask = offs_k < dqk
     offs_c = tl.arange(0, BC)
-    offs_v = tl.arange(0, BV)                          # full [dv+1] value tile (den rides in col dv)
+    offs_v = tl.arange(0, BV)                          # value tile: [dv+1] (den in col dv) | [dv] (raw)
     vmask = offs_v < dv
-    dmask = offs_v == dv                               # the ones-column (per-state denominator)
-    vsmask = offs_v < (dv + 1)                         # value cols AND the den col
+    dmask = offs_v == dv                               # the ones-column (per-state denominator); raw: none
+    # cols spanned by the streamed state slice: value cols + den col (normalized) or just value (raw).
+    vsmask = offs_v < (dv + 1) if USE_DEN else vmask
     for t in range(T):
         # SHARED query/key — loaded ONCE per token, reused across every state (never replicated).
         b_q = tl.load(q_ptr + bh * sq_b + t * sq_t + offs_k * sq_d, mask=kmask, other=0.0).to(tl.float32) * scale
         b_k = tl.load(k_ptr + bh * sq_b + t * sq_t + offs_k * sq_d, mask=kmask, other=0.0).to(tl.float32)
-        # value augmented with the ones-column at index dv (carries the per-state denominator).
         b_v = tl.load(v_ptr + bh * sv_b + t * sv_t + offs_v * sv_d, mask=vmask, other=0.0).to(tl.float32)
-        b_v = tl.where(dmask, 1.0, b_v)                # [BV]; v at cols<dv, 1 at col dv, 0 beyond
+        if USE_DEN:
+            # value augmented with the ones-column at index dv (carries the per-state denominator).
+            b_v = tl.where(dmask, 1.0, b_v)            # [BV]; v at cols<dv, 1 at col dv, 0 beyond
         if USE_KAPPA:
             kap = tl.load(kap_ptr + bh * skap_b + t * skap_t).to(tl.float32)
         else:
             kap = 1.0
-        num = tl.zeros([BV], dtype=tl.float32)         # Σ_c r̃ᶜ (q·Sᶜ) over the [dv+1] tile (den in col dv)
-        den = 0.0                                      # Σ_c r̃ᶜ dᶜ
+        num = tl.zeros([BV], dtype=tl.float32)         # Σ_c r̃ᶜ (q·Sᶜ) over the value tile (den in col dv if USE_DEN)
+        den = 0.0                                      # Σ_c r̃ᶜ dᶜ (USE_DEN only)
         for cb in range(NCB):
             cols_c = cb * BC + offs_c
             cmask = cols_c < nc
             b_r = tl.load(r_ptr + bh * sg_b + t * sg_t + cols_c * sg_c, mask=cmask, other=0.0).to(tl.float32)
             b_w = tl.load(w_ptr + bh * sg_b + t * sg_t + cols_c * sg_c, mask=cmask, other=0.0).to(tl.float32)
-            # state slice S[BC, BK, BV] flattened to [BC*BK, BV] (BV spans the [dv+1] value+den tile).
+            # state slice S[BC, BK, BV] flattened to [BC*BK, BV] (BV spans value(+den) per USE_DEN).
             ckv = tl.reshape(cols_c[:, None] * dqk + offs_k[None, :], [BC * BK])              # [BC*BK]
             ckmask = tl.reshape(cmask[:, None] & kmask[None, :], [BC * BK])
             s_base = s_ptr + bh * ss_b
@@ -93,14 +102,13 @@ def _rola_decode_kernel(
                 dec = tl.reshape(tl.broadcast_to(tl.exp(b_g)[:, None], [BC, BK]), [BC * BK])  # [BC*BK]
                 b_s = b_s * dec[:, None]
             wk = tl.reshape(wk2, [BC * BK])                                                   # [BC*BK]
-            # write current token: Sᶜ += w^c k ⊗ [v;1]  (the ones-col gives the +w^c k den update)
+            # write current token: Sᶜ += w^c k ⊗ [v;1]  (the ones-col gives the +w^c k den update; raw: ⊗ v)
             b_s = b_s + wk[:, None] * b_v[None, :]
             tl.store(s_base + ckv[:, None] * ss_k + offs_v[None, :] * ss_v, b_s,
                      mask=ckmask[:, None] & vsmask[None, :])
-            # SHARED read: P^c = q · Sᶜ → [BC, BV] per-state readout (col dv is the per-state den dᶜ).
+            # SHARED read: P^c = q · Sᶜ → [BC, BV] per-state readout (col dv is the per-state den dᶜ if USE_DEN).
             qk = tl.reshape(tl.broadcast_to(b_q[None, :], [BC, BK]), [BC * BK])               # [BC*BK]
             p = tl.sum(tl.reshape(qk[:, None] * b_s, [BC, BK, BV]), axis=1)                   # [BC, BV]
-            p_den = tl.sum(tl.where(dmask[None, :], p, 0.0), axis=1)                          # [BC] per-state den
             # rescale the read gate per the norm, inline. The per-state den d^c is the canonical RAW
             # SIGNED mass Σ_{j≤t} w_j^c (φq·φk) — matching `_kappa_rescale` (chunk), `chunk_rola` torch,
             # and the naive oracle. The rescale r̃=r/(d+ε) | r·(d+ε)^{−κ} is only well-defined for d>0
@@ -109,29 +117,38 @@ def _rola_decode_kernel(
             # tl.abs() d here: an abs would SILENTLY rewrite the normalizer for signed d, making decode
             # disagree with chunk/routed/oracle (all raw-signed). With raw d, every path behaves
             # identically (matched for d>0; identically ill-posed for signed d — loud, not divergent).
+            # RAW (NORM==3): no per-state den exists; apply the read gate directly (rt=b_r) and emit the
+            # un-normalized numerator Σ_c r^c (q·Sᶜ) — the final divide is skipped below.
+            if USE_DEN:
+                p_den = tl.sum(tl.where(dmask[None, :], p, 0.0), axis=1)                      # [BC] per-state den
+            else:
+                p_den = tl.zeros([BC], dtype=tl.float32)
             if NORM == 1:                                                                    # per_state
                 rt = b_r / (p_den + eps)
             elif NORM == 2:                                                                  # kappa
                 rt = b_r * tl.exp(-kap * tl.log(p_den + eps))
-            else:                                                                            # global
+            else:                                                                            # global | raw
                 rt = b_r
             rt = tl.where(cmask, rt, 0.0)
             num += tl.sum(p * rt[:, None], axis=0)
             den += tl.sum(p_den * rt)
-        o = num / (den + eps)
+        o = num / (den + eps) if USE_DEN else num
         tl.store(o_ptr + bh * so_b + t * so_t + offs_v * so_v, o, mask=vmask)
 
 
 def _decode_triton(q, k, v, r, w, g, kappa, norm, scale, eps, initial_state, output_final_state):
     """Bespoke fused decode. q,k:[BH,T,K] v:[BH,T,V] r,w:[BH,T,nc] g:[BH,T,nc]|None
-    kappa:[BH,T,1]|None. State `[BH, nc, K, V+1]` carried in HBM (initial_state seeds it; mutated in
-    place across tokens). Returns (o[BH,T,V], state|None)."""
+    kappa:[BH,T,1]|None. State `[BH, nc, K, V+1]` (normalized norms) or `[BH, nc, K, V]` (raw — no den
+    column) carried in HBM (initial_state seeds it; mutated in place across tokens). Returns
+    (o[BH,T,V], state|None)."""
     BH, T, dqk = q.shape
     dv = v.shape[-1]
     nc = r.shape[-1]
-    norm_id = {'global': 0, 'per_state': 1, 'kappa': 2}[norm]
+    norm_id = {'global': 0, 'per_state': 1, 'kappa': 2, 'raw': 3}[norm]
+    use_den = norm != 'raw'                            # raw carries NO per-state denominator (no +1 col)
+    den_w = 1 if use_den else 0                        # extra value col for the per-state den (0 for raw)
     BK = max(16, triton.next_power_of_2(dqk))
-    BV = max(16, triton.next_power_of_2(dv + 1))      # full value tile INCLUDING the den (ones) column
+    BV = max(16, triton.next_power_of_2(dv + den_w))   # value tile (+ den ones-column for normalized norms)
     # state-block width: bound the resident [BC*BK, BV] register tile (~8K fp32 elems) so big dv/dqk
     # still fit — fewer states/program for fat value tiles. BC=8 measured best (smaller blocks = more
     # state-block loop iters but a lighter per-iter register tile; HBM-streaming-bound either way).
@@ -142,11 +159,12 @@ def _decode_triton(q, k, v, r, w, g, kappa, norm, scale, eps, initial_state, out
     q, k, v, r, w = (x.contiguous() for x in (q, k, v, r, w))
     g = g.contiguous() if g is not None else None
     kappa = kappa.contiguous() if kappa is not None else None
-    # State buffer [BH, nc, dqk, dv+1] (fp32). Seed from initial_state ([BH, nc, K, V+1]); else zeros.
+    # State buffer [BH, nc, dqk, dv(+1)] (fp32). normalized: +1 den ones-column; raw: NONE (bare [*,K,V]).
+    # Seed from initial_state ([BH, nc, K, V(+1)]); else zeros.
     if initial_state is not None:
         S = initial_state.float().contiguous().clone()
     else:
-        S = torch.zeros(BH, nc, dqk, dv + 1, device=q.device, dtype=torch.float32)
+        S = torch.zeros(BH, nc, dqk, dv + den_w, device=q.device, dtype=torch.float32)
     o = torch.empty(BH, T, dv, device=q.device, dtype=torch.float32)
     # dummy ptrs for the optional inputs (triton needs a valid base even when unused).
     g_in = g if g is not None else q
@@ -160,9 +178,9 @@ def _decode_triton(q, k, v, r, w, g, kappa, norm, scale, eps, initial_state, out
         k.stride(0), k.stride(1), *skap,
         S.stride(0), S.stride(1), S.stride(2), S.stride(3), o.stride(0), o.stride(1), o.stride(2),
         BK=BK, BV=BV, BC=BC, NCB=NCB,
-        NORM=norm_id, USE_G=g is not None, USE_KAPPA=kappa is not None,
+        NORM=norm_id, USE_DEN=use_den, USE_G=g is not None, USE_KAPPA=kappa is not None,
         num_warps=nw, num_stages=ns)
-    final_state = S.view(q.shape[0], nc, dqk, dv + 1) if output_final_state else None
+    final_state = S.view(q.shape[0], nc, dqk, dv + den_w) if output_final_state else None
     return o, final_state
 
 
@@ -187,12 +205,14 @@ def fused_recurrent_rola(
 
     Mirrors `chunk_rola`'s routed signature, plus the recurrent triad `initial_state` /
     `output_final_state` / `cu_seqlens`. `q`/`k` are the feature-mapped queries/keys (as for
-    `chunk_rola`). `norm` ∈ {'global','per_state','kappa'}; 'kappa' rescales the read gate by
+    `chunk_rola`). `norm` ∈ {'raw','global','per_state','kappa'}; 'kappa' rescales the read gate by
     `(dᶜ+eps)^{−κ}` per token (RAW signed den — the canonical convention; well-defined for d>0, which
-    the production elu+1 layer guarantees). Returns `(o, final_state)`; `final_state` is `[N, H*nc, K, V+1]`
-    Kronecker state (the per-state denominator carried in the `+1` column) when `output_final_state`
-    else `None`, layout-compatible with `chunk_rola(output_final_state=True)` so a chunked prefill
-    hands off to this decode path.
+    the production elu+1 layer guarantees); 'raw' emits the un-normalized numerator Σ_c r^c (q·Sᶜ)
+    directly (no read-gate rescale, no divide). Returns `(o, final_state)`; `final_state` is the
+    `[N, H*nc, K, V+1]` Kronecker state (the per-state denominator carried in the `+1` column) for the
+    normalized norms, or `[N, H*nc, K, V]` (NO den column) for 'raw', when `output_final_state` else
+    `None`, layout-compatible with `chunk_rola(output_final_state=True)` so a chunked prefill hands off
+    to this decode path.
     """
     B, T, H, K = q.shape
     nc = r.shape[-1]
@@ -217,12 +237,14 @@ def fused_recurrent_rola(
         gf = _floor_ld(gf)
     # kappa is [B,T,H,1] -> [BH,T,1].
     kapf = fold(kappa) if (norm == 'kappa' and kappa is not None) else None
-    # initial_state arrives as [N, H*nc, K, V+1] (== [B, H*nc, K, V+1]); view to [BH, nc, K, V+1].
-    init = initial_state.view(B * H, nc, K, dv + 1) if initial_state is not None else None
+    # State width: normalized norms carry the +1 per-state den column; raw carries NONE ([*,K,V]).
+    den_w = 0 if norm == 'raw' else 1
+    # initial_state arrives as [N, H*nc, K, V(+1)] (== [B, H*nc, K, V(+1)]); view to [BH, nc, K, V(+1)].
+    init = initial_state.view(B * H, nc, K, dv + den_w) if initial_state is not None else None
 
     o, state = _decode_triton(qf, kf, vf, rf, wf, gf, kapf, norm, float(scale), eps,
                               init, output_final_state)
     o = o.view(B, H, T, dv).permute(0, 2, 1, 3).contiguous().to(v.dtype)        # [B,T,H,V]
     if state is not None:
-        state = state.view(B, H * nc, K, dv + 1)
+        state = state.view(B, H * nc, K, dv + den_w)
     return o, state
