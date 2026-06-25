@@ -2,10 +2,10 @@
 
 """rola_instance — named RoLA preset → fla_rola.layers.RoLA kwargs.
 
-Initial-launch scope: only the FUSED, elu-feature-map kernels that route through the shared-Gram
-chunk_rola op — the `rla` family (global / per_state / kappa norm) and the scalar-gated `gla_scalar`
-family. The alternative feature maps (hedgehog / based / rebased) and the non-fused virtual-head GLA /
-routed-delta variants are not supported.
+Initial-launch scope: only the FUSED, elu-feature-map kernels that route through the in-kernel
+tree-routed `chunk_rola_routed` op — the `rla` family (global / per_state / kappa norm) and the
+scalar-gated `gla_scalar` family. The alternative feature maps (hedgehog / based / rebased) and the
+non-fused virtual-head GLA / routed-delta variants are not supported.
 """
 
 ROLA_INSTANCES = (

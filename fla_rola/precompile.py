@@ -56,15 +56,21 @@ from dataclasses import dataclass, field
 # The autotuned kernels we warm, by entrypoint path. These are the attribute names of the
 # Autotuner objects on ``fla_rola.ops.rola.chunk``. (Used for reporting / validation; the
 # capture hook discovers whatever actually fires, so this list need not be exhaustive.)
+#
+# We warm the PRODUCTION path — ``chunk_rola_routed`` (the in-kernel tree-routed forward the RoLA
+# layer runs for training/prefill since #39 phase 2). The ONLY autotuned kernels in that path are the
+# routed numerator-readout forward `_rola_routed_fwd_intra/_inter` (the codegen wall the warmer exists
+# to amortize). They are RLA/GLA-shared (one `@triton.jit`, `USE_G` constexpr split by `_SCAN_KEY`), so
+# both paths name the same two kernels; the GLA capture drives them with `USE_G=True` (a distinct
+# autotune key → its own configs). The routed BACKWARD (`routed_bwd_kernels`) and the fused
+# kappa/per_state kernels are NON-autotuned (fixed warps/stages), so there is no codegen to warm there;
+# decode (`fused_recurrent_rola`) is non-autotuned too. The warmer drives `norm='raw'` — the norm whose
+# readout is the autotuned numerator path (kappa/per_state route through the non-autotuned fused den).
 RLA_KERNELS = (
-    "_rola_fwd_intra", "_rola_fwd_inter", "_scan_S", "_scan_dS",
-    "_par_grad_rla_qr", "_par_grad_rla_kwv",
-    "_den_fwd_intra", "_den_fwd_inter", "_den_bwd_scan", "_den_grad",
+    "_rola_routed_fwd_intra", "_rola_routed_fwd_inter",
 )
 GLA_KERNELS = (
-    "_rola_gla_fwd_intra", "_rola_gla_fwd_inter", "_scan_S", "_scan_dS",
-    "_par_grad_gla_qr", "_par_grad_gla_kwv",
-    "_den_fwd_intra", "_den_fwd_inter", "_den_gla_bwd_scan", "_den_gla_grad",
+    "_rola_routed_fwd_intra", "_rola_routed_fwd_inter",
 )
 
 # meta keys that are launch-controls, NOT kernel constexprs — dropped before merging a
@@ -117,24 +123,31 @@ class _Captured:
 
 
 def _make_inputs(spec: ShapeSpec, device="cuda", dtype=None):
-    """Small real inputs (B=H=1) for the capture fwd+bwd at this shape's dqk/dv/nc."""
+    """Small real inputs (B=H=1) for the capture fwd+bwd at this shape's dqk/dv/nc, for the PRODUCTION
+    tree-routed op `chunk_rola_routed`. Flat routing (D=1, b=nc): the in-kernel router takes the hidden
+    state `h` + per-head router weights `Wr,Ww:[H,D,d_model,b]`; GLA adds the per-head decay weight
+    `Wg:[H,d_model]` (the autotuned `_rola_routed_fwd_*` split on `USE_G` via `_SCAN_KEY`)."""
     import torch
     if dtype is None:
         dtype = torch.bfloat16
     B, H, T = 1, 1, spec.T
+    D, b = 1, spec.nc                          # flat routing: one level, b=nc leaves
+    d_model = max(8, spec.nc)                  # per-head router input width (kept small, shape-agnostic)
     g = torch.Generator(device=device).manual_seed(0)
 
     def mk(last):
         return torch.randn(B, T, H, last, device=device, dtype=dtype,
                            generator=g, requires_grad=True)
     q, k, v = mk(spec.dqk), mk(spec.dqk), mk(spec.dv)
-    r, w = mk(spec.nc), mk(spec.nc)
+    h = mk(d_model)
+    Wr = (torch.randn(H, D, d_model, b, device=device, dtype=dtype, generator=g) * 0.4).requires_grad_()
+    Ww = (torch.randn(H, D, d_model, b, device=device, dtype=dtype, generator=g) * 0.4).requires_grad_()
     kappa = torch.rand(B, T, H, 1, device=device, dtype=dtype, generator=g)
-    out = dict(q=q, k=k, v=v, r=r, w=w, kappa=kappa)
+    out = dict(q=q, k=k, v=v, h=h, Wr=Wr, Ww=Ww, D=D, b=b, kappa=kappa)
     if spec.path == "gla":
-        # decay within the fp32-safe floor (see chunk._GLA_FLOOR); small negative logs.
-        out["g"] = (-torch.rand(B, T, H, spec.nc, device=device, dtype=torch.float32,
-                                generator=g) * 0.5).clamp(min=-2.0)
+        # per-head decay weight Wg:[H,d_model] (kept fp32 — the in-kernel decay exp is precision-sensitive).
+        out["Wg"] = (torch.randn(H, d_model, device=device, dtype=torch.float32, generator=g) * 0.4
+                     ).requires_grad_()
     return out
 
 
@@ -145,17 +158,17 @@ def capture_shape(spec: ShapeSpec) -> dict:
     This is the only GPU-touching step; it runs once per shape and is cheap relative to the
     codegen it enables to be parallelized.
 
-    COVERAGE: the capture drives ``chunk_rola`` — the LAYER / production path (the RoLA layer
-    runs ``chunk_rola`` for training/prefill), so its autotuned RLA/GLA fwd+bwd kernels are
-    warmed. It does NOT yet warm the tree-routed training kernels (``chunk_rola_routed`` — the
-    in-kernel router-grad fold) nor the non-autotuned ``fused_recurrent_rola`` decode kernel
-    (decode has fixed launch params, so there is no autotuner codegen wall to amortize). Extend
-    the capture to also drive ``chunk_rola_routed`` once #39 wires the fused routed path into the
-    layer."""
+    COVERAGE: the capture drives ``chunk_rola_routed`` — the LAYER / production path (since #39 phase 2
+    the RoLA layer runs the in-kernel tree-routed forward for training/prefill), so its autotuned routed
+    forward kernels (`_rola_routed_fwd_intra/_inter`, the only autotuned kernels in that path) are warmed.
+    It does NOT warm the non-autotuned ``fused_recurrent_rola`` decode kernel nor the fused kappa/per_state
+    kernels (fixed launch params → no autotuner codegen wall to amortize). The capture uses ``norm='raw'``:
+    that is the norm whose readout is the autotuned numerator path; kappa/per_state route through the
+    non-autotuned fused den."""
     import torch
     import triton.runtime.jit as jitmod
 
-    from fla_rola.ops.rola.chunk import chunk_rola
+    from fla_rola.ops.rola.chunk import chunk_rola_routed
 
     spec = ShapeSpec.coerce(spec)
     if not torch.cuda.is_available():
@@ -181,10 +194,13 @@ def capture_shape(spec: ShapeSpec) -> dict:
     jitmod.JITFunction.run = patched_run
     try:
         ins = _make_inputs(spec)
-        kw = dict(norm=spec.norm, kappa=ins["kappa"])
-        if "g" in ins:
-            kw["g"] = ins["g"]
-        out = chunk_rola(ins["q"], ins["k"], ins["v"], ins["r"], ins["w"], **kw)
+        # norm='raw' fires the autotuned routed numerator forward (`_rola_routed_fwd_intra/_inter`);
+        # kappa/per_state route through the non-autotuned fused den (no codegen wall to warm).
+        kw = dict(norm="raw")
+        if "Wg" in ins:
+            kw["Wg"] = ins["Wg"]
+        out = chunk_rola_routed(ins["q"], ins["k"], ins["v"], ins["h"], ins["Wr"], ins["Ww"],
+                                ins["D"], ins["b"], **kw)
         out.sum().backward()
         torch.cuda.synchronize()
     finally:

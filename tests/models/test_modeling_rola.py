@@ -10,8 +10,8 @@ from fla_rola.utils import assert_close, device
 @pytest.mark.parametrize('rola_instance', ['rola-rla-kappa-asym', 'rola-gla-kappa-asym'])
 def test_generation(rola_instance):
     """Generation == forward: a chunked prefill hands its recurrent state to token-by-token recurrent
-    decode (KV-cache) and reproduces the full teacher-forced forward. No padding — `chunk_rola` is
-    fixed-length; the varlen/unpad path lands with `chunk_rola` cu_seqlens support (follow-up)."""
+    decode (KV-cache) and reproduces the full teacher-forced forward. No padding — `chunk_rola_routed` is
+    fixed-length; the varlen/unpad path lands with `chunk_rola_routed` cu_seqlens support (follow-up)."""
     if device != 'cuda':
         pytest.skip('RoLA Triton kernels require CUDA')
     torch.manual_seed(42)

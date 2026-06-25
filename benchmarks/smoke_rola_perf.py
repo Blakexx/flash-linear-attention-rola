@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Quick perf smoke for the routed RoLA op (chunk_rola) — a fast LOCAL signal, NOT a benchmark and
-NOT a correctness check (use tests/ops/test_rola.py for correctness).
+"""Quick perf smoke for the production tree-routed RoLA op (chunk_rola_routed) — a fast LOCAL signal,
+NOT a benchmark and NOT a correctness check (use tests/ops/test_rola.py for correctness).
 
 Times fwd and fwd+bwd (CUDA events, warmup, median) for RLA/GLA × {global, kappa} at a representative
 shape, in the training dtype (bf16). Run on an idle GPU:  python -u benchmarks/smoke_rola_perf.py
@@ -9,7 +9,7 @@ import sys
 
 import torch
 
-from fla_rola.ops.rola import chunk_rola
+from fla_rola.ops.rola import chunk_rola_routed
 
 DEV = "cuda"
 
@@ -48,20 +48,22 @@ def main():
     def rb(*s):
         return torch.randn(*s, generator=g, device=DEV, dtype=torch.bfloat16)
 
+    D, b = 1, nc                       # flat routing (D=1, b=nc) — the in-kernel router takes h + Wr/Ww
+    dm = H * dv                        # a representative hidden width
     for gla in (False, True):
         q = (torch.nn.functional.elu(rb(B, L, H, K)) + 1).requires_grad_()
         k = (torch.nn.functional.elu(rb(B, L, H, K)) + 1).requires_grad_()
         v = rb(B, L, H, dv).requires_grad_()
-        r = torch.softmax(rb(B, L, H, nc).float(), -1).bfloat16().requires_grad_()
-        w = torch.softmax(rb(B, L, H, nc).float(), -1).bfloat16().requires_grad_()
-        ld = (torch.log(torch.sigmoid(rb(B, L, H, nc).float())).clamp(min=-2.5).bfloat16().requires_grad_()
-              if gla else None)
+        h = rb(B, L, H, dm).requires_grad_()
+        Wr = (rb(H, D, dm, b) * 0.4).requires_grad_()
+        Ww = (rb(H, D, dm, b) * 0.4).requires_grad_()
+        Wg = (rb(H, dm).float() * 0.4).requires_grad_() if gla else None
         kap = torch.full((B, L, H, 1), 0.5, device=DEV, dtype=torch.bfloat16)
-        leaves = [x for x in (q, k, v, r, w, ld) if x is not None]
+        leaves = [x for x in (q, k, v, h, Wr, Ww, Wg) if x is not None]
         for norm in ("global", "kappa"):
             def fn(norm=norm):
-                return chunk_rola(q, k, v, r=r, w=w, g=ld, norm=norm,
-                                  kappa=kap if norm == "kappa" else None, scale=1.0)
+                return chunk_rola_routed(q, k, v, h, Wr, Ww, D, b, norm=norm,
+                                         kappa=kap if norm == "kappa" else None, scale=1.0, Wg=Wg)
             fwd = _median_ms(fn, leaves, bwd=False)
             fb = _median_ms(fn, leaves, bwd=True)
             print(f"  {'GLA' if gla else 'RLA'}/{norm:7s}  fwd={fwd:.2f}ms  fwd+bwd={fb:.2f}ms")

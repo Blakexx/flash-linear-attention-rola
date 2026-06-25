@@ -18,7 +18,9 @@ NEVER materialized. The layer projects, applies φ, and dispatches one weights-i
               -> fused_recurrent_rola(qf,kf,v, r,w,g, norm, kappa)
       -> o_proj
 
-flat (D=1, b=nc) is the strict equivalent of the old dense Linear(hidden, H*nc) softmax router.
+flat (D=1, b=nc) is the strict equivalent of the old dense Linear(hidden, H*nc) softmax router (weight
+init + math identical; the sole exception is the off-default router_bias=True bias-init — zeros, a
+uniform-prior start, vs the old Linear's random bias — see `_init_factor_router`).
 
 Two inner kernels (both route through the in-kernel routed readout, the paper-shipping cells):
   * 'rla'        : un-decayed (Wg=None). Feature map φ ∈ {elu, hedgehog, based, rebased}.
@@ -156,7 +158,7 @@ class RoLA(nn.Module):
         self.conv_size = conv_size
         self.layer_idx = layer_idx
 
-        # Feature map is elu+1 only (the fused chunk_rola path): proj_qk == feat_dim == head_k_dim.
+        # Feature map is elu+1 only (the fused chunk_rola_routed path): proj_qk == feat_dim == head_k_dim.
         self.proj_qk = head_k_dim
         self.feat_dim = head_k_dim
 
@@ -188,9 +190,14 @@ class RoLA(nn.Module):
         # PER-HEAD per-level factor routers on the residual stream. RoLA routes per head: each head h
         # owns its OWN tree weights Wr/Ww ∈ [H, D, hidden, b] (b**D == nc), and the leaf gate is the
         # product over levels of softmax(h·W[head,lvl] + bias). 'flat' (D=1, b=nc) is the strict
-        # equivalent of the old dense Linear(hidden, H*nc) router: W[head,0] == old per-head weight^T.
-        # The factor weights live as plain nn.Parameters (NOT nn.Linear) so the per-head/per-level
-        # structure is explicit and the in-kernel routed op consumes them directly. tie_routers keeps
+        # equivalent of the old dense Linear(hidden, H*nc) router: W[head,0] == old per-head weight^T —
+        # with ONE deliberate exception on the off-default `router_bias=True` path: the factor bias inits
+        # to ZEROS (write_b/read_b below) rather than the old Linear's random uniform(±1/√fan_in) bias, a
+        # uniform-prior start for the softmax router (no a-priori state preference). router_bias=False (the
+        # default, biasless) is bit-for-bit the old router; the zeros-vs-random bias is the only gap, and
+        # only when the bias is enabled. The factor weights live as plain nn.Parameters (NOT nn.Linear) so
+        # the per-head/per-level structure is explicit and the in-kernel routed op consumes them directly.
+        # tie_routers keeps
         # read_W=None (reuse write_W) — registering a second tensor aliasing the same weight crashes HF
         # safetensors save.
         D, b = self.route_D, self.route_b
@@ -231,8 +238,11 @@ class RoLA(nn.Module):
         2-D [out, in] = [H*D*b, hidden] tensor — 2-D is essential: kaiming_uniform infers fan_in from a
         2-D weight as dim 1 (== hidden), whereas a 3-D [*, b, hidden] tensor would treat b as input
         feature-maps and inflate fan_in to b·hidden (bound √b too small). Reshape/transpose into
-        [H,D,hidden,b]. flat (b=nc) thus reproduces the old dense nn.Linear(hidden, H*nc) init
-        distribution exactly (std ≈ same; verified by the fresh-init parity test)."""
+        [H,D,hidden,b]. flat (b=nc) thus reproduces the old dense nn.Linear(hidden, H*nc) WEIGHT init
+        distribution exactly (std ≈ same; verified by the fresh-init parity test). NOTE the BIAS is the
+        one exception to the "strict equivalent": when `router_bias=True` the factor bias inits to ZEROS
+        (a deliberate uniform-prior start for the softmax router), NOT the old Linear's random
+        uniform(±1/√fan_in) bias. The default `router_bias=False` is biasless → fully equivalent."""
         H, D, hidden, b = W.shape
         wt = torch.empty(H * D * b, hidden)       # 2-D [out=H*D*b, in=hidden] -> kaiming fan_in == hidden
         nn.init.kaiming_uniform_(wt, a=5 ** 0.5)
