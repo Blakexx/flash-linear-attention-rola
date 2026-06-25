@@ -103,11 +103,18 @@ def _rola_decode_kernel(
             qk = tl.reshape(tl.broadcast_to(b_q[None, :], [BC, BK]), [BC * BK])               # [BC*BK]
             p = tl.sum(tl.reshape(qk[:, None] * b_s, [BC, BK, BV]), axis=1)                   # [BC, BV]
             p_den = tl.sum(tl.where(dmask[None, :], p, 0.0), axis=1)                          # [BC] per-state den
-            # rescale the read gate per the norm, inline.
+            # rescale the read gate per the norm, inline. The per-state den d^c is the canonical RAW
+            # SIGNED mass Σ_{j≤t} w_j^c (φq·φk) — matching `_kappa_rescale` (chunk), `chunk_rola` torch,
+            # and the naive oracle. The rescale r̃=r/(d+ε) | r·(d+ε)^{−κ} is only well-defined for d>0
+            # (the kappa pow / per_state divide of a signed d is ill-posed). PRODUCTION GUARANTEES d≥0:
+            # the layer is elu+1-only (φ>0) with softmax write gates (w≥0) ⇒ d≥0 structurally. We do NOT
+            # tl.abs() d here: an abs would SILENTLY rewrite the normalizer for signed d, making decode
+            # disagree with chunk/routed/oracle (all raw-signed). With raw d, every path behaves
+            # identically (matched for d>0; identically ill-posed for signed d — loud, not divergent).
             if NORM == 1:                                                                    # per_state
-                rt = b_r / (tl.abs(p_den) + eps)
+                rt = b_r / (p_den + eps)
             elif NORM == 2:                                                                  # kappa
-                rt = b_r * tl.exp(-kap * tl.log(tl.abs(p_den) + eps))
+                rt = b_r * tl.exp(-kap * tl.log(p_den + eps))
             else:                                                                            # global
                 rt = b_r
             rt = tl.where(cmask, rt, 0.0)

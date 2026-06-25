@@ -108,10 +108,13 @@ def _vh_combine(o_aug, r, nc, norm, dv):
     Bq, L = o_aug.shape[0], o_aug.shape[1]
     o = o_aug.view(Bq, L, _H, nc, dv + 1)
     num, den = o[..., :dv], o[..., dv]
+    # RAW signed den (the canonical convention: chunk `_kappa_rescale`, decode, `chunk_rola` torch, and
+    # the naive oracle all use raw (d+ε)). Tests run positive features (q,k=.abs(), softmax w ⇒ d>0), so
+    # raw == |d|; the rescale r̃=r·(d+ε)^{−κ} | r/(d+ε) is only well-defined for d>0 (production = elu+1).
     if norm == 'kappa':
-        r = r * (den.abs() + EPS).pow(-KAPPA)
+        r = r * (den + EPS).pow(-KAPPA)
     elif norm == 'per_state':
-        r = r / (den.abs() + EPS)
+        r = r / (den + EPS)
     return (num * r.unsqueeze(-1)).sum(3) / ((den * r).sum(3).unsqueeze(-1) + EPS)
 
 

@@ -3996,7 +3996,10 @@ def _final_state(kf, vf, wf, gf, B, H):
     v1 = torch.cat([vf, torch.ones_like(vf[..., :1])], -1).float()      # [BH,T,V+1]
     wgt = wf.float()                                                    # [BH,T,nc]
     if gf is not None:                                                  # GLA: token t decays by Σ_{t'>t} g
-        G = gf.float().cumsum(1)
+        # Clamp the per-token log-decay to `_GLA_FLOOR` — the SAME floor every chunked GLA decay site
+        # applies (readout/den/routed). Without it the emitted final state would decay at a faster rate
+        # than the chunked prefill it must hand off to (`test_recurrent_handoff`), a prefill→decode gap.
+        G = gf.float().clamp(min=_GLA_FLOOR).cumsum(1)
         wgt = wgt * (G[:, -1:, :] - G).exp()
     state = torch.einsum('btc,btd,bte->bcde', wgt, kf.float(), v1)      # [BH, nc, K, V+1]
     return state.view(B, H * state.shape[1], state.shape[2], state.shape[3])
