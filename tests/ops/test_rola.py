@@ -63,16 +63,6 @@ def _relmax(a, b):
     return (a - b).abs().max().item() / (b.abs().max().item() + 1e-9)
 
 
-def _fold(t):
-    B, L, H, D = t.shape
-    return t.permute(0, 2, 1, 3).reshape(B * H, L, D).contiguous()
-
-
-def _unfold(t, B, H):
-    BH, L, D = t.shape
-    return t.view(B, H, L, D).permute(0, 2, 1, 3).contiguous()
-
-
 _GLA_BWD_TOL = 1.2e-1   # GLA decay fp32 floor (NOT a kernel bug): the gate/decay grads (drg,dwg,dld) flow
 #                       through the softmax-gate × exp(cumsum(ld)) product across the chunked recurrence,
 #                       whose fp32-vs-fp64 floor is ~9e-2 worst-case (the dwg grad; seed-driven, present
@@ -765,9 +755,31 @@ class TestInterCorrectness:
         old test_kappa_routed_autograd_fp64 / test_routed_bias_fwd_bwd / test_routed_bwd_nonpow2_dv /
         test_gla_routed_bwd_faithful / test_gla_routed_bias_bwd_faithful — the GLA×bias×routing holes the
         gates caught are now grid nodes, not one cell. Also cross-checks the fused output ==
-        _chunk_rola_impl fed the SAME router's per-head gates (the unified torch-naive truth)."""
+        _chunk_rola_impl fed the SAME router's per-head gates (the unified torch-naive truth).
+
+        The nc=16 / DEPTH-4 routing family (flat-16, square-16, tree-16 at D=4) is covered for the BACKWARD
+        grads by the sibling `test_routed_bwd_nc16_depth4` (the old test_routed_bias_fwd_bwd gated db_r/db_w/
+        dWr/dWw through depth-4 — restored there so the depth-4/nc=16 grads stay gated)."""
         if device != 'cuda':
             pytest.skip('RoLA Triton kernels require CUDA')
+        self._routed_fwd_bwd_check(norm, gla, bias, D, b, Kd, dv)
+
+    @pytest.mark.parametrize('norm', ['raw', 'global', 'per_state', 'kappa'])
+    @pytest.mark.parametrize('bias', [False, True])
+    @pytest.mark.parametrize('D,b', _ROUTE_FLAT_SQ_TREE_16)   # flat(16), square(16), tree-16 (DEPTH 4)
+    def test_routed_bwd_nc16_depth4(self, norm, bias, D, b):
+        """Restores the nc=16 / DEPTH-4 BACKWARD grad coverage the old test_routed_bias_fwd_bwd gated (the
+        cross-product otherwise tops out at the nc=8 family / depth-3). Runs the SAME fused-vs-fp64-reference
+        check (all grads incl. db_r/db_w/dWr/dWw through the depth-4 tree's leaf-product fold) over flat-16,
+        square-16, and the depth-4 tree-16 × bias{off,on} × all norms. RLA (the bias/router-grad family the
+        old depth-4 cell covered); the nc=8 grid already crosses GLA × bias × tree. Runs in the deferred
+        warmed sweep — closes the depth-4/nc=16 grad hole flagged by the gate."""
+        if device != 'cuda':
+            pytest.skip('RoLA Triton kernels require CUDA')
+        self._routed_fwd_bwd_check(norm, gla=False, bias=bias, D=D, b=b, Kd=16, dv=16)
+
+    def _routed_fwd_bwd_check(self, norm, gla, bias, D, b, Kd, dv):
+        """The shared fused-vs-fp64-reference forward+backward check body (see test_routed_fwd_bwd)."""
         B, H, T, dm = 2, 2, 64, 40
         scale = Kd ** -0.5
         g = torch.Generator(device=device).manual_seed(0)
