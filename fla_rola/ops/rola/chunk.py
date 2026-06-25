@@ -412,7 +412,8 @@ def rola_rla_triton(q, k, v, r, w, chunk=None, BG=16, compute_dtype=None):
 # The production tree-routing forward (the validated prototype since promoted; its backward kernels now
 # live in `routed_bwd_kernels.py`): instead of taking PRECOMPUTED gates
 # r,w ∈ [L,nc] and forming R = r·wᵀ, the routing gram is built IN-KERNEL from the hidden state h and the
-# per-level router weights Wr,Ww ∈ [D, d_model, b] (b^D = nc), never materializing the [L,nc] gates.
+# PER-HEAD router weights Wr,Ww ∈ [H, D, d_model, b] (b^D = nc, per head; the kernel indexes head = the
+# B·H fold-row % H), never materializing the [L,nc] gates.
 #
 # This is a SOURCE SWAP, not a new pipeline: the inner machinery is the *same* production RLA forward
 # (`_rola_fwd_intra` collapse-intra over state-blocks, `_rola_fwd_inter` NB-fused inter scan, the same
@@ -447,26 +448,37 @@ def _build_sel(D, b, nc, device):
     return sel
 
 
-def _routing_bias(b_r, b_w, D, b, device, dtype=torch.float32):
-    """Resolve the optional per-level routing bias b_r/b_w ∈ [D,b] (the affine term of softmax(h·W+b))
-    to (br, bw, has_bias) for the kernels. None ⇒ a 1-element dummy (never read; HAS_BIAS=False gates
-    every load) so the kernel signature stays uniform and the bias=None path is byte-identical to the
-    pre-bias kernel."""
+def _routing_bias(b_r, b_w, H, D, b, device, dtype=torch.float32):
+    """Resolve the optional PER-HEAD routing bias b_r/b_w ∈ [H,D,b] (the affine term of softmax(h·W+b),
+    per head) to (br, bw, has_bias) for the kernels. None ⇒ a 1-element dummy (never read; HAS_BIAS=False
+    gates every load AND `_bias_strides`/head-stride return 0) so the kernel signature stays uniform and
+    the bias=None path is byte-identical to the pre-bias kernel."""
     if b_r is None and b_w is None:
         dummy = torch.zeros(1, device=device, dtype=dtype)
         return dummy, dummy, False
     if b_r is None or b_w is None:
         raise ValueError("routing bias: pass both b_r and b_w, or neither")
-    if tuple(b_r.shape) != (D, b) or tuple(b_w.shape) != (D, b):
-        raise ValueError(f"routing bias must be [D,b]=[{D},{b}], got {tuple(b_r.shape)}/{tuple(b_w.shape)}")
+    if tuple(b_r.shape) != (H, D, b) or tuple(b_w.shape) != (H, D, b):
+        raise ValueError(f"routing bias must be [H,D,b]=[{H},{D},{b}], got {tuple(b_r.shape)}/{tuple(b_w.shape)}")
     return b_r.to(dtype).contiguous(), b_w.to(dtype).contiguous(), True
 
 
 def _bias_strides(br, bw, has_bias):
-    """(sbr_lvl, sbr_b, sbw_lvl, sbw_b) for the kernel launch; zeros when bias is absent."""
+    """(sbr_lvl, sbr_b, sbw_lvl, sbw_b) for the kernel launch; zeros when bias is absent. PER-HEAD bias
+    is [H,D,b] so the level/branch strides are dims 1,2 (dim 0 is head, handled by `_router_head_strides`)."""
     if not has_bias:
         return (0, 0, 0, 0)
-    return (br.stride(0), br.stride(1), bw.stride(0), bw.stride(1))
+    return (br.stride(1), br.stride(2), bw.stride(1), bw.stride(2))
+
+
+def _router_head_strides(Wr, Ww, br, bw, has_bias):
+    """(H, swr_head, sww_head, sbr_head, sbw_head) — the per-head row strides of the [H,D,d_model,b]
+    routers and the [H,D,b] biases. The kernels offset Wr/Ww/bias by (pid_b % H)*stride to reach THIS
+    head's slice. Bias head-strides are 0 when absent (the dummy is never indexed)."""
+    H = Wr.shape[0]
+    sbr_head = br.stride(0) if has_bias else 0
+    sbw_head = bw.stride(0) if has_bias else 0
+    return (H, Wr.stride(0), Ww.stride(0), sbr_head, sbw_head)
 
 
 @triton.jit
@@ -537,7 +549,7 @@ def _build_rw_tile(h_ptr, wr_ptr, ww_ptr, sel_ptr, offs_c, cmask,
 @triton.jit
 def _rola_routed_fwd_intra(q_ptr, k_ptr, v_ptr, h_ptr, wr_ptr, ww_ptr, sel_ptr, ld_ptr, outa_ptr,
                            br_ptr, bw_ptr,
-                           L, dqk, dv, nc, d_model,
+                           L, dqk, dv, nc, d_model, H, swr_head, sww_head, sbr_head, sbw_head,
                            sq_b, sq_l, sq_d, sv_b, sv_l, sv_d,
                            sh_b, sh_l, sh_d, swr_lvl, swr_d, swr_b, sww_lvl, sww_d, sww_b,
                            ssel_lvl, ssel_b, ssel_c, sg_b, sg_l, sg_c, soa_b, soa_l, soa_v,
@@ -556,6 +568,13 @@ def _rola_routed_fwd_intra(q_ptr, k_ptr, v_ptr, h_ptr, wr_ptr, ww_ptr, sel_ptr, 
     nc-collapse still holds (each block's decayed [BT,BG]·[BG,BT] gram is still a [BT,BT] partial)."""
     b = tl.program_id(0)
     t = tl.program_id(1)
+    # Per-head router: the BH fold is (B,H) -> head = pid_b % H. Offset Wr/Ww (and the bias) to THIS
+    # head's [D,d_model,b] slice; the inner `_build_rw_tile` then reads the head-correct factors.
+    _hd = b % H
+    wr_ptr = wr_ptr + _hd * swr_head
+    ww_ptr = ww_ptr + _hd * sww_head
+    br_ptr = br_ptr + _hd * sbr_head
+    bw_ptr = bw_ptr + _hd * sbw_head
     offs_t = tl.arange(0, BT)
     offs_v = tl.arange(0, BV)
     offs_bb = tl.arange(0, BB)
@@ -603,6 +622,7 @@ def _rola_routed_fwd_intra(q_ptr, k_ptr, v_ptr, h_ptr, wr_ptr, ww_ptr, sel_ptr, 
 def _rola_routed_fwd_inter(q_ptr, k_ptr, v_ptr, h_ptr, wr_ptr, ww_ptr, sel_ptr, ld_ptr, outa_ptr,
                            br_ptr, bw_ptr,
                            L, dqk, dv: tl.constexpr, nc, d_model,
+                           H, swr_head, sww_head, sbr_head, sbw_head,
                            sq_b, sq_l, sq_d, sv_b, sv_l, sv_d,
                            sh_b, sh_l, sh_d, swr_lvl, swr_d, swr_b, sww_lvl, sww_d, sww_b,
                            ssel_lvl, ssel_b, ssel_c, sg_b, sg_l, sg_c, soa_b, soa_n, soa_l, soa_v,
@@ -622,6 +642,11 @@ def _rola_routed_fwd_inter(q_ptr, k_ptr, v_ptr, h_ptr, wr_ptr, ww_ptr, sel_ptr, 
     b = tl.program_id(0)
     sb = tl.program_id(1)
     d0 = tl.program_id(2)
+    _hd = b % H                                  # per-head router slice (BH fold is (B,H))
+    wr_ptr = wr_ptr + _hd * swr_head
+    ww_ptr = ww_ptr + _hd * sww_head
+    br_ptr = br_ptr + _hd * sbr_head
+    bw_ptr = bw_ptr + _hd * sbw_head
     ND_V = (dv + BV - 1) // BV
     offs_t = tl.arange(0, BT)
     offs_d = d0 * BK + tl.arange(0, BK)
@@ -695,22 +720,24 @@ def _routed_fwd_tiled(q, k, v, h, Wr, Ww, D, b, sel, chunk, BG, BK=64, b_r=None,
     ld = (_floor_ld(ld).contiguous() if use_g
           else q.new_zeros(B, L, nc))   # USE_G=False: ld unread (kernel skips the load), pass a stub
     sg = (ld.stride(0), ld.stride(1), ld.stride(2))
-    br, bw, has_bias = _routing_bias(b_r, b_w, D, b, q.device, dtype=q.dtype)
+    H = Wr.shape[0]
+    br, bw, has_bias = _routing_bias(b_r, b_w, H, D, b, q.device, dtype=q.dtype)
     sbias = _bias_strides(br, bw, has_bias)
+    head = _router_head_strides(Wr, Ww, br, bw, has_bias)   # (H, swr_head, sww_head, sbr_head, sbw_head)
     out_intra = torch.zeros(B, L, BV, device=q.device, dtype=torch.float32)
     out_inter = torch.zeros(B, L, BV, device=q.device, dtype=torch.float32)
     so_a = (out_intra.stride(0), out_intra.stride(1), out_intra.stride(2))
     so_e = (out_inter.stride(0), 0, out_inter.stride(1), out_inter.stride(2))
     base = (q.stride(0), q.stride(1), q.stride(2), v.stride(0), v.stride(1), v.stride(2))
     route = (h.stride(0), h.stride(1), h.stride(2),
-             Wr.stride(0), Wr.stride(1), Wr.stride(2), Ww.stride(0), Ww.stride(1), Ww.stride(2),
+             Wr.stride(1), Wr.stride(2), Wr.stride(3), Ww.stride(1), Ww.stride(2), Ww.stride(3),
              sel.stride(0), sel.stride(1), sel.stride(2))
     _rola_routed_fwd_intra[(B, NCH)](q, k, v, h, Wr, Ww, sel, ld, out_intra, br, bw, L, dqk, dv, nc, d_model,
-                                     *base, *route, *sg, *so_a, *sbias,
+                                     *head, *base, *route, *sg, *so_a, *sbias,
                                      D=D, bb_=b, BB=BB, BT=chunk, BK=BK, BV=BV, BG=BG, BD=BD,
                                      ND=ND, NB=NB, NDM=NDM, HAS_BIAS=has_bias, USE_G=use_g)
     _rola_routed_fwd_inter[(B, NB, ND)](q, k, v, h, Wr, Ww, sel, ld, out_inter, br, bw, L, dqk, dv, nc, d_model,
-                                        *base, *route, *sg, *so_e, *sbias,
+                                        *head, *base, *route, *sg, *so_e, *sbias,
                                         D=D, bb_=b, BB=BB, BT=chunk, BK=BK, BG=BG, BD=BD,
                                         NCH=NCH, NDM=NDM, HAS_BIAS=has_bias, USE_G=use_g)   # BV autotuned
     return out_intra[..., :dv] + out_inter[..., :dv]
@@ -718,10 +745,10 @@ def _routed_fwd_tiled(q, k, v, h, Wr, Ww, D, b, sel, chunk, BG, BK=64, b_r=None,
 
 def _rola_rla_routed_fwd(q, k, v, h, Wr, Ww, D, b, chunk=None, BG=16):
     """Un-normalized TREE-ROUTED RLA readout via Triton (the optimized production forward) — PLAIN
-    (no autograd). The routing gram is built IN-KERNEL from the hidden state h + per-level router weights
-    Wr,Ww ∈ [D,d_model,b] (b^D=nc); the [L,nc] gates are never materialized.
+    (no autograd). The routing gram is built IN-KERNEL from the hidden state h + per-head router weights
+    Wr,Ww ∈ [H,D,d_model,b] (b^D=nc, per head); the [L,nc] gates are never materialized.
 
-    q,k:[BH,L,K]  v:[BH,L,V]  h:[BH,L,d_model]  Wr,Ww:[D,d_model,b].  Returns [BH,L,V] at BV=next_pow2(V).
+    q,k:[BH,L,K]  v:[BH,L,V]  h:[BH,L,d_model]  Wr,Ww:[H,D,d_model,b].  Returns [BH,L,V] at BV=next_pow2(V).
     Flat (D=1, b=nc) is the fused equivalent of `rola_rla_triton(q,k,v,r,w)` with r,w the D=1 router's
     explicit softmax gates."""
     chunk = _CHUNK_FWD if chunk is None else min(chunk, _CHUNK_FWD)
@@ -756,7 +783,7 @@ def _rola_rla_routed_fwd(q, k, v, h, Wr, Ww, D, b, chunk=None, BG=16):
 @triton.jit
 def _rola_routed_snap_kernel(h_ptr, k_ptr, v_ptr, wr_ptr, ww_ptr, sel_ptr, ld_ptr, s_ptr, snap_ptr,
                              br_ptr, bw_ptr,
-                             L, d_model, dqk, dv, nc,
+                             L, d_model, dqk, dv, nc, H, swr_head, sww_head, sbr_head, sbw_head,
                              sh_b, sh_l, sh_d, sq_b, sq_l, sq_d, sv_b, sv_l, sv_d,
                              swr_lvl, swr_d, swr_b, sww_lvl, sww_d, sww_b,
                              ssel_lvl, ssel_b, ssel_c, sg_b, sg_l, sg_c, ss_b, ss_c, ss_k, ss_v,
@@ -775,6 +802,11 @@ def _rola_routed_snap_kernel(h_ptr, k_ptr, v_ptr, wr_ptr, ww_ptr, sel_ptr, ld_pt
     USE_G (GLA, #30 V1): the per-c state decays by e^{Λ_c} each chunk and the write is e^{Λ_c-a}-weighted
     (S[c] ← e^{Λ_c}S[c] + Σ w_end k⊗v) — exactly the decayed inter scan; the snapshot is still PRE-update."""
     pid_b = tl.program_id(0)
+    _hd = pid_b % H                              # per-head router slice (BH fold is (B,H))
+    wr_ptr = wr_ptr + _hd * swr_head
+    ww_ptr = ww_ptr + _hd * sww_head
+    br_ptr = br_ptr + _hd * sbr_head
+    bw_ptr = bw_ptr + _hd * sbw_head
     ND_V = (dv + BV - 1) // BV       # value-blocks (BV is the value TILE; ND_V==1 ⇒ the un-tiled kernel)
     offs_t = tl.arange(0, BT)
     offs_bb = tl.arange(0, BB)
@@ -845,9 +877,11 @@ def _routed_snapshots(q, k, v, h, Wr, Ww, D, b, sel, chunk, BG, br=None, bw=None
     ND = triton.cdiv(dqk, BK)
     NDM = triton.cdiv(d_model, BD)
     NCH = triton.cdiv(L, chunk)
+    H = Wr.shape[0]
     if br is None:
-        br, bw, has_bias = _routing_bias(None, None, D, b, q.device, dtype=q.dtype)
+        br, bw, has_bias = _routing_bias(None, None, H, D, b, q.device, dtype=q.dtype)
     sbias = _bias_strides(br, bw, has_bias)
+    head = _router_head_strides(Wr, Ww, br, bw, has_bias)
     use_g = ld is not None
     ld = (_floor_ld(ld).contiguous() if use_g else q.new_zeros(B, L, nc))
     sg = (ld.stride(0), ld.stride(1), ld.stride(2))
@@ -855,10 +889,10 @@ def _routed_snapshots(q, k, v, h, Wr, Ww, D, b, sel, chunk, BG, br=None, bw=None
     snap = torch.zeros(B, NCH, nc, dqk, dv, device=q.device, dtype=torch.float32)
     _rola_routed_snap_kernel[(B,)](
         h, k, v, Wr, Ww, sel, ld, S, snap, br, bw,
-        L, d_model, dqk, dv, nc,
+        L, d_model, dqk, dv, nc, *head,
         h.stride(0), h.stride(1), h.stride(2), q.stride(0), q.stride(1), q.stride(2),
         v.stride(0), v.stride(1), v.stride(2),
-        Wr.stride(0), Wr.stride(1), Wr.stride(2), Ww.stride(0), Ww.stride(1), Ww.stride(2),
+        Wr.stride(1), Wr.stride(2), Wr.stride(3), Ww.stride(1), Ww.stride(2), Ww.stride(3),
         sel.stride(0), sel.stride(1), sel.stride(2), *sg,
         S.stride(0), S.stride(1), S.stride(2), S.stride(3),
         snap.stride(0), snap.stride(1), snap.stride(2), snap.stride(3), snap.stride(4),
@@ -905,8 +939,10 @@ def _rola_rla_routed_bwd(q, k, v, h, Wr, Ww, do, D, b, chunk, BG, b_r=None, b_w=
     # all gram dots run with fp32 operands — the bf16-rounded saved inputs are upcast here. Keeps grads
     # at the bf16 NOISE floor (<1e-2) rather than the bf16-operand floor of the fold dots.
     q, k, v, h, Wr, Ww, do = (x.float().contiguous() for x in (q, k, v, h, Wr, Ww, do))
-    br, bw, has_bias = _routing_bias(b_r, b_w, D, b, q.device, dtype=torch.float32)
+    H = Wr.shape[0]
+    br, bw, has_bias = _routing_bias(b_r, b_w, H, D, b, q.device, dtype=torch.float32)
     sbias = _bias_strides(br, bw, has_bias)
+    head = _router_head_strides(Wr, Ww, br, bw, has_bias)   # (H, swr_head, sww_head, sbr_head, sbw_head)
     # The fold kernels run fp32 operands (precision floor of the deep-Hadamard jacobian); fp32 doubles
     # per-program SMEM vs the proto's bf16 regime, so the backward chunk is capped at _CHUNK (32) — the
     # GLA/all-backwards device constant — independent of the forward chunk (each is just a tiling of the
@@ -934,10 +970,10 @@ def _rola_rla_routed_bwd(q, k, v, h, Wr, Ww, do, D, b, chunk, BG, b_r=None, b_w=
     dk = torch.zeros(B, L, dqk, device=q.device, dtype=torch.float32)
     dvv = torch.zeros(B, L, dv, device=q.device, dtype=torch.float32)
     dh = torch.zeros(B, L, d_model, device=q.device, dtype=torch.float32)
-    dWr = torch.zeros(D, d_model, b, device=q.device, dtype=torch.float32)
-    dWw = torch.zeros(D, d_model, b, device=q.device, dtype=torch.float32)
-    dbr = torch.zeros(D, b, device=q.device, dtype=torch.float32)   # routing-bias grads [D,b] (transient fold)
-    dbw = torch.zeros(D, b, device=q.device, dtype=torch.float32)
+    dWr = torch.zeros(H, D, d_model, b, device=q.device, dtype=torch.float32)   # per-head [H,D,d_model,b]
+    dWw = torch.zeros(H, D, d_model, b, device=q.device, dtype=torch.float32)
+    dbr = torch.zeros(H, D, b, device=q.device, dtype=torch.float32)   # per-head routing-bias grads [H,D,b]
+    dbw = torch.zeros(H, D, b, device=q.device, dtype=torch.float32)
     # gda[B,L,nc]: persistent per-token log-decay adjoint accumulator (USE_G) — the intra kernel writes
     # its da-pieces over all chunks (parallel), the inter kernels add theirs per chunk; reverse-cumsummed
     # per chunk into dld at the end. RLA leaves it zero (a 1-col stub) and dld is unused.
@@ -950,10 +986,10 @@ def _rola_rla_routed_bwd(q, k, v, h, Wr, Ww, do, D, b, chunk, BG, b_r=None, b_w=
     _routed_bwd_intra[(B, NCH)](
         h, q, k, v, Wr, Ww, sel, ld, do, dq, dk, dvv, dh, dWr, dWw, gda,
         br, bw, dbr, dbw,
-        L, d_model, dqk, dv, nc,
+        L, d_model, dqk, dv, nc, *head,
         h.stride(0), h.stride(1), h.stride(2), q.stride(0), q.stride(1), q.stride(2),
         v.stride(0), v.stride(1), v.stride(2),
-        Wr.stride(0), Wr.stride(1), Wr.stride(2), Ww.stride(0), Ww.stride(1), Ww.stride(2),
+        Wr.stride(1), Wr.stride(2), Wr.stride(3), Ww.stride(1), Ww.stride(2), Ww.stride(3),
         sel.stride(0), sel.stride(1), sel.stride(2), *sgl, *sga,
         do.stride(0), do.stride(1), do.stride(2), dh.stride(0), dh.stride(1), dh.stride(2),
         *sbias,
@@ -972,10 +1008,10 @@ def _rola_rla_routed_bwd(q, k, v, h, Wr, Ww, do, D, b, chunk, BG, b_r=None, b_w=
         # state-bwd reads dS = adjoint S_{j+1} (pre-decvec) → dk,dv,gdw + (USE_G) the carry/w_end da-pieces.
         _routed_bwd_inter_state[(B,)](
             h, k, v, Wr, Ww, sel, ld, Sj, dS, dk, dvv, gdw, gda, br, bw,
-            L, d_model, dqk, dv, nc, c * chunk,
+            L, d_model, dqk, dv, nc, c * chunk, *head,
             h.stride(0), h.stride(1), h.stride(2), q.stride(0), q.stride(1), q.stride(2),
             v.stride(0), v.stride(1), v.stride(2),
-            Wr.stride(0), Wr.stride(1), Wr.stride(2), Ww.stride(0), Ww.stride(1), Ww.stride(2),
+            Wr.stride(1), Wr.stride(2), Wr.stride(3), Ww.stride(1), Ww.stride(2), Ww.stride(3),
             sel.stride(0), sel.stride(1), sel.stride(2), *sgl,
             dS.stride(0), dS.stride(1), dS.stride(2), dS.stride(3),
             gdr.stride(0), gdr.stride(1), gdr.stride(2), *sga, *sbias,
@@ -989,9 +1025,9 @@ def _rola_rla_routed_bwd(q, k, v, h, Wr, Ww, do, D, b, chunk, BG, b_r=None, b_w=
             dS = dS * torch.exp(Lam_c)[:, :, None, None]
         _routed_bwd_inter_read[(B,)](
             h, q, Wr, Ww, sel, ld, Sj, dS, do, dq, gdr, gda, br, bw,
-            L, d_model, dqk, dv, nc, c * chunk,
+            L, d_model, dqk, dv, nc, c * chunk, *head,
             h.stride(0), h.stride(1), h.stride(2), q.stride(0), q.stride(1), q.stride(2),
-            Wr.stride(0), Wr.stride(1), Wr.stride(2), Ww.stride(0), Ww.stride(1), Ww.stride(2),
+            Wr.stride(1), Wr.stride(2), Wr.stride(3), Ww.stride(1), Ww.stride(2), Ww.stride(3),
             sel.stride(0), sel.stride(1), sel.stride(2), *sgl,
             Sj.stride(0), Sj.stride(1), Sj.stride(2), Sj.stride(3),
             do.stride(0), do.stride(1), do.stride(2),
@@ -999,9 +1035,9 @@ def _rola_rla_routed_bwd(q, k, v, h, Wr, Ww, do, D, b, chunk, BG, b_r=None, b_w=
             **inter_common)
         _routed_bwd_fold[(B,)](
             h, Wr, Ww, sel, gdr, gdw, dh, dWr, dWw, br, bw, dbr, dbw,
-            L, d_model, nc, c * chunk,
+            L, d_model, nc, c * chunk, *head,
             h.stride(0), h.stride(1), h.stride(2),
-            Wr.stride(0), Wr.stride(1), Wr.stride(2), Ww.stride(0), Ww.stride(1), Ww.stride(2),
+            Wr.stride(1), Wr.stride(2), Wr.stride(3), Ww.stride(1), Ww.stride(2), Ww.stride(3),
             sel.stride(0), sel.stride(1), sel.stride(2),
             gdr.stride(0), gdr.stride(1), gdr.stride(2), dh.stride(0), dh.stride(1), dh.stride(2),
             *sbias,
@@ -1077,10 +1113,10 @@ def rola_rla_routed_triton(q, k, v, h, Wr, Ww, D, b, chunk=None, BG=16, b_r=None
     """Un-normalized TREE-ROUTED RLA readout via Triton — the in-kernel-routing twin of
     `rola_rla_triton`, now DIFFERENTIABLE end-to-end (fused router-grad fold; the [L,nc] gates and their
     grads are NEVER materialized). The routing gram is built IN-KERNEL from the hidden state h + per-level
-    router weights Wr,Ww ∈ [D,d_model,b] (b^D=nc), with an OPTIONAL per-level bias b_r/b_w ∈ [D,b]
+    router weights Wr,Ww ∈ [H,D,d_model,b] (b^D=nc, per head), with an OPTIONAL per-head bias b_r/b_w ∈ [H,D,b]
     (softmax(h·W+b)).
 
-    q,k:[BH,L,K]  v:[BH,L,V]  h:[BH,L,d_model]  Wr,Ww:[D,d_model,b].  Returns [BH,L,V] at BV=next_pow2(V).
+    q,k:[BH,L,K]  v:[BH,L,V]  h:[BH,L,d_model]  Wr,Ww:[H,D,d_model,b].  Returns [BH,L,V] at BV=next_pow2(V).
     Flat (D=1, b=nc) is the fused equivalent of `rola_rla_triton(q,k,v,r,w)` with r,w the D=1 router's
     explicit softmax gates. Grads dq,dk,dv,d_h,dWr,dWw (+db_r,db_w) match autograd to rel<1e-2 (bf16)."""
     return _RoLARoutedFn.apply(q, k, v, h, Wr, Ww, D, b, chunk, BG, b_r, b_w, None)
@@ -1171,6 +1207,7 @@ def _kappa_rescale(r_tile, d_tile, kap, cmask, GLOBAL: tl.constexpr,
 def _kappa_fwd_chunk(h_ptr, q_ptr, k_ptr, v_ptr, wr_ptr, ww_ptr, sel_ptr, kap_ptr, ld_ptr,
                      sval_ptr, sden_ptr, num_ptr, den_ptr, br_ptr, bw_ptr,
                      L, d_model, dqk, dv, nc, t_start,
+                     H, swr_head, sww_head, sbr_head, sbw_head,
                      sh_b, sh_l, sh_d, sq_b, sq_l, sq_d, sv_b, sv_l, sv_d, sk_b, sk_l,
                      swr_lvl, swr_d, swr_b, sww_lvl, sww_d, sww_b, ssel_lvl, ssel_b, ssel_c,
                      sg_b, sg_l, sg_c,
@@ -1197,6 +1234,11 @@ def _kappa_fwd_chunk(h_ptr, q_ptr, k_ptr, v_ptr, wr_ptr, ww_ptr, sel_ptr, kap_pt
     bmask = offs_bb < b
     rows = t_start + offs_t
     rmask = rows < L
+    _hd = pid_b % H                              # per-head router slice (BH fold is (B,H))
+    wr_ptr = wr_ptr + _hd * swr_head
+    ww_ptr = ww_ptr + _hd * sww_head
+    br_ptr = br_ptr + _hd * sbr_head
+    bw_ptr = bw_ptr + _hd * sbw_head
     kap = tl.load(kap_ptr + pid_b*sk_b + rows*sk_l, mask=rmask, other=0.0)
     causal = (offs_t[:, None] >= offs_t[None, :]) & rmask[:, None] & rmask[None, :]
     # content gram G = q·kᵀ accumulated over BK-feature-blocks (so the [BT,BK] q/k tiles stay <=64).
@@ -1371,8 +1413,10 @@ def _kappa_routed_fwd(q, k, v, h, Wr, Ww, kap, D, b, sel, chunk, global_norm, pe
     den = torch.zeros(B, L, device=q.device, dtype=torch.float32)
     snap_val = torch.zeros(B, NCH, nc, dqk, dv, device=q.device, dtype=torch.float32)
     snap_den = torch.zeros(B, NCH, nc, dqk, device=q.device, dtype=torch.float32)
-    br, bw, has_bias = _routing_bias(b_r, b_w, D, b, q.device, dtype=q.dtype)
+    H = Wr.shape[0]
+    br, bw, has_bias = _routing_bias(b_r, b_w, H, D, b, q.device, dtype=q.dtype)
     sbias = _bias_strides(br, bw, has_bias)
+    head = _router_head_strides(Wr, Ww, br, bw, has_bias)
     use_g = ld is not None
     ld = (_floor_ld(ld).contiguous() if use_g else q.new_zeros(B, L, nc))
     sg = (ld.stride(0), ld.stride(1), ld.stride(2))
@@ -1384,10 +1428,10 @@ def _kappa_routed_fwd(q, k, v, h, Wr, Ww, kap, D, b, sel, chunk, global_norm, pe
         snap_den[:, c].copy_(Sden)
         _kappa_fwd_chunk[(B,)](
             h, q, k, v, Wr, Ww, sel, kap, ld, Sval, Sden, num, den, br, bw,
-            L, d_model, dqk, dv, nc, c * chunk,
+            L, d_model, dqk, dv, nc, c * chunk, *head,
             h.stride(0), h.stride(1), h.stride(2), q.stride(0), q.stride(1), q.stride(2),
             v.stride(0), v.stride(1), v.stride(2), kap.stride(0), kap.stride(1),
-            Wr.stride(0), Wr.stride(1), Wr.stride(2), Ww.stride(0), Ww.stride(1), Ww.stride(2),
+            Wr.stride(1), Wr.stride(2), Wr.stride(3), Ww.stride(1), Ww.stride(2), Ww.stride(3),
             sel.stride(0), sel.stride(1), sel.stride(2), *sg,
             Sval.stride(0), Sval.stride(1), Sval.stride(2), Sval.stride(3),
             Sden.stride(0), Sden.stride(1), Sden.stride(2),
@@ -1430,6 +1474,7 @@ def _kappa_rescale_bwd(drt_tile, r_tile, d_tile, kap, cmask,
 def _kappa_bwd_state(h_ptr, k_ptr, v_ptr, wr_ptr, ww_ptr, sel_ptr, ld_ptr, sval_ptr, sden_ptr,
                      dsval_ptr, dsden_ptr, dk_ptr, dv_ptr, gdw_ptr, gda_ptr, br_ptr, bw_ptr,
                      L, d_model, dqk, dv, nc, t_start,
+                     H, swr_head, sww_head, sbr_head, sbw_head,
                      sh_b, sh_l, sh_d, sq_b, sq_l, sq_d, sv_b, sv_l, sv_d,
                      swr_lvl, swr_d, swr_b, sww_lvl, sww_d, sww_b, ssel_lvl, ssel_b, ssel_c,
                      sg_b, sg_l, sg_c,
@@ -1454,6 +1499,11 @@ def _kappa_bwd_state(h_ptr, k_ptr, v_ptr, wr_ptr, ww_ptr, sel_ptr, ld_ptr, sval_
     bmask = offs_bb < b
     rows = t_start + offs_t
     rmask = rows < L
+    _hd = pid_b % H                              # per-head router slice (BH fold is (B,H))
+    wr_ptr = wr_ptr + _hd * swr_head
+    ww_ptr = ww_ptr + _hd * sww_head
+    br_ptr = br_ptr + _hd * sbr_head
+    bw_ptr = bw_ptr + _hd * sbw_head
     for cb in range(NCBLK):
         cols = cb * BC + offs_c
         cmask = cols < nc
@@ -1537,6 +1587,7 @@ def _kappa_bwd_read(h_ptr, q_ptr, k_ptr, v_ptr, wr_ptr, ww_ptr, sel_ptr, kap_ptr
                     dsval_ptr, dsden_ptr, dq_ptr, dk_ptr, dv_ptr, dkap_ptr, gdr_ptr, gdw_ptr, gda_ptr,
                     br_ptr, bw_ptr,
                     L, d_model, dqk, dv, nc, t_start,
+                    H, swr_head, sww_head, sbr_head, sbw_head,
                     sh_b, sh_l, sh_d, sq_b, sq_l, sq_d, sv_b, sv_l, sv_d, sk_b, sk_l,
                     swr_lvl, swr_d, swr_b, sww_lvl, sww_d, sww_b, ssel_lvl, ssel_b, ssel_c,
                     sg_b, sg_l, sg_c,
@@ -1565,6 +1616,11 @@ def _kappa_bwd_read(h_ptr, q_ptr, k_ptr, v_ptr, wr_ptr, ww_ptr, sel_ptr, kap_ptr
     bmask = offs_bb < b
     rows = t_start + offs_t
     rmask = rows < L
+    _hd = pid_b % H                              # per-head router slice (BH fold is (B,H))
+    wr_ptr = wr_ptr + _hd * swr_head
+    ww_ptr = ww_ptr + _hd * sww_head
+    br_ptr = br_ptr + _hd * sbr_head
+    bw_ptr = bw_ptr + _hd * sbw_head
     kap = tl.load(kap_ptr + pid_b*sk_b + rows*sk_l, mask=rmask, other=0.0)
     dden = tl.load(dden_ptr + pid_b*sdd_b + rows*sdd_l, mask=rmask, other=0.0)
     causal = ((offs_t[:, None] >= offs_t[None, :]) & rmask[:, None] & rmask[None, :]).to(tl.float32)
@@ -1761,18 +1817,19 @@ def _kappa_routed_bwd(q, k, v, h, Wr, Ww, kap, snap_val, snap_den, dnum, dden,
     # dvv/dq/dk are written with v's / q's row strides (sv_l=v.stride(1)=dv, sq_l=q.stride(1)=dqk), so
     # they MUST be allocated at the TRUE dv/dqk width (NOT padded BV/BK) or the row layout corrupts for
     # non-pow2 dv/dqk. The in-kernel [BT,BV]/[BT,BK] accumulators store only the masked :dv/:dqk part.
+    H = Wr.shape[0]
     dq = torch.zeros(B, L, dqk, device=q.device, dtype=torch.float32)
     dk = torch.zeros(B, L, dqk, device=q.device, dtype=torch.float32)
     dvv = torch.zeros(B, L, dv, device=q.device, dtype=torch.float32)
     dh = torch.zeros(B, L, d_model, device=q.device, dtype=torch.float32)
-    dWr = torch.zeros(D, d_model, b, device=q.device, dtype=torch.float32)
-    dWw = torch.zeros(D, d_model, b, device=q.device, dtype=torch.float32)
+    dWr = torch.zeros(H, D, d_model, b, device=q.device, dtype=torch.float32)   # per-head [H,D,d_model,b]
+    dWw = torch.zeros(H, D, d_model, b, device=q.device, dtype=torch.float32)
     dkap = torch.zeros(B, L, device=q.device, dtype=torch.float32)
     dSval = torch.zeros(B, nc, dqk, dv, device=q.device, dtype=torch.float32)
     dSden = torch.zeros(B, nc, dqk, device=q.device, dtype=torch.float32)
-    br, bw, has_bias = _routing_bias(b_r, b_w, D, b, q.device, dtype=torch.float32)
-    dbr = torch.zeros(D, b, device=q.device, dtype=torch.float32)   # routing-bias grads [D,b] (transient fold)
-    dbw = torch.zeros(D, b, device=q.device, dtype=torch.float32)
+    br, bw, has_bias = _routing_bias(b_r, b_w, H, D, b, q.device, dtype=torch.float32)
+    dbr = torch.zeros(H, D, b, device=q.device, dtype=torch.float32)   # per-head routing-bias grads [H,D,b]
+    dbw = torch.zeros(H, D, b, device=q.device, dtype=torch.float32)
     dnum = dnum.contiguous()
     dden = dden.contiguous()
     # ld:[B,L,nc] (GLA) clamped to the fp32 decay floor; RLA passes a zero stub the kernels skip (USE_G=False).
@@ -1789,9 +1846,10 @@ def _kappa_routed_bwd(q, k, v, h, Wr, Ww, kap, snap_val, snap_den, dnum, dden,
     sB = (q.stride(0), q.stride(1), q.stride(2))
     sV = (v.stride(0), v.stride(1), v.stride(2))
     sH = (h.stride(0), h.stride(1), h.stride(2))
-    sWr = (Wr.stride(0), Wr.stride(1), Wr.stride(2))
-    sWw = (Ww.stride(0), Ww.stride(1), Ww.stride(2))
+    sWr = (Wr.stride(1), Wr.stride(2), Wr.stride(3))   # per-head [H,D,d_model,b]: lvl/d/b strides (dim0=head)
+    sWw = (Ww.stride(1), Ww.stride(2), Ww.stride(3))
     sSel = (sel.stride(0), sel.stride(1), sel.stride(2))
+    head = _router_head_strides(Wr, Ww, br, bw, has_bias)   # (H, swr_head, sww_head, sbr_head, sbw_head)
     # snapshot (Sval_j/Sden_j) strides for the state-bwd ZdZ term — same (B, flat-k, v) layout as dSval.
     sSV = (dSval.stride(0), dSval.stride(2), dSval.stride(3))   # (B, flat-k=dqk-axis, v)
     sSD = (dSden.stride(0), dSden.stride(2))                    # (B, flat-k)
@@ -1812,7 +1870,7 @@ def _kappa_routed_bwd(q, k, v, h, Wr, Ww, kap, snap_val, snap_den, dnum, dden,
         # the USE_G carry/w_end da-pieces, using the chunk-start snapshot Sval_j/Sden_j for the Λ-coupling).
         _kappa_bwd_state[(B,)](
             h, k, v, Wr, Ww, sel, ld, Sval, Sden, dSval, dSden, dk, dvv, gdw, gda, br, bw,
-            L, d_model, dqk, dv, nc, c * chunk,
+            L, d_model, dqk, dv, nc, c * chunk, *head,
             *sH, *sB, *sV, *sWr, *sWw, *sSel, *sgl, *sSV, *sSD, *sGD, *sga, *sBias, **state_common)
         if use_g:
             # decay the running adjoints by decvec=e^{Λ_c} (per state) — the reverse of the forward's
@@ -1826,7 +1884,7 @@ def _kappa_routed_bwd(q, k, v, h, Wr, Ww, kap, snap_val, snap_den, dnum, dden,
         _kappa_bwd_read[(B,)](
             h, q, k, v, Wr, Ww, sel, kap, ld, Sval, Sden, dnum, dden,
             dSval, dSden, dq, dk, dvv, dkap, gdr, gdw, gda, br, bw,
-            L, d_model, dqk, dv, nc, c * chunk,
+            L, d_model, dqk, dv, nc, c * chunk, *head,
             *sH, *sB, *sV, kap.stride(0), kap.stride(1), *sWr, *sWw, *sSel, *sgl, *sSV, *sSD,
             dnum.stride(0), dnum.stride(1), dnum.stride(2), dden.stride(0), dden.stride(1), *sGD, *sga,
             *sBias,
@@ -1834,7 +1892,7 @@ def _kappa_routed_bwd(q, k, v, h, Wr, Ww, kap, snap_val, snap_den, dnum, dden,
         # fold the transient gate-grads -> dWr,dWw,dh (+db; proto fold; factor-rebuild SMEM isolated here).
         _routed_bwd_fold[(B,)](
             h, Wr, Ww, sel, gdr, gdw, dh, dWr, dWw, br, bw, dbr, dbw,
-            L, d_model, nc, c * chunk, *sH, *sWr, *sWw, *sSel,
+            L, d_model, nc, c * chunk, *head, *sH, *sWr, *sWw, *sSel,
             gdr.stride(0), gdr.stride(1), gdr.stride(2), dh.stride(0), dh.stride(1), dh.stride(2),
             *sBias,
             **fold_common)
@@ -4196,18 +4254,25 @@ def chunk_rola(q, k, v, r, w, g=None, norm='kappa', kappa=None, scale=None, eps=
 # ============================================================================
 
 
-def _tree_gates_torch(hf, Wr, Ww, D, b, b_r=None, b_w=None):
+def _tree_gates_torch(hf, Wr, Ww, D, b, H, b_r=None, b_w=None):
     """Build the EXPLICIT folded [BH,T,nc] read/write gates from (h, Wr, Ww) the way the tree
-    factorizes — r[...,leaf] = Π_lvl softmax(h·Wr[lvl] + b_r[lvl])[..., digit_lvl(leaf)]. This is the
-    MATERIALIZED path the routed kernel avoids; used here only for (a) the normalized-norm den pre-pass
-    and (b) the flat-equivalence validation reference. Optional per-level bias b_r/b_w ∈ [D,b]."""
+    factorizes — r[...,leaf] = Π_lvl softmax(h·Wr[head,lvl] + b_r[head,lvl])[..., digit_lvl(leaf)]. The
+    router is PER-HEAD (Wr,Ww ∈ [H,D,d_model,b]; bias b_r/b_w ∈ [H,D,b]): each head folds with its OWN
+    weights, exactly the per-head kernel. This is the MATERIALIZED path the routed kernel avoids; used
+    here only for (a) the normalized-norm den pre-pass (CPU) and (b) the flat-equivalence reference.
+    `hf` is the [BH,T,d_model] fold (BH=(B,H)); H lets us route each head independently."""
     nc = b ** D
+    BH, T, dm = hf.shape
+    hr = hf.view(BH // H, H, T, dm)                                   # [B,H,T,dm]
 
-    def _logit(x, W, bias, i):
-        z = x @ W[i].to(x.dtype)
-        return z if bias is None else z + bias[i].to(x.dtype)
-    fr = torch.stack([torch.softmax(_logit(hf, Wr, b_r, i), dim=-1) for i in range(D)], 0)  # [D,BH,T,b]
-    fw = torch.stack([torch.softmax(_logit(hf, Ww, b_w, i), dim=-1) for i in range(D)], 0)
+    def _logit(W, bias, i):
+        # per-head: h[b,head]·W[head,i] -> [B,H,T,b], refold to [BH,T,b].
+        z = torch.einsum('bhtd,hdc->bhtc', hr, W[:, i].to(hf.dtype))
+        if bias is not None:
+            z = z + bias[:, i].to(hf.dtype)[None, :, None, :]
+        return z.reshape(BH, T, -1)
+    fr = torch.stack([torch.softmax(_logit(Wr, b_r, i), dim=-1) for i in range(D)], 0)  # [D,BH,T,b]
+    fw = torch.stack([torch.softmax(_logit(Ww, b_w, i), dim=-1) for i in range(D)], 0)
     # OUT-OF-PLACE leaf-product (column-stack), so the gates stay differentiable w.r.t. b_r/b_w (the
     # in-place `r[...,leaf] *= ` aliases a view and breaks autograd through the optional bias inputs).
     rc, wc = [], []
@@ -4230,7 +4295,7 @@ def _rola_routed_readout(qf, kf, vf, hf, Wr, Ww, D, b, chunk_size, b_r=None, b_w
             return rola_gla_routed_triton(qf, kf, vf, hf, Wr, Ww, ld, D, b, chunk=chunk_size,
                                           b_r=b_r, b_w=b_w)
         return rola_rla_routed_triton(qf, kf, vf, hf, Wr, Ww, D, b, chunk=chunk_size, b_r=b_r, b_w=b_w)
-    r, w = _tree_gates_torch(hf, Wr, Ww, D, b, b_r=b_r, b_w=b_w)
+    r, w = _tree_gates_torch(hf, Wr, Ww, D, b, Wr.shape[0], b_r=b_r, b_w=b_w)
     return _rola_chunk_core(qf, kf, vf, w, r, ld, chunk_size)
 
 
@@ -4245,12 +4310,14 @@ def chunk_rola_routed(q, k, v, h, Wr, Ww, D, b, norm='kappa', kappa=None, scale=
         q, k:  φ-mapped queries/keys [B, T, H, K].
         v:     values [B, T, H, V].
         h:     pre-routing hidden state [B, T, H, d_model] (the router lives in the kernel).
-        Wr,Ww: per-level read/write router weights [D, d_model, b]  (b^D = nc).
+        Wr,Ww: PER-HEAD read/write router weights [H, D, d_model, b]  (b^D = nc). Each head h routes
+               with its OWN [D,d_model,b] tree weights (RoLA's per-head routing — the kernel indexes
+               head = (B·H fold-row) % H). d_model is the per-head router input width.
         D, b:  tree depth and branching (flat: D=1,b=nc; square: D=2,b=√nc; tree: b=2).
         norm:  'raw' | 'global' | 'per_state' | 'kappa'.
         kappa: per-token exponent [B,T,H,1] (required for norm='kappa').
         scale: query scale (default 1/sqrt(K)).
-        b_r,b_w: OPTIONAL per-level routing bias [D, b] — the affine term of softmax(h·W + b), giving
+        b_r,b_w: OPTIONAL PER-HEAD routing bias [H, D, b] — the affine term of softmax(h·W + b), giving
                  the routing a non-uniform prior (default None = uniform start, backward-compatible).
         g:     OPTIONAL per-state log-decay [B, T, H, nc] for the scalar-gated (GLA) variant. None = RLA
                (byte-identical to the no-g path); the decayed scan uses rt=r·e^a, w_end=w·e^{Λ-a} and a
@@ -4315,7 +4382,7 @@ def chunk_rola_routed(q, k, v, h, Wr, Ww, D, b, norm='kappa', kappa=None, scale=
     # explicit gates + the eager-core numerator. ALL CUDA normalized norms (incl. 'global') route through
     # the fused in-kernel den path above, so `_tree_gates_torch` is never on the production CUDA path.
     # The bias is threaded here too (out-of-place gates) so the fallback honors softmax(h·W+b).
-    rf, wf = _tree_gates_torch(hf, Wr, Ww, D, b, b_r=b_r, b_w=b_w)
+    rf, wf = _tree_gates_torch(hf, Wr, Ww, D, b, H, b_r=b_r, b_w=b_w)
     rf, wf = rf.to(compute_dtype), wf.to(compute_dtype)
     d = _perstate_den_torch(qf, kf, wf, gf, chunk_size, eps)
     if norm == 'kappa':

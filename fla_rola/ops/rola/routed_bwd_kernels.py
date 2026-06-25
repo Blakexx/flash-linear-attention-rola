@@ -167,7 +167,7 @@ def _bwd_intra_kernel(
     h_ptr, q_ptr, k_ptr, v_ptr, wr_ptr, ww_ptr, sel_ptr, ld_ptr, do_ptr,
     dq_ptr, dk_ptr, dv_ptr, dh_ptr, dwr_ptr, dww_ptr, gda_ptr,
     br_ptr, bw_ptr, dbr_ptr, dbw_ptr,
-    L, d_model, dqk, dv, nc,
+    L, d_model, dqk, dv, nc, H, swr_head, sww_head, sbr_head, sbw_head,
     sh_b, sh_l, sh_d, sq_b, sq_l, sq_d, sv_b, sv_l, sv_d,
     swr_lvl, swr_d, swr_b, sww_lvl, sww_d, sww_b,
     ssel_lvl, ssel_b, ssel_c, sg_b, sg_l, sg_c, sga_b, sga_l, sga_c,
@@ -185,6 +185,18 @@ def _bwd_intra_kernel(
     # buffer (the read/state kernels add their da-pieces; the driver reverse-cumsums gda → dld).
     pid_b = tl.program_id(0)
     pid_t = tl.program_id(1)
+    # Per-head router: BH fold is (B,H) -> head = pid_b % H. Offset the READ (Wr/Ww/bias) AND the
+    # WRITE (dWr/dWw/dbias) pointers to THIS head's [D,d_model,b] slice; the fold's atomic-adds then
+    # accumulate into the head's own grad slice. dh/h stay per-row (already head-indexed by pid_b).
+    _hd = pid_b % H
+    wr_ptr = wr_ptr + _hd * swr_head
+    ww_ptr = ww_ptr + _hd * sww_head
+    br_ptr = br_ptr + _hd * sbr_head
+    bw_ptr = bw_ptr + _hd * sbw_head
+    dwr_ptr = dwr_ptr + _hd * swr_head
+    dww_ptr = dww_ptr + _hd * sww_head
+    dbr_ptr = dbr_ptr + _hd * sbr_head
+    dbw_ptr = dbw_ptr + _hd * sbw_head
     offs_t = tl.arange(0, BT)
     offs_v = tl.arange(0, BV)
     offs_k = tl.arange(0, BK)
@@ -282,7 +294,7 @@ def _bwd_intra_kernel(
 def _bwd_inter_read_kernel(
     h_ptr, q_ptr, wr_ptr, ww_ptr, sel_ptr, ld_ptr, s_ptr, ds_ptr, do_ptr,
     dq_ptr, gdr_ptr, gda_ptr, br_ptr, bw_ptr,
-    L, d_model, dqk, dv, nc, t_start,
+    L, d_model, dqk, dv, nc, t_start, H, swr_head, sww_head, sbr_head, sbw_head,
     sh_b, sh_l, sh_d, sq_b, sq_l, sq_d,
     swr_lvl, swr_d, swr_b, sww_lvl, sww_d, sww_b,
     ssel_lvl, ssel_b, ssel_c, sgl_b, sgl_l, sgl_c, ss_b, ss_c, ss_k, ss_v,
@@ -296,6 +308,11 @@ def _bwd_inter_read_kernel(
     # dq/dS_read flow through rt; the read routing-factor grad is drt·eᵃ (→ gdr) and the read-gate decay
     # adjoint dart_inter=drt·rt is accumulated into the persistent gda buffer (the driver reverse-cumsums).
     pid_b = tl.program_id(0)
+    _hd = pid_b % H                              # per-head router slice (BH fold is (B,H)); read-only here
+    wr_ptr = wr_ptr + _hd * swr_head
+    ww_ptr = ww_ptr + _hd * sww_head
+    br_ptr = br_ptr + _hd * sbr_head
+    bw_ptr = bw_ptr + _hd * sbw_head
     ND_V = (dv + BV - 1) // BV       # value-blocks (BV is the value TILE; ND_V==1 ⇒ the un-tiled kernel)
     offs_t = tl.arange(0, BT)
     offs_bb = tl.arange(0, BB)
@@ -370,7 +387,7 @@ def _bwd_inter_read_kernel(
 def _bwd_inter_state_kernel(
     h_ptr, k_ptr, v_ptr, wr_ptr, ww_ptr, sel_ptr, ld_ptr, sj_ptr, ds_ptr,
     dk_ptr, dv_ptr, gdw_ptr, gda_ptr, br_ptr, bw_ptr,
-    L, d_model, dqk, dv, nc, t_start,
+    L, d_model, dqk, dv, nc, t_start, H, swr_head, sww_head, sbr_head, sbw_head,
     sh_b, sh_l, sh_d, sq_b, sq_l, sq_d, sv_b, sv_l, sv_d,
     swr_lvl, swr_d, swr_b, sww_lvl, sww_d, sww_b,
     ssel_lvl, ssel_b, ssel_c, sgl_b, sgl_l, sgl_c, ss_b, ss_c, ss_k, ss_v,
@@ -386,6 +403,11 @@ def _bwd_inter_state_kernel(
     # placed on the LAST row of gda. ds_in MUST be the pre-decvec adjoint of S_{j+1} (the driver applies
     # the e^Λ state-carry decay to ds AFTER this kernel, before the read kernel folds dS_read).
     pid_b = tl.program_id(0)
+    _hd = pid_b % H                              # per-head router slice (BH fold is (B,H)); read-only here
+    wr_ptr = wr_ptr + _hd * swr_head
+    ww_ptr = ww_ptr + _hd * sww_head
+    br_ptr = br_ptr + _hd * sbr_head
+    bw_ptr = bw_ptr + _hd * sbw_head
     ND_V = (dv + BV - 1) // BV       # value-blocks (BV is the value TILE; ND_V==1 ⇒ the un-tiled kernel)
     offs_t = tl.arange(0, BT)
     offs_bb = tl.arange(0, BB)
@@ -465,7 +487,7 @@ def _bwd_inter_state_kernel(
 def _fold_kernel(
     h_ptr, wr_ptr, ww_ptr, sel_ptr, gdr_ptr, gdw_ptr,
     dh_ptr, dwr_ptr, dww_ptr, br_ptr, bw_ptr, dbr_ptr, dbw_ptr,
-    L, d_model, nc, t_start,
+    L, d_model, nc, t_start, H, swr_head, sww_head, sbr_head, sbw_head,
     sh_b, sh_l, sh_d, swr_lvl, swr_d, swr_b, sww_lvl, sww_d, sww_b,
     ssel_lvl, ssel_b, ssel_c, sg_b, sg_t, sg_c, sdh_b, sdh_l, sdh_d,
     sbr_lvl, sbr_b, sbw_lvl, sbw_b,
@@ -475,6 +497,15 @@ def _fold_kernel(
     HAS_BIAS: tl.constexpr,
 ):
     pid_b = tl.program_id(0)
+    _hd = pid_b % H                              # per-head router slice (BH fold is (B,H))
+    wr_ptr = wr_ptr + _hd * swr_head
+    ww_ptr = ww_ptr + _hd * sww_head
+    br_ptr = br_ptr + _hd * sbr_head
+    bw_ptr = bw_ptr + _hd * sbw_head
+    dwr_ptr = dwr_ptr + _hd * swr_head
+    dww_ptr = dww_ptr + _hd * sww_head
+    dbr_ptr = dbr_ptr + _hd * sbr_head
+    dbw_ptr = dbw_ptr + _hd * sbw_head
     offs_t = tl.arange(0, BT)
     offs_bb = tl.arange(0, BB)
     offs_c = tl.arange(0, BC)
