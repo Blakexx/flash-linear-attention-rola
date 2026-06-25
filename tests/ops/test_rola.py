@@ -1,31 +1,27 @@
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 
-"""Correctness suite for the routed RoLA operator (`chunk_rola`) and its Triton kernels.
+"""Correctness suite for the routed RoLA operator.
 
-Pytest port of the four original script-style harnesses, preserving every gate with the SAME
-shapes / dtypes / tolerances / fp64 oracles (the new file passing IS the correctness gate — it is
-not weakened):
+The precomputed-gate RoLA Triton kernels (the numerator-readout and per-state-den kernels) are
+RETIRED (#44 convergence): the public `chunk_rola` is now a PURE-TORCH naive reference
+(`C._chunk_rola_impl`), and the routed math lives entirely in the in-kernel routed op
+(`chunk_rola_routed` / `fused_recurrent_rola`). The suite therefore validates:
 
   * INTER equivalence (was test_recurrent_vs_chunked.py): the chunked (vh `chunk_simple_gla`),
-    recurrent (step `fused_recurrent_simple_gla`) and routed (`chunk_rola`) forms agree with each
-    other and — for the global norm — with the direct O(L²) naive oracle, across
-    {RLA,GLA} × nc × dv × norm{global,kappa,per_state}. Plus the INTER backward: the routed-kernel
-    analytic grad == autograd through the naive oracle AND the vh chunk, at BT=16 fp32.
-  * KERNEL vs fp64 ORACLE (was test_rola_routed_tiling.py): fp64 gradcheck of the naive oracles,
-    then the numerator-readout AND per-state-den Triton kernels (RLA + GLA) vs the fp64 oracle —
-    forward + analytic backward — swept across the feature dim K (<=64 SRAM regime and well beyond),
-    plus the den caller E2E at dqk=128.
-  * INTRA branch-invariance (was test_kernel_self_consistency.py): at dv=64 the value tile BV admits
-    ND_V=4 (BV=16) and ND_V=2 (BV=32); both are forced and the full fwd+bwd must agree (fp32, BT=16).
-  * DEN-FWD config sweep (was test_den_fwd_tile_sweep.py): FORCE every autotune feature-tile (BD)
-    config of the two den-forward kernels and assert each matches the fp64 oracle — the only check
-    that exercises the small-SMEM fallback tiles the autotuner never picks on the dev card.
+    recurrent (step `fused_recurrent_simple_gla`) and routed (the torch-naive `chunk_rola`) forms
+    agree with each other and — for the global norm — with the direct O(L²) naive oracle, across
+    {RLA,GLA} × nc × dv × norm{global,kappa,per_state}. Plus the INTER backward: the routed grad ==
+    autograd through the naive oracle AND the vh chunk, at BT=16 fp32.
+  * The naive fp64 ORACLE gradchecks (the anchor for the inter-equivalence gates).
+  * RECURRENT (decode) handoff + carried-state equivalence; the signed-den consistency and the
+    below-floor ld guard.
+  * The in-kernel ROUTED op (`chunk_rola_routed`): faithfulness + fp64-autograd vs the chunked
+    reference, per-head routing/decay independence, non-pow2 dv backward, optional routing bias,
+    torch.compile parity, and the in-kernel routed GLA forward — all anchored to the SINGLE
+    canonical per-head gate truth (`_per_head_gates`).
 
 Run:  PYTHONPATH=. pytest tests/ops/test_rola.py -q   (CUDA required; CPU is skipped).
 """
-
-import contextlib
-import itertools
 
 import pytest
 import torch
@@ -33,17 +29,9 @@ import triton
 
 import fla_rola.ops.rola.chunk as C
 from fla_rola.ops.rola import chunk_rola, fused_recurrent_rola
-from fla_rola.ops.rola.chunk import (
-    rola_gla_triton,
-    rola_perstate_den_gla_triton,
-    rola_perstate_den_triton,
-    rola_rla_triton,
-)
 from fla_rola.ops.rola.naive import (
     naive_rola_gla,
-    naive_rola_gla_perstate_den,
     naive_rola_global,
-    naive_rola_perstate_den,
 )
 from fla_rola.ops.simple_gla import chunk_simple_gla
 from fla_rola.ops.simple_gla.fused_recurrent import fused_recurrent_simple_gla
@@ -146,10 +134,10 @@ def _naive(q, k, v, r, w, ld, gla):
 
 
 def _routed(q, k, v, r, w, ld, nc, norm):
-    """The first-class chunk_rola operator — the third leg of vh == routed-kernel == naive."""
+    """The torch-naive routed reference (`_chunk_rola_impl`) — the third leg of vh == routed == naive."""
     kap = (torch.full((q.shape[0], q.shape[1], _H, 1), KAPPA, device=q.device, dtype=q.dtype)
            if norm == 'kappa' else None)
-    return chunk_rola(q, k, v, r=r, w=w, g=ld, norm=norm, kappa=kap, scale=1.0)
+    return C._chunk_rola_impl(q, k, v, r=r, w=w, g=ld, norm=norm, kappa=kap, scale=1.0)
 
 
 # Inter equivalence is the heaviest cell (6 seeds × 3 paths, and the vh `chunk_simple_gla` RECOMPILES
@@ -266,38 +254,6 @@ def _mk_oracle(B, L, H, K, nc, dv, dtype, seed=0, with_ld=False):
     return q, k, v, rg, wg
 
 
-def _rla_normalized(q, k, v, rg, wg):
-    """[B,L,H,*] -> normalized [B,L,H,dv] via the SPLIT path (numerator-only kernel + global den
-    reconstructed as Σ_c rgᶜ·dᶜ from the per-state den pre-pass)."""
-    B, L, H, dv = v.shape
-    qf, kf, rgf, wgf = _fold(q), _fold(k), _fold(rg), _fold(wg)
-    numf = rola_rla_triton(qf, kf, _fold(v), rgf, wgf)
-    d = rola_perstate_den_triton(qf, kf, wgf)
-    denf = (rgf * d).sum(-1, keepdim=True)
-    return _unfold(numf / (denf + EPS), B, H)
-
-
-def _gla_normalized(q, k, v, rg, wg, ld):
-    B, L, H, dv = v.shape
-    qf, kf, rgf, wgf, ldf = _fold(q), _fold(k), _fold(rg), _fold(wg), _fold(ld)
-    numf = rola_gla_triton(qf, kf, _fold(v), rgf, wgf, ldf)
-    d = rola_perstate_den_gla_triton(qf, kf, wgf, ldf)
-    denf = (rgf * d).sum(-1, keepdim=True)
-    return _unfold(numf / (denf + EPS), B, H)
-
-
-# Awkward-dim sweeps shared across the kernel tests below. These are the AXES that historically hid
-# padding/stride/masking bugs (the dv=24 grad-corruption class): non-pow2 dv (24), large dqk (64,128)
-# where forward generality was UNVERIFIED, and non-pow2 nc (96). A SMART SUBSET (not the full Cartesian
-# product — each fresh shape is a separate kernel autotune/compile, so the full grid is hours): 16 pow2
-# + 24 non-pow2 (the LM dim) + 32 pow2-tiled for dv, and one non-pow2 nc=96. Any padding/stride/masking
-# bug in the class fires SOMEWHERE in this subset. (The over-comprehensive dv∈{16,24,32,48} ×
-# dqk∈{16,24,64,128} grid is left to the optional `dimsweep`-marked runs; this subset is the permanent
-# fast regression gate.)
-_SWEEP_DV = [16, 24, 32]            # 16 un-tiled (ND_V==1); 24 non-pow2 (LM dim); 32 pow2 value-tiled
-_SWEEP_NC = [96]                    # one non-pow2 nc (padded-tail dmask); RLA bwd holds, GLA hits #28
-
-
 # Oracle gradchecks: tiny-K fp64 reference. Sweep dv (incl. non-pow2) and nc (incl. non-pow2) so the
 # oracle whose grads anchor every kernel test is itself proven valid at the awkward dims.
 @pytest.mark.parametrize('dv', [4, 24, 48])
@@ -327,91 +283,6 @@ def test_oracle_gradcheck_gla(nc, dv):
         tuple(ins), eps=1e-6, atol=1e-5, rtol=1e-4)
 
 
-# K spans the K<=64 SRAM regime AND well beyond (the conservative-bound region the tiling makes robust).
-_KS = [16, 64, 128, 256, 512]
-_KS_DEN = [16, 64, 96, 128, 256, 512]   # +96 (non-pow2) exercises the padded-tail dmask
-
-# Curated (dqk, dv) cells for the readout-backward sweep — a SMART SUBSET, not the full Cartesian
-# product, because every fresh (dqk,nc,dv) shape is a separate Triton autotune/compile and the
-# value-tiled fp32 backward at large dqk × non-pow2 dv has a huge config space (minutes per cell). These
-# cells cover the bug class without the autotune blow-up:
-#   (16,16): un-tiled ND_V==1 baseline.  (16,24): non-pow2 dv (LM dim) — the stride/mask class, fast at
-#   dqk=16.  (16,32): pow2 value-tiled.  (64,16): LARGE dqk (the previously-UNVERIFIED region the routed
-#   fix made robust) — proven at the cheap dv=16 config.
-# Large-dqk × non-pow2-dv is additionally covered (more cheaply) by the routed/kappa family
-# (`test_kappa_routed_autograd_fp64`, `test_routed_bwd_nonpow2_dv` at dqk∈{64,128} × dv∈{24,48}) and by
-# `test_den_caller_e2e_dqk128`. nc is fixed to the one non-pow2 value (96) by `_SWEEP_NC`.
-_BWD_KV_RLA = [(16, 16), (16, 24), (16, 32), (64, 16)]
-# GLA mirror: dqk=16 sweeps dv (dv=16 PASSES; dv>=24 xfails #28); the large-dqk cell xfails #28.
-_BWD_KV_GLA = [(16, 16), (16, 24), (16, 32), (64, 16)]
-
-# dqk-only sweeps for the readout backward (dv/nc swept separately). RLA bwd holds at scale → up to 128;
-# GLA bwd dqk>=64 fits SMEM after #28 (the decay-replay WV-split), so dqk=64 must PASS (no #28 OOM).
-_BWD_DQK_RLA = [16, 64, 128]
-_BWD_DQK_GLA = [16, 64]
-
-# The GLA readout backward replays the per-state decay (exp cumsum) into SMEM. On this card (sm86, 99KB
-# = 101376 B per-block cap) that block OVERFLOWS whenever the value tile is BV=32 (i.e. dv>=24, the LM
-# dim) OR dqk>=64 — Triton then raises OutOfResources. Measured: dv=24 needs 108800 B at EVERY nc/dqk;
-# dqk>=64 needs 112640 B. This is task #28 (the decay-replay SMEM wall), a SEPARATE fix — NOT a
-# stride/padding/masking bug, and it fires off MULTIPLE awkward axes (dv AND dqk), so a static per-param
-# xfail can't capture it. We catch the OutOfResources at run time and xfail it as #28; ANY OTHER failure
-# (a real numerical stride/mask bug raises AssertionError, not OutOfResources) still trips the test.
-_GLA_BWD_OOM = triton.runtime.errors.OutOfResources
-
-
-def _run_or_xfail_gla28(fn):
-    """Run a GLA readout-backward closure; xfail as #28 iff it hits the decay-replay SMEM OutOfResources
-    (the documented SEPARATE fix). A real correctness bug raises AssertionError and is NOT swallowed."""
-    try:
-        fn()
-    except _GLA_BWD_OOM as e:
-        pytest.xfail(f'#28 decay-replay SMEM wall: GLA readout-bwd OutOfResources ({str(e).splitlines()[0]})')
-
-
-@pytest.mark.parametrize('K', _KS)
-def test_readout_fwd_rla(K):
-    """RLA numerator-readout normalized fwd: kernel(fp32) vs oracle(fp64). TOL 5e-3."""
-    if device != 'cuda':
-        pytest.skip('RoLA Triton kernels require CUDA')
-    q, k, v, rg, wg = _mk_oracle(2, 64, 2, K, nc=4, dv=16, dtype=torch.float64)
-    ref = naive_rola_global(q, k, v, wg, rg)
-    out = _rla_normalized(*[t.float() for t in (q, k, v, rg, wg)]).double()
-    assert _relmax(out, ref) < 5e-3
-
-
-@pytest.mark.parametrize('dv', _SWEEP_DV)         # non-pow2 dv (24): the _bwd_split alloc-stride class
-@pytest.mark.parametrize('nc', _SWEEP_NC)         # non-pow2 nc (96): the per-state dmask padded tail
-@pytest.mark.parametrize('K', _BWD_DQK_RLA)       # dqk incl. large 64/128 (RLA bwd must hold at scale)
-def test_readout_bwd_rla(K, nc, dv):
-    """RLA analytic grads (fp32 autograd) vs oracle analytic grads (fp64 autograd), per input. TOL 8e-3.
-    Swept over non-pow2 dv/nc and large dqk — the `_bwd_split_rla` (`_par_grad_rla_*`) value-tiled
-    backward, the exact class of kernel the dv=24 corruption hid in.
-    NEVER gradcheck-in-fp64 through the fp32 kernel (fails to compile by construction)."""
-    if device != 'cuda':
-        pytest.skip('RoLA Triton kernels require CUDA')
-    q, k, v, rg, wg = _mk_oracle(2, 48, 2, K, nc=nc, dv=dv, dtype=torch.float32)
-    ik = [t.clone().requires_grad_(True) for t in (q, k, v, rg, wg)]
-    _rla_normalized(*ik).sum().backward()
-    io = [t.double().detach().requires_grad_(True) for t in (q, k, v, rg, wg)]
-    naive_rola_global(io[0], io[1], io[2], io[4], io[3]).sum().backward()
-    worst = max((ik[i].grad.double() - io[i].grad).abs().max().item()
-                / (io[i].grad.abs().max().item() + 1e-9) for i in range(5))
-    assert worst < 8e-3
-
-
-@pytest.mark.parametrize('K', _KS)
-def test_readout_fwd_gla(K):
-    """GLA numerator-readout normalized fwd vs oracle(fp64). TOL 3e-2 (GLA exp(cumsum(ld)) decay caps
-    fp32-vs-fp64 at ~1.5e-2; the tight GLA-fwd gate is the inter routed==chunk fp32-vs-fp32 ~1.5e-3)."""
-    if device != 'cuda':
-        pytest.skip('RoLA Triton kernels require CUDA')
-    q, k, v, rg, wg, ld = _mk_oracle(2, 64, 2, K, nc=4, dv=16, dtype=torch.float64, with_ld=True)
-    ref = naive_rola_gla(q, k, v, wg, rg, ld, normalized=True)
-    out = _gla_normalized(*[t.float() for t in (q, k, v, rg, wg, ld)]).double()
-    assert _relmax(out, ref) < 3e-2
-
-
 _GLA_BWD_TOL = 1.2e-1   # GLA decay fp32 floor (NOT a kernel bug): the gate/decay grads (drg,dwg,dld) flow
 #                       through the softmax-gate × exp(cumsum(ld)) product across the chunked recurrence,
 #                       whose fp32-vs-fp64 floor is ~9e-2 worst-case (the dwg grad; seed-driven, present
@@ -420,263 +291,6 @@ _GLA_BWD_TOL = 1.2e-1   # GLA decay fp32 floor (NOT a kernel bug): the gate/deca
 #                       grads stay ~5e-3 (the tight stride/mask gate asserted separately below). After #28
 #                       the decay-replay fits SMEM at dv>=24/dqk>=64 too, so those cells now RUN (no longer
 #                       #28-OOM-xfail) and hit this same floor. Tight-grad GLA validation = GLA/RLA parity sync.
-
-
-@pytest.mark.parametrize('dv', _SWEEP_DV)
-@pytest.mark.parametrize('nc', _SWEEP_NC)
-@pytest.mark.parametrize('K', _BWD_DQK_GLA)
-def test_readout_bwd_gla(K, nc, dv):
-    """GLA analytic grads vs oracle analytic grads, per input (incl. dld). Swept over non-pow2 dv/nc and
-    large dqk. TWO gates: q,k,v grads (the stride/mask-sensitive readout half) MUST hold to the tight
-    RLA-grade 8e-3 — this is the real correctness gate, proving the value/feature tiling is bit-correct;
-    the gate/decay grads (rg,wg,ld) only to `_GLA_BWD_TOL` (the GLA softmax×exp-decay fp32 floor). After
-    #28 (the decay-replay WV-split) the kernel fits SMEM at dv>=24 AND dqk>=64, so ALL cells now RUN to
-    completion (the `_run_or_xfail_gla28` OOM-xfail is retained as a guard but no longer fires here). A
-    real stride/mask bug trips the tight qkv assert (AssertionError, NOT swallowed by the OOM guard)."""
-    if device != 'cuda':
-        pytest.skip('RoLA Triton kernels require CUDA')
-    q, k, v, rg, wg, ld = _mk_oracle(2, 48, 2, K, nc=nc, dv=dv, dtype=torch.float32, with_ld=True)
-
-    def _check():
-        ik = [t.clone().requires_grad_(True) for t in (q, k, v, rg, wg, ld)]
-        _gla_normalized(*ik).sum().backward()
-        io = [t.double().detach().requires_grad_(True) for t in (q, k, v, rg, wg, ld)]
-        naive_rola_gla(io[0], io[1], io[2], io[4], io[3], io[5], normalized=True).sum().backward()
-        # q,k,v grads (the stride/mask-sensitive readout half) hold to the tight RLA-grade gate; the
-        # gate/decay grads (rg,wg,ld) only to the GLA decay floor. Assert each at its appropriate tol.
-        rels = [(ik[i].grad.double() - io[i].grad).abs().max().item()
-                / (io[i].grad.abs().max().item() + 1e-9) for i in range(6)]
-        assert max(rels[:3]) < 8e-3, f'qkv grads {rels[:3]}'   # tight: stride/mask correctness gate
-        worst = max(rels)
-        assert worst < _GLA_BWD_TOL, f'grads {rels}'
-    _run_or_xfail_gla28(_check)
-
-
-@pytest.mark.parametrize('K', _KS_DEN)
-def test_den_fwd_rla(K):
-    """RLA per-state den fwd: kernel(fp32) vs oracle(fp64). TOL 5e-3."""
-    if device != 'cuda':
-        pytest.skip('RoLA Triton kernels require CUDA')
-    q, k, v, rg, wg = _mk_oracle(2, 64, 2, K, nc=4, dv=16, dtype=torch.float64)
-    ref = naive_rola_perstate_den(q, k, wg)
-    out = _unfold(rola_perstate_den_triton(_fold(q.float()), _fold(k.float()), _fold(wg.float())), 2, 2).double()
-    assert _relmax(out, ref) < 5e-3
-
-
-@pytest.mark.parametrize('K', _KS_DEN)
-def test_den_bwd_rla(K):
-    """RLA per-state den analytic grads vs oracle. TOL 8e-3."""
-    if device != 'cuda':
-        pytest.skip('RoLA Triton kernels require CUDA')
-    q, k, v, rg, wg = _mk_oracle(2, 48, 2, K, nc=4, dv=16, dtype=torch.float32)
-    ik = [t.clone().requires_grad_(True) for t in (q, k, wg)]
-    _unfold(rola_perstate_den_triton(_fold(ik[0]), _fold(ik[1]), _fold(ik[2])), 2, 2).sum().backward()
-    io = [t.double().detach().requires_grad_(True) for t in (q, k, wg)]
-    naive_rola_perstate_den(io[0], io[1], io[2]).sum().backward()
-    worst = max((ik[i].grad.double() - io[i].grad).abs().max().item()
-                / (io[i].grad.abs().max().item() + 1e-9) for i in range(3))
-    assert worst < 8e-3
-
-
-@pytest.mark.parametrize('K', _KS_DEN)
-def test_den_fwd_gla(K):
-    """GLA per-state den fwd vs oracle(fp64). TOL 3e-2 (GLA decay fp32-vs-fp64 floor)."""
-    if device != 'cuda':
-        pytest.skip('RoLA Triton kernels require CUDA')
-    q, k, v, rg, wg, ld = _mk_oracle(2, 64, 2, K, nc=4, dv=16, dtype=torch.float64, with_ld=True)
-    ref = naive_rola_gla_perstate_den(q, k, wg, ld)
-    out = _unfold(rola_perstate_den_gla_triton(_fold(q.float()), _fold(k.float()),
-                                               _fold(wg.float()), _fold(ld.float())), 2, 2).double()
-    assert _relmax(out, ref) < 3e-2
-
-
-@pytest.mark.parametrize('K', _KS_DEN)
-def test_den_bwd_gla(K):
-    """GLA per-state den analytic grads vs oracle (incl. the dld column). TOL 8e-3."""
-    if device != 'cuda':
-        pytest.skip('RoLA Triton kernels require CUDA')
-    q, k, v, rg, wg, ld = _mk_oracle(2, 48, 2, K, nc=4, dv=16, dtype=torch.float32, with_ld=True)
-    ik = [t.clone().requires_grad_(True) for t in (q, k, wg, ld)]
-    _unfold(rola_perstate_den_gla_triton(_fold(ik[0]), _fold(ik[1]), _fold(ik[2]), _fold(ik[3])), 2, 2).sum().backward()
-    io = [t.double().detach().requires_grad_(True) for t in (q, k, wg, ld)]
-    naive_rola_gla_perstate_den(io[0], io[1], io[2], io[3]).sum().backward()
-    worst = max((ik[i].grad.double() - io[i].grad).abs().max().item()
-                / (io[i].grad.abs().max().item() + 1e-9) for i in range(4))
-    assert worst < 8e-3
-
-
-@pytest.mark.parametrize('gla', [False, True])
-def test_den_caller_e2e_dqk128(gla):
-    """E2E den caller at dqk=128 (the now-ungated model path): the Triton den entry points match the
-    eager oracle (fwd + grads), RLA and GLA. fwd<2e-2, grad<3e-2."""
-    if device != 'cuda':
-        pytest.skip('RoLA Triton kernels require CUDA')
-    K = 128
-    if not gla:
-        q, k, v, rg, wg = _mk_oracle(2, 48, 2, K, nc=4, dv=16, dtype=torch.float32)
-        ik = [t.clone().requires_grad_(True) for t in (q, k, wg)]
-        _unfold(rola_perstate_den_triton(_fold(ik[0]), _fold(ik[1]), _fold(ik[2])), 2, 2).sum().backward()
-        io = [t.double().detach().requires_grad_(True) for t in (q, k, wg)]
-        ref = naive_rola_perstate_den(io[0], io[1], io[2])
-        ref.sum().backward()
-        fwd = _relmax(_unfold(rola_perstate_den_triton(_fold(q), _fold(k), _fold(wg)), 2, 2).double(), ref)
-        gw = max((ik[i].grad.double() - io[i].grad).abs().max().item()
-                 / (io[i].grad.abs().max().item() + 1e-9) for i in range(3))
-    else:
-        q, k, v, rg, wg, ld = _mk_oracle(2, 48, 2, K, nc=4, dv=16, dtype=torch.float32, with_ld=True)
-        ik = [t.clone().requires_grad_(True) for t in (q, k, wg, ld)]
-        _unfold(rola_perstate_den_gla_triton(_fold(ik[0]), _fold(ik[1]), _fold(ik[2]), _fold(ik[3])), 2, 2).sum().backward()
-        io = [t.double().detach().requires_grad_(True) for t in (q, k, wg, ld)]
-        ref = naive_rola_gla_perstate_den(io[0], io[1], io[2], io[3])
-        ref.sum().backward()
-        fwd = _relmax(_unfold(rola_perstate_den_gla_triton(_fold(q), _fold(k), _fold(wg), _fold(ld)), 2, 2).double(), ref)
-        gw = max((ik[i].grad.double() - io[i].grad).abs().max().item()
-                 / (io[i].grad.abs().max().item() + 1e-9) for i in range(4))
-    assert fwd < 2e-2 and gw < 3e-2, f'fwd={fwd:.2e} grad={gw:.2e}'
-
-
-# =============================================================================
-# INTRA branch-invariance: at dv=64 force ND_V=4 (BV=16) vs ND_V=2 (BV=32) and assert fwd+bwd agree.
-# (was tests/test_kernel_self_consistency.py — BT=16 fp32 so the value-tiled fp32 configs fit.)
-# =============================================================================
-_VALUE_TILED = (C._scan_S, C._scan_dS, C._rola_fwd_inter, C._rola_gla_fwd_inter,
-                C._par_grad_rla_qr, C._par_grad_rla_kwv, C._par_grad_gla_qr, C._par_grad_gla_kwv)
-_HAS_BD = (C._par_grad_rla_qr, C._par_grad_rla_kwv, C._par_grad_gla_qr, C._par_grad_gla_kwv)
-
-
-def _force_bv(bv, warps, bd=16, stages=1):
-    """Pin every value-tiled kernel to one (BV, num_warps) config (grad kernels also need BD)."""
-    for k in _VALUE_TILED:
-        kw = {'BD': bd, 'BV': bv} if k in _HAS_BD else {'BV': bv}
-        k.configs = [triton.Config(dict(kw), num_warps=warps, num_stages=stages)]
-        with contextlib.suppress(Exception):
-            k.cache.clear()
-
-
-def _run_forced(gla, bv, warps, dv, B=2, H=2, L=128, K=16, nc=16, seed=0, dt=torch.float32):
-    """Forced-config forward+backward; returns (out, [grads]) as fp64."""
-    _force_bv(bv, warps)
-    g = torch.Generator(device=device).manual_seed(seed)
-
-    def rf(*s):
-        return torch.randn(*s, generator=g, device=device, dtype=torch.float64)
-    q = torch.nn.functional.elu(rf(B, L, H, K)) + 1.0
-    k = torch.nn.functional.elu(rf(B, L, H, K)) + 1.0
-    v = rf(B, L, H, dv)
-    r = torch.softmax(rf(B, L, H, nc), -1)
-    w = torch.softmax(rf(B, L, H, nc), -1)
-    ld = torch.log(torch.sigmoid(rf(B, L, H, nc))).clamp(min=-2.5)
-    coef = rf(B, L, H, dv)
-    nin = [q, k, v, r, w, ld] if gla else [q, k, v, r, w]
-    kin = [_fold(x.to(dt)).clone().requires_grad_() for x in nin]
-    out = (rola_gla_triton(*kin) if gla else rola_rla_triton(*kin))
-    gk = torch.autograd.grad((out.float() * _fold(coef.to(dt)).float()).sum(), kin)
-    return out.double(), [x.double() for x in gk]
-
-
-@pytest.mark.parametrize('gla', [False, True])
-def test_intra_branch_invariance(gla):
-    """dv=64: ND_V=4 (BV=16) vs ND_V=2 (BV=32) — same math, different value-block grouping (fp32
-    accumulation) → fwd AND every grad must agree to ~fp32 (1e-3, far under any tolerance). Validates
-    that every compiled tiling branch computes the same math (the autotuner picks just one per shape).
-    Runs at BT=16 fp32 so the value-tiled configs fit a small card."""
-    if device != 'cuda':
-        pytest.skip('RoLA Triton kernels require CUDA')
-    saved = (C._CHUNK, C._CHUNK_FWD)
-    saved_cfgs = {k: k.configs for k in _VALUE_TILED}
-    C._CHUNK = 16
-    C._CHUNK_FWD = 16
-    try:
-        dv = 64
-        o_a, g_a = _run_forced(gla, 16, 2, dv)   # ND_V=4
-        o_b, g_b = _run_forced(gla, 32, 2, dv)   # ND_V=2
-
-        def rel(a, b):
-            return ((a - b).norm() / (b.norm() + 1e-12)).item()
-        fwd = rel(o_a, o_b)
-        bwd = max(rel(a, b) for a, b in zip(g_a, g_b))
-        assert max(fwd, bwd) < 1e-3, f'forward-eq {fwd:.1e} backward-eq {bwd:.1e}'
-    finally:
-        C._CHUNK, C._CHUNK_FWD = saved
-        for k, cfg in saved_cfgs.items():     # restore autotune configs (the test pinned them)
-            k.configs = cfg
-            with contextlib.suppress(Exception):
-                k.cache.clear()
-
-
-# =============================================================================
-# DEN-FWD config sweep: FORCE every feature-tile (BD) config of the two den-forward kernels and
-# assert each matches the fp64 oracle — exercises the small-SMEM fallback tiles the autotuner never
-# picks on the dev card. (was tests/test_den_fwd_tile_sweep.py — CRITICAL, kept in full.)
-# =============================================================================
-_CHUNK = C._CHUNK
-
-
-def _fold3(t):
-    B, L, H = t.shape[:3]
-    return t.permute(0, 2, 1, 3).reshape(B * H, L, t.shape[-1])
-
-
-@contextlib.contextmanager
-def _force_config(kernel, cfg):
-    """Pin a triton.autotune kernel to a single config (len(configs)==1 => the Autotuner skips
-    pruning/benchmarking and uses configs[0] verbatim). Also clears+restores the autotune cache."""
-    saved_configs = kernel.configs
-    saved_cache = dict(kernel.cache)
-    kernel.configs = [cfg]
-    kernel.cache.clear()
-    try:
-        yield
-    finally:
-        kernel.configs = saved_configs
-        kernel.cache.clear()
-        kernel.cache.update(saved_cache)
-
-
-def _bd_configs(kernel):
-    """Distinct configs keyed by BD (the feature-tile knob)."""
-    by_bd = {}
-    for cfg in kernel.configs:
-        by_bd.setdefault(cfg.kwargs['BD'], cfg)
-    return by_bd
-
-
-@pytest.mark.parametrize('nc', [8, 24])
-@pytest.mark.parametrize('dqk', [16, 32, 64, 128])
-def test_den_fwd_tile_sweep(dqk, nc):
-    """Force EVERY (intra_BD × inter_BD) config of the den-forward kernels and assert RLA-kappa AND
-    GLA-kappa match the fp64 oracle. EVERY config (incl. the tiny tiles the autotuner never selects)
-    must match fp64 — that proves the small-SMEM fallback tiles are correct. TOL 2e-3."""
-    if device != 'cuda':
-        pytest.skip('RoLA Triton kernels require CUDA')
-    tol = 2e-3
-    torch.manual_seed(0xC0FFEE + dqk * 131 + nc)
-    B, H, L = 1, 2, 3 * _CHUNK + 5       # span >2 chunks + a ragged tail (exercises masking)
-    q = torch.randn(B, L, H, dqk, device=device, dtype=torch.float32) * 0.3
-    k = torch.randn(B, L, H, dqk, device=device, dtype=torch.float32) * 0.3
-    w = torch.rand(B, L, H, nc, device=device, dtype=torch.float32)
-    ld = -torch.rand(B, L, H, nc, device=device, dtype=torch.float32) * 0.1   # small negative log-decay
-    qf, kf, wf, ldf = _fold3(q), _fold3(k), _fold3(w), _fold3(ld)
-
-    ref_rla = _fold3(naive_rola_perstate_den(q.double(), k.double(), w.double(), chunk=_CHUNK))
-    ref_gla = _fold3(naive_rola_gla_perstate_den(q.double(), k.double(), w.double(), ld.double(), chunk=_CHUNK))
-
-    intra_cfgs = _bd_configs(C._den_fwd_intra)
-    inter_cfgs = _bd_configs(C._den_fwd_inter)
-
-    max_err = 0.0
-    n = 0
-    for (_bd_i, ci), (_bd_j, cj) in itertools.product(intra_cfgs.items(), inter_cfgs.items()):
-        with _force_config(C._den_fwd_intra, ci), _force_config(C._den_fwd_inter, cj):
-            d_rla = rola_perstate_den_triton(qf, kf, wf, chunk=_CHUNK)
-            d_gla = rola_perstate_den_gla_triton(qf, kf, wf, ldf, chunk=_CHUNK)
-        for got, ref in ((d_rla, ref_rla), (d_gla, ref_gla)):
-            # Global (Frobenius) relative error — robust to den elements crossing zero.
-            err = ((got.double() - ref).norm() / (ref.norm() + 1e-12)).item()
-            max_err = max(max_err, err)
-            n += 1
-    assert n > 0
-    assert max_err < tol, f'{n} configs swept, max rel err {max_err:.2e} (tol {tol:.0e})'
 
 
 # =============================================================================
@@ -1005,17 +619,18 @@ def test_kappa_routed_autograd_fp64(D, b, Kd, V, norm):
     rels = {n: _relmax(a.float(), b.float()) for n, a, b in zip(names, gf, ge)}
     assert _relmax(of.float(), oe.float()) < 1e-2, f'out {_relmax(of.float(), oe.float()):.2e}'
     assert all(r < 1e-2 for r in rels.values()), f'grads {rels}'
-    # UNIFIED-TRUTH cross-check: the fused routed output == the PRODUCTION chunk_rola fed the SAME
+    # UNIFIED-TRUTH cross-check: the fused routed output == _chunk_rola_impl (torch naive) fed the SAME
     # router's per-head gates (the gates `_per_head_gates` produces) — so the fused kernel is anchored to
-    # what chunk_rola does, not a fused-only reference. A shared-vs-per-head divergence fails this.
+    # what _chunk_rola_impl (torch naive) does, not a fused-only reference. A shared-vs-per-head
+    # divergence fails this.
     hf = h.float().permute(0, 2, 1, 3).reshape(B * H, T, dm)
     rg, wg = _per_head_gates(hf, Wr.float(), Ww.float(), D, b, H)
     rg = rg.view(B, H, T, -1).permute(0, 2, 1, 3).contiguous()
     wg = wg.view(B, H, T, -1).permute(0, 2, 1, 3).contiguous()
-    o_chunk = chunk_rola(q.float(), k.float(), v.float(), r=rg, w=wg,
-                         norm=norm, kappa=(kappa.float() if norm == 'kappa' else None), scale=scale)
+    o_chunk = C._chunk_rola_impl(q.float(), k.float(), v.float(), r=rg, w=wg,
+                                 norm=norm, kappa=(kappa.float() if norm == 'kappa' else None), scale=scale)
     assert _relmax(of.float(), o_chunk.float()) < 1e-2, \
-        f'routed != chunk_rola(per-head gates): {_relmax(of.float(), o_chunk.float()):.2e}'
+        f'routed != _chunk_rola_impl(per-head gates): {_relmax(of.float(), o_chunk.float()):.2e}'
 
 
 @pytest.mark.parametrize('norm', ['global', 'kappa', 'per_state'])
@@ -1342,70 +957,6 @@ def test_routed_bias_none_backcompat(norm, D, b):
         o_explicit = C.chunk_rola_routed(q, k, v, h, Wr, Ww, D, b, b_r=None, b_w=None, **kw)
         diff = (o_implicit.float() - o_explicit.float()).abs().max().item()
         assert diff == 0.0, f'{norm} {dt} bias=None not bit-identical: {diff}'
-
-
-# ============================================================================
-# V2 (#30): GLA torch.compile parity. The GLA readout + per-state den are now `rola::readout_gla` /
-# `rola::den_gla` custom_ops (the in-op `cdt` fp32-cast twins of the RLA ops), so chunk_rola with
-# g!=None compiles like RLA: 0 graph breaks (fullgraph), and compiled-vs-eager grads at the same
-# <0.5% noise floor (the in-op bf16 round is eager-deterministic, not inductor-reordered).
-# ============================================================================
-@pytest.mark.parametrize('norm', ['raw', 'global', 'per_state', 'kappa'])
-def test_gla_compile_fullgraph(norm):
-    """chunk_rola(g!=None) compiles fullgraph (0 graph breaks) for every norm — the V2 compile gate."""
-    if device != 'cuda':
-        pytest.skip('RoLA Triton kernels require CUDA')
-    B, H, T, K, V, nc = 2, 4, 128, 16, 32, 64
-    g_ = torch.Generator(device=device).manual_seed(0)
-
-    def mk(*s):
-        return torch.randn(*s, device=device, generator=g_)
-    q, k, v = mk(B, T, H, K), mk(B, T, H, K), mk(B, T, H, V)
-    r = torch.softmax(mk(B, T, H, nc), -1)
-    w = torch.softmax(mk(B, T, H, nc), -1)
-    ld = (-torch.rand(B, T, H, nc, device=device, generator=g_) * 0.5).clamp(min=-2.5)
-    kappa = torch.rand(B, T, H, 1, device=device, generator=g_) * 0.3
-    torch._dynamo.reset()
-    fn = torch.compile(C._chunk_rola_impl, fullgraph=True)
-    with torch.autocast('cuda', dtype=torch.bfloat16):
-        o = fn(q, k, v, r, w, g=ld, norm=norm, kappa=(kappa if norm == 'kappa' else None), scale=1.0)
-    assert o.shape == (B, T, H, V)
-
-
-@pytest.mark.parametrize('norm', ['global', 'per_state'])
-def test_gla_compile_grad_noise(norm):
-    """Compiled-vs-eager GLA grads under bf16 autocast land <0.5% (mirrors the RLA compile grad-noise
-    gate) — the in-op `cdt` cast keeps the bf16 round out of the compile-visible normalize glue."""
-    if device != 'cuda':
-        pytest.skip('RoLA Triton kernels require CUDA')
-    B, H, T, K, V, nc = 2, 4, 128, 16, 32, 64
-
-    def run(fn, seed):
-        g_ = torch.Generator(device=device).manual_seed(seed)
-
-        def mk(*s):
-            return torch.randn(*s, device=device, generator=g_)
-        q, k, v = mk(B, T, H, K), mk(B, T, H, K), mk(B, T, H, V)
-        r = torch.softmax(mk(B, T, H, nc), -1)
-        w = torch.softmax(mk(B, T, H, nc), -1)
-        ld = (-torch.rand(B, T, H, nc, device=device, generator=g_) * 0.5).clamp(min=-2.5)
-        ts = [q, k, v, r, w, ld]
-        for t in ts:
-            t.requires_grad_()
-        with torch.autocast('cuda', dtype=torch.bfloat16):
-            o = fn(q, k, v, r, w, g=ld, norm=norm, kappa=None, scale=1.0)
-        o.float().sum().backward()
-        return o.detach().float(), [t.grad.detach().float() for t in ts]
-
-    def rel(a, b):
-        return ((a - b).norm() / (b.norm() + 1e-12)).item()
-    torch._dynamo.reset()
-    comp = torch.compile(C._chunk_rola_impl)
-    oe, ge = run(C._chunk_rola_impl, 7)
-    oc, gc = run(comp, 7)
-    grads = [rel(a, b) for a, b in zip(gc, ge)]
-    assert rel(oc, oe) < 5e-3, f'{norm} fwd noise {rel(oc, oe):.2e}'
-    assert max(grads) < 5e-3, f'{norm} grad noise {grads}'
 
 
 # ============================================================================

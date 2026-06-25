@@ -67,11 +67,13 @@ def _run_subproc(code, **env_extra):
 _REAL_RUN = '''
 import os, json
 from fla_rola.precompile import _make_inputs, ShapeSpec
-from fla_rola.ops.rola.chunk import chunk_rola
+from fla_rola.ops.rola.chunk import chunk_rola_routed
 import torch
 s = ShapeSpec.coerce(json.loads(os.environ["ROLA_SPEC"]))
 ins = _make_inputs(s)
-chunk_rola(ins["q"], ins["k"], ins["v"], ins["r"], ins["w"], norm=s.norm, kappa=ins["kappa"]).sum().backward()
+kw = {"Wg": ins["Wg"]} if "Wg" in ins else {}
+chunk_rola_routed(ins["q"], ins["k"], ins["v"], ins["h"], ins["Wr"], ins["Ww"],
+                  ins["D"], ins["b"], norm="raw", **kw).sum().backward()
 torch.cuda.synchronize()
 print("__JSON__" + json.dumps({"ok": True}))
 '''
@@ -101,7 +103,7 @@ def test_enumerate_produces_picklable_workitems():
         shutil.rmtree(cap, ignore_errors=True)
     assert summary["n_shapes"] == 1
     fired = {w.kernel for w in work}
-    for kn in ("_rola_fwd_intra", "_par_grad_rla_qr", "_den_grad"):
+    for kn in ("_rola_routed_fwd_intra", "_rola_routed_fwd_inter"):
         assert kn in fired, f"{kn} not captured"
     import pickle
     pickle.loads(pickle.dumps(work))  # ProcessPool requires picklability
