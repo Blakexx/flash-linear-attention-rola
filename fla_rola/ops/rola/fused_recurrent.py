@@ -192,7 +192,8 @@ def fused_recurrent_rola(
     Mirrors `chunk_rola`'s routed signature, plus the recurrent triad `initial_state` /
     `output_final_state` / `cu_seqlens`. `q`/`k` are the feature-mapped queries/keys (as for
     `chunk_rola`). `norm` ∈ {'global','per_state','kappa'}; 'kappa' rescales the read gate by
-    `(|dᶜ|+eps)^{−κ}` per token. Returns `(o, final_state)`; `final_state` is the `[N, H*nc, K, V+1]`
+    `(dᶜ+eps)^{−κ}` per token (RAW signed den — the canonical convention; well-defined for d>0, which
+    the production elu+1 layer guarantees). Returns `(o, final_state)`; `final_state` is `[N, H*nc, K, V+1]`
     Kronecker state (the per-state denominator carried in the `+1` column) when `output_final_state`
     else `None`, layout-compatible with `chunk_rola(output_final_state=True)` so a chunked prefill
     hands off to this decode path.
@@ -210,6 +211,14 @@ def fused_recurrent_rola(
 
     qf, kf, vf, rf, wf = fold(q), fold(k), fold(v), fold(r), fold(w)
     gf = fold(g)
+    if gf is not None:
+        # Floor the per-token log-decay through the SAME guard the chunked GLA paths use (#33) so a
+        # floored chunked prefill hands off to a decode that decays at the matching rate. Single-token
+        # decay never overflows fp32, but an unfloored decode below `_GLA_FLOOR` would silently decay
+        # FASTER than the (floored) prefill state it continues. Raises (or clamps, ROLA_GLA_FLOOR_CLAMP)
+        # identically to the chunk path.
+        from fla_rola.ops.rola.chunk import _floor_ld
+        gf = _floor_ld(gf)
     # kappa is [B,T,H,1] -> [BH,T,1].
     kapf = fold(kappa) if (norm == 'kappa' and kappa is not None) else None
     # initial_state arrives as [N, H*nc, K, V+1] (== [B, H*nc, K, V+1]); view to [BH, nc, K, V+1].

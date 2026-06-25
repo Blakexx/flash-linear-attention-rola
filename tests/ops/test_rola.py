@@ -259,7 +259,9 @@ def _mk_oracle(B, L, H, K, nc, dv, dtype, seed=0, with_ld=False):
     rg = torch.softmax(rnd(B, L, H, nc), dim=-1)
     wg = torch.softmax(rnd(B, L, H, nc), dim=-1)
     if with_ld:
-        ld = torch.log(torch.sigmoid(rnd(B, L, H, nc)))      # per-state log-decay in (-inf, 0)
+        # per-state log-decay in (-inf, 0), floored to the kernel's fp32-safe domain (_GLA_FLOOR=-2.5,
+        # #33) so kernel and oracle test the SAME in-domain decay (the kernel raises out-of-range now).
+        ld = torch.log(torch.sigmoid(rnd(B, L, H, nc))).clamp(min=-2.5)
         return q, k, v, rg, wg, ld
     return q, k, v, rg, wg
 

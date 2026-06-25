@@ -665,7 +665,7 @@ def _routed_fwd_tiled(q, k, v, h, Wr, Ww, D, b, sel, chunk, BG, BK=64, b_r=None,
     NDM = triton.cdiv(d_model, BD)
     q, k, v, h, Wr, Ww = [x.contiguous() for x in (q, k, v, h, Wr, Ww)]
     use_g = ld is not None
-    ld = (ld.clamp(min=_GLA_FLOOR).contiguous() if use_g
+    ld = (_floor_ld(ld).contiguous() if use_g
           else q.new_zeros(B, L, nc))   # USE_G=False: ld unread (kernel skips the load), pass a stub
     sg = (ld.stride(0), ld.stride(1), ld.stride(2))
     br, bw, has_bias = _routing_bias(b_r, b_w, D, b, q.device, dtype=q.dtype)
@@ -822,7 +822,7 @@ def _routed_snapshots(q, k, v, h, Wr, Ww, D, b, sel, chunk, BG, br=None, bw=None
         br, bw, has_bias = _routing_bias(None, None, D, b, q.device, dtype=q.dtype)
     sbias = _bias_strides(br, bw, has_bias)
     use_g = ld is not None
-    ld = (ld.clamp(min=_GLA_FLOOR).contiguous() if use_g else q.new_zeros(B, L, nc))
+    ld = (_floor_ld(ld).contiguous() if use_g else q.new_zeros(B, L, nc))
     sg = (ld.stride(0), ld.stride(1), ld.stride(2))
     S = torch.zeros(B, nc, dqk, dv, device=q.device, dtype=torch.float32)
     snap = torch.zeros(B, NCH, nc, dqk, dv, device=q.device, dtype=torch.float32)
@@ -893,7 +893,7 @@ def _rola_rla_routed_bwd(q, k, v, h, Wr, Ww, do, D, b, chunk, BG, b_r=None, b_w=
     NCH = triton.cdiv(L, chunk)
     sel = _build_sel(D, b, nc, q.device)
     # ld:[B,L,nc] (GLA) clamped to the fp32 decay floor; RLA passes a zero stub the kernels skip (USE_G=False).
-    ld = (ld.float().clamp(min=_GLA_FLOOR).contiguous() if use_g else q.new_zeros(B, L, nc))
+    ld = (_floor_ld(ld).float().contiguous() if use_g else q.new_zeros(B, L, nc))
     sgl = (ld.stride(0), ld.stride(1), ld.stride(2))
     # per-chunk pre-state snapshots (the recurrent STATE, not gates) for the reverse-scan — recomputed
     # here at the SAME fp32 router precision as the fold, so fwd/bwd routing is bit-consistent.
@@ -1347,7 +1347,7 @@ def _kappa_routed_fwd(q, k, v, h, Wr, Ww, kap, D, b, sel, chunk, global_norm, pe
     br, bw, has_bias = _routing_bias(b_r, b_w, D, b, q.device, dtype=q.dtype)
     sbias = _bias_strides(br, bw, has_bias)
     use_g = ld is not None
-    ld = (ld.clamp(min=_GLA_FLOOR).contiguous() if use_g else q.new_zeros(B, L, nc))
+    ld = (_floor_ld(ld).contiguous() if use_g else q.new_zeros(B, L, nc))
     sg = (ld.stride(0), ld.stride(1), ld.stride(2))
     common = dict(GLOBAL=global_norm, PER_STATE=per_state, EPS=eps, D=D, b=b, BB=BB, BT=chunk,
                   BK=BK, BV=BV, BD=BD, BC=BC, NCBLK=NCBLK, ND=ND, NDM=NDM, HAS_BIAS=has_bias,
@@ -1749,7 +1749,7 @@ def _kappa_routed_bwd(q, k, v, h, Wr, Ww, kap, snap_val, snap_den, dnum, dden,
     dnum = dnum.contiguous()
     dden = dden.contiguous()
     # ld:[B,L,nc] (GLA) clamped to the fp32 decay floor; RLA passes a zero stub the kernels skip (USE_G=False).
-    ld = (ld.float().clamp(min=_GLA_FLOOR).contiguous() if use_g else q.new_zeros(B, L, nc))
+    ld = (_floor_ld(ld).float().contiguous() if use_g else q.new_zeros(B, L, nc))
     sgl = (ld.stride(0), ld.stride(1), ld.stride(2))
     # gda[B,L,nc]: persistent per-token log-decay adjoint (USE_G) — state/read kernels add their da-pieces
     # per chunk; reverse-cumsummed per chunk into dld at the end. RLA leaves it a 1-col stub (unused).
@@ -1923,7 +1923,58 @@ def _kappa_routed_readout(qf, kf, vf, hf, Wr, Ww, kapf, D, b, chunk_size, global
 # (dk,dwg,dv,da_kwv,dLam) + a torch dld assembly (reverse-cumsum of da per chunk). Ported verbatim
 # from the verified reference (all 6 grads incl. dld matched the torch GLA reference to fp noise).
 # ============================================================================
-_GLA_FLOOR = -2.5   # per-token log-decay floor (retention ≥ 8.2%/tok); fp32-safe for BT≤32
+# --- GLA per-token log-decay floor — a GENUINE fp32+SMEM limit, NOT a tuning artifact (#33) ---------
+# The chunked GLA scan FACTORS the per-chunk decay as e^{a_i} (into the read gate) × e^{-a_j} (into the
+# write gate), a=cumsum(ld) over a chunk, so the routing gram is ONE tl.dot R=(r·e^a)@(w·e^{-a})ᵀ and
+# the state carry is w_end=w·e^{Λ-a}, decvec=e^Λ. The decay DIFFERENCE e^{a_i-a_j} on the causal
+# triangle is in (0,1], but each FACTOR e^{±a}, e^{Λ-a} is unbounded: with ld≥FLOOR over BT rows the
+# largest factor is e^{BT·|FLOOR|}. fp32 overflows at ln(FLT_MAX)=88.72, so the hard constraint is
+#     BT · |FLOOR| ≲ 88.72.
+# At BT=32: 32·2.5 = 80 (fp32-safe, measured gram maxerr 1.2e-7). At BT=64: 64·2.5 = 160 → e^160 = inf
+# (measured: factored gram goes NaN). The differenced form (e^{a_i-a_j}, FLA simple_gla) would be
+# BT-free but cannot be absorbed into the routed read/write matmul nor the cross-chunk state carry —
+# it is structural to the chunked GLA recurrence shared by every FLA gated op. SEPARATELY, the fused
+# kappa-routed BACKWARD mega-kernel (decayed gram + 3-pass-κ fp32 tiles co-resident) OOMs the 99KB
+# Ampere SMEM at BT=64 (measured Required 102400 > 101376) — a second, independent wall that pins
+# BT≤32 (bwd≤16) regardless of the floor. Both limits point at the SAME shipped operating point.
+#
+# FLOOR=-2.5 ⇒ per-token retention ≥ e^{-2.5} = 8.2%/tok. The production layer's ld=log(alpha_chunk)
+# CAN dip below this (alpha→0, write_gate→1), so the floor is NOT a structural no-op: it would alter a
+# learned decay. Per the no-silent-rewrite rule we make the floor LOUD — `_floor_ld` RAISES on
+# out-of-range ld by default; opt into clamp-with-warning via ROLA_GLA_FLOOR_CLAMP=1 (e.g. training
+# that tolerates the truncation). All GLA decay sites route through `_floor_ld`.
+_GLA_FLOOR = -2.5   # per-token log-decay floor (retention ≥ 8.2%/tok); fp32-safe for BT≤32 (see above)
+_GLA_FLOOR_CLAMP = os.environ.get('ROLA_GLA_FLOOR_CLAMP', '0') not in ('0', '', 'false', 'False')
+_gla_floor_warned = False
+
+
+def _floor_ld(ld):
+    """Enforce the GLA log-decay floor (#33). ld below `_GLA_FLOOR` would overflow the factored fp32
+    decay gram (e^{BT·|FLOOR|}); by default RAISE (no silent semantic rewrite). With
+    ROLA_GLA_FLOOR_CLAMP=1, clamp to the floor and warn ONCE. Returns a tensor safe for the chunk
+    kernels (dtype/contiguity left to the caller)."""
+    global _gla_floor_warned
+    mn = ld.detach().min()
+    if mn < _GLA_FLOOR:
+        if not _GLA_FLOOR_CLAMP:
+            raise ValueError(
+                f"GLA log-decay ld below the fp32-safe floor _GLA_FLOOR={_GLA_FLOOR} "
+                f"(min ld={mn.item():.4f}). The chunked GLA decay is factored e^{{±a}} and overflows "
+                f"fp32 (ln FLT_MAX=88.72) once BT·|ld|≳88.72; BT≤32 needs |ld|≤2.77, so the kernel "
+                f"cannot represent this decay rate. Reduce the decay (raise alpha / lower the write "
+                f"gate), or set ROLA_GLA_FLOOR_CLAMP=1 to clamp ld to the floor (truncating the "
+                f"learned decay) instead of raising."
+            )
+        if not _gla_floor_warned:
+            import warnings
+            warnings.warn(
+                f"GLA log-decay ld clamped to _GLA_FLOOR={_GLA_FLOOR} (ROLA_GLA_FLOOR_CLAMP=1); "
+                f"min ld={mn.item():.4f} truncated. This alters the learned decay rate.",
+                stacklevel=2,
+            )
+            _gla_floor_warned = True
+        return ld.clamp(min=_GLA_FLOOR)
+    return ld
 
 # Snapshot-GRANULARITY stride (#1): the backward boundary-state snapshots Sb/dSa are written only every
 # KSNAP chunks (slot = chunk//KSNAP), 1/KSNAP the dominant backward HBM. The grad kernels read the
@@ -2062,7 +2113,7 @@ def _gla_fwd(q, k, v, wg, rg, ld, chunk, BG, BK=64):
     B, L, dqk = q.shape
     dv = v.shape[-1]
     nc = wg.shape[-1]
-    ld = ld.clamp(min=_GLA_FLOOR).contiguous()
+    ld = _floor_ld(ld).contiguous()
     BV = max(16, triton.next_power_of_2(dv))
     BK = min(BK, max(16, triton.next_power_of_2(dqk)))   # exact-width blocks for dqk<=64; tile beyond
     ND = triton.cdiv(dqk, BK)
@@ -3143,7 +3194,7 @@ def _bwd_split_gla(q, k, v, wg, rg, ld, g, chunk=None, BG=16, nb_tile=None):
     B, L, dqk = q.shape
     dv = v.shape[-1]
     nc = wg.shape[-1]
-    ld = ld.clamp(min=_GLA_FLOOR)
+    ld = _floor_ld(ld)
     q, k, v, wg, rg, ld, g = [x.contiguous() for x in (q, k, v, wg, rg, ld, g)]
     BD = max(16, triton.next_power_of_2(dqk))
     BV = max(16, triton.next_power_of_2(dv))
@@ -3628,7 +3679,7 @@ class _DenGLAFn(torch.autograd.Function):
         BD = max(16, triton.next_power_of_2(dqk))
         NB = triton.cdiv(nc, BG)
         NCH = triton.cdiv(L, chunk)
-        ld = ld.clamp(min=_GLA_FLOOR)
+        ld = _floor_ld(ld)
         q, k, wg, ld = q.contiguous(), k.contiguous(), wg.contiguous(), ld.contiguous()
         # Disjoint dual-buffer + host-sum (mirrors the BC-split fwd/bwd): intra writes its own buffer
         # with plain store, inter atomic-accumulates over feature-blocks into its own (reset_to_zero).
@@ -3703,7 +3754,7 @@ def _den_gla_op(q: torch.Tensor, k: torch.Tensor, wg: torch.Tensor, ld: torch.Te
     with torch.autocast('cuda', enabled=False):
         dt = _DT[cdt]
         q, k, wg = (t.to(dt) for t in (q, k, wg))
-        ld = ld.clamp(min=_GLA_FLOOR).float()
+        ld = _floor_ld(ld).float()
         B, L, dqk = q.shape
         nc = wg.shape[-1]
         BD = max(16, triton.next_power_of_2(dqk))
@@ -3744,7 +3795,7 @@ def _den_gla_bwd_op(q: torch.Tensor, k: torch.Tensor, wg: torch.Tensor, ld: torc
     with torch.autocast('cuda', enabled=False):
         dt = _DT[cdt]
         q, k, wg = (t.to(dt) for t in (q, k, wg))
-        ld = ld.clamp(min=_GLA_FLOOR).float()
+        ld = _floor_ld(ld).float()
         B, L, dqk = q.shape
         nc = wg.shape[-1]
         BD = max(16, triton.next_power_of_2(dqk))
@@ -3996,10 +4047,10 @@ def _final_state(kf, vf, wf, gf, B, H):
     v1 = torch.cat([vf, torch.ones_like(vf[..., :1])], -1).float()      # [BH,T,V+1]
     wgt = wf.float()                                                    # [BH,T,nc]
     if gf is not None:                                                  # GLA: token t decays by Σ_{t'>t} g
-        # Clamp the per-token log-decay to `_GLA_FLOOR` — the SAME floor every chunked GLA decay site
-        # applies (readout/den/routed). Without it the emitted final state would decay at a faster rate
-        # than the chunked prefill it must hand off to (`test_recurrent_handoff`), a prefill→decode gap.
-        G = gf.float().clamp(min=_GLA_FLOOR).cumsum(1)
+        # Apply the SAME GLA decay floor (`_floor_ld`) every chunked GLA decay site uses (readout/den/
+        # routed). Without it the emitted final state would decay at a faster rate than the chunked
+        # prefill it must hand off to (`test_recurrent_handoff`) — a prefill→decode decay-rate gap.
+        G = _floor_ld(gf).float().cumsum(1)
         wgt = wgt * (G[:, -1:, :] - G).exp()
     state = torch.einsum('btc,btd,bte->bcde', wgt, kf.float(), v1)      # [BH, nc, K, V+1]
     return state.view(B, H * state.shape[1], state.shape[2], state.shape[3])
