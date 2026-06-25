@@ -1128,6 +1128,44 @@ def test_routed_per_head_independence(D, b, norm):
     assert same < 1e-4, f'shared-router control: head outputs should be identical, got {same:.2e}'
 
 
+@pytest.mark.parametrize('norm', ['raw', 'global', 'kappa'])
+@pytest.mark.parametrize('D,b', [(1, 8), (2, 3)])
+def test_routed_per_head_decay_independence(D, b, norm):
+    """The DECAY is PER-HEAD too (#45): distinct per-head decay weights Wg ⇒ distinct per-head decay ⇒
+    distinct head outputs; a shared Wg (with shared routers) ⇒ identical. A shared-across-heads decay
+    weight would COLLAPSE the distinct case (the decay analogue of the shared-router bug). Inputs are
+    IDENTICAL across heads + the ROUTERS are shared, so the head outputs depend ONLY on Wg here."""
+    if device != 'cuda':
+        pytest.skip('RoLA Triton kernels require CUDA')
+    B, H, T, Kd, V, dm = 2, 4, 64, 16, 16, 24
+    g = torch.Generator(device=device).manual_seed(7)
+
+    def fm(x):
+        return torch.nn.functional.elu(x) + 1.0
+    q = fm(torch.randn(B, T, 1, Kd, device=device, generator=g)).expand(B, T, H, Kd).contiguous()
+    k = fm(torch.randn(B, T, 1, Kd, device=device, generator=g)).expand(B, T, H, Kd).contiguous()
+    v = torch.randn(B, T, 1, V, device=device, generator=g).expand(B, T, H, V).contiguous()
+    h = torch.randn(B, T, 1, dm, device=device, generator=g).expand(B, T, H, dm).contiguous()
+    kap = (torch.rand(B, T, 1, 1, device=device, generator=g) * 0.5 + 0.3).expand(B, T, H, 1).contiguous() \
+        if norm == 'kappa' else None
+    # SHARED routers across heads (so routing alone can't make heads differ) — the only per-head asymmetry
+    # is Wg. Use a non-trivial shared router so the write gates aren't uniform (else 1-w(1-α) hides α).
+    Wr = (torch.randn(1, D, dm, b, device=device, generator=g) * 0.8).expand(H, D, dm, b).contiguous()
+    Ww = (torch.randn(1, D, dm, b, device=device, generator=g) * 0.8).expand(H, D, dm, b).contiguous()
+    Wg = torch.randn(H, dm, device=device, generator=g) * 0.6           # DISTINCT decay weight per head
+    kw = dict(norm=norm, kappa=kap, scale=1.0, Wg=Wg)
+    o = C.chunk_rola_routed(q, k, v, h, Wr, Ww, D, b, **kw)             # [B,T,H,V]
+    diffs = [(o[:, :, i] - o[:, :, j]).abs().max().item() for i in range(H) for j in range(i + 1, H)]
+    assert min(diffs) > 1e-3, \
+        f'per-head DECAY collapsed: identical inputs + shared routers + DISTINCT Wg gave near-identical ' \
+        f'head outputs (min cross-head diff {min(diffs):.2e}) — the decay weight is being SHARED across heads'
+    # CONTROL: broadcast head-0's Wg to all heads ⇒ identical inputs + router + decay ⇒ identical out.
+    Wg_s = Wg[:1].expand(H, dm).contiguous()
+    o_s = C.chunk_rola_routed(q, k, v, h, Wr, Ww, D, b, **dict(kw, Wg=Wg_s))
+    same = max((o_s[:, :, i] - o_s[:, :, 0]).abs().max().item() for i in range(H))
+    assert same < 1e-4, f'shared-Wg control: head outputs should be identical, got {same:.2e}'
+
+
 # =============================================================================
 # Routed RAW / GLOBAL-numerator backward at NON-POW2 dv (regression for the dv=24 grad-corruption bug).
 #
@@ -1376,11 +1414,22 @@ def test_gla_compile_grad_noise(norm):
 # (rel at the GLA fp32 decay floor), flat/square/tree, and never allocates a [*,L,nc] routed-gate buffer
 # (ld is an INPUT, not an allocation). USE_G=False (ld=None) is byte-identical to the RLA routed fwd.
 # ============================================================================
+def _ld_from_Wg(hf, wf, Wg, H):
+    """THE per-state log-decay ld[BH,L,nc] from the per-head decay weight Wg:[H,d_model] + the write gate
+    wf — `RoLA._log_decay` (layers/rola.py) EXACTLY. The op computes this IN-KERNEL (never materialized);
+    this is the test's reference materialization. #45."""
+    BH, T, dm = hf.shape
+    hr = hf.view(BH // H, H, T, dm)
+    alpha = torch.sigmoid(torch.einsum('bhtd,hd->bht', hr, Wg)).reshape(BH, T, 1)
+    return (1.0 - wf * (1.0 - alpha)).clamp(min=1e-8).log().clamp(min=-2.5)
+
+
 @pytest.mark.parametrize('chunk', [64, 16])  # 64 = single-chunk (NCH=1); 16 = multi-chunk (NCH=4) — exercises the inter-chunk decay (decvec/w_end/Lam), which NCH=1 leaves dead
 @pytest.mark.parametrize('D,b', [(1, 16), (2, 4), (4, 2)])
 def test_gla_routed_fwd_faithful(D, b, chunk):
-    """Routed GLA numerator forward == naive_rola_gla oracle (on the tree-materialized gates), the
-    [L,nc]-free fused readout faithful to the explicit-gate math. flat/square/tree."""
+    """Routed GLA numerator forward (in-kernel ld from Wg, #45) == naive_rola_gla oracle on the
+    tree-materialized gates + the LAYER's ld(Wg) formula — the [L,nc]-free AND ld-free fused readout
+    faithful to the explicit-gate math. flat/square/tree."""
     if device != 'cuda':
         pytest.skip('RoLA Triton kernels require CUDA')
     from fla_rola.ops.rola.naive import naive_rola_gla
@@ -1395,21 +1444,23 @@ def test_gla_routed_fwd_faithful(D, b, chunk):
     v, h = mk(BH, L, dv), mk(BH, L, dm)
     Wr = torch.randn(1, D, dm, b, device=device, generator=g_) * 0.4   # H=1 (BH-as-batch op-level test)
     Ww = torch.randn(1, D, dm, b, device=device, generator=g_) * 0.4
-    ld = (-torch.rand(BH, L, nc, device=device, generator=g_) * 0.5).clamp(min=-2.5)
+    Wg = torch.randn(1, dm, device=device, generator=g_) * 0.4         # per-head decay weight [H=1,d_model]
     sel = C._build_sel(D, b, nc, device)
-    o_routed = C._routed_fwd_tiled(q, k, v, h, Wr, Ww, D, b, sel, chunk=chunk, BG=16, ld=ld)
+    o_routed = C._routed_fwd_tiled(q, k, v, h, Wr, Ww, D, b, sel, chunk=chunk, BG=16, Wg=Wg)
     r, w = C._tree_gates_torch(h, Wr, Ww, D, b, 1)
+    ld = _ld_from_Wg(h, w, Wg, 1)   # the LAYER's ld(Wg) — the oracle the in-kernel ld must match
 
     def unf(t):
         return t.view(BH, L, 1, -1)
     o_naive = naive_rola_gla(unf(q), unf(k), unf(v), unf(w), unf(r), unf(ld), normalized=False).view(BH, L, dv)
     rel = ((o_routed - o_naive).norm() / (o_naive.norm() + 1e-9)).item()
-    assert rel < 1e-2, f'D={D} b={b} routed-GLA-fwd vs naive rel {rel:.2e}'
+    assert rel < 1e-2, f'D={D} b={b} routed-GLA-fwd(Wg) vs naive(ld(Wg)) rel {rel:.2e}'
 
 
 def test_gla_routed_fwd_no_LNC_materialization():
-    """The fused routed GLA numerator never allocates a [*,L,nc] routed read/write GATE buffer (ld is a
-    passed INPUT, not an allocation). d_model != nc != L so any [*,L,nc] alloc is unambiguous."""
+    """The fused routed GLA forward never allocates ANY [*,L,nc] buffer — neither the routed read/write
+    GATE nor (now, #45) the per-state log-decay ld: the decay is computed IN-KERNEL from Wg:[H,d_model]
+    (the saved-activation win). d_model != nc != L so any [*,L,nc] alloc is unambiguous."""
     if device != 'cuda':
         pytest.skip('RoLA Triton kernels require CUDA')
     D, b, nc = 2, 3, 9
@@ -1423,11 +1474,11 @@ def test_gla_routed_fwd_no_LNC_materialization():
     v, h = mk(BH, L, dv), mk(BH, L, dm)
     Wr = torch.randn(1, D, dm, b, device=device, generator=g_) * 0.4   # H=1 (BH-as-batch op-level test)
     Ww = torch.randn(1, D, dm, b, device=device, generator=g_) * 0.4
-    ld = (-torch.rand(BH, L, nc, device=device, generator=g_) * 0.5).clamp(min=-2.5)
+    Wg = torch.randn(1, dm, device=device, generator=g_) * 0.4         # per-head decay weight [H=1,d_model]
     sel = C._build_sel(D, b, nc, device)
     # warm the kernel (cold Triton autotune itself calls torch.empty for its bench buffers) BEFORE the
     # allocation watch, so the watch only sees the steady-state launch's buffers.
-    C._routed_fwd_tiled(q, k, v, h, Wr, Ww, D, b, sel, chunk=32, BG=16, ld=ld)
+    C._routed_fwd_tiled(q, k, v, h, Wr, Ww, D, b, sel, chunk=32, BG=16, Wg=Wg)
     hits = []
     real_zeros, real_empty = torch.zeros, torch.empty
 
@@ -1441,10 +1492,11 @@ def test_gla_routed_fwd_no_LNC_materialization():
         return w
     torch.zeros, torch.empty = watch(real_zeros), watch(real_empty)
     try:
-        C._routed_fwd_tiled(q, k, v, h, Wr, Ww, D, b, sel, chunk=32, BG=16, ld=ld)
+        C._routed_fwd_tiled(q, k, v, h, Wr, Ww, D, b, sel, chunk=32, BG=16, Wg=Wg)
     finally:
         torch.zeros, torch.empty = real_zeros, real_empty
-    assert not hits, f'[*,L={L},nc={nc}] routed-gate buffer(s) materialized: {hits}'
+    # #45: even the ld is gone now — NO [*,L,nc] buffer at all (gates never materialized, ld in-kernel).
+    assert not hits, f'[*,L={L},nc={nc}] buffer(s) materialized (gate or ld): {hits}'
 
 
 # ============================================================================
@@ -1456,19 +1508,22 @@ def test_gla_routed_fwd_no_LNC_materialization():
 # on the tree-materialized gates — q/k/v TIGHT, the gate/decay grads (drg/dwg/dld) to the GLA fp32 floor.
 # USE_G=False (ld=None) is byte-identical to the RLA routed backward (see test_routed_bwd_nonpow2_dv).
 # ============================================================================
-def _gla_routed_ref(q, k, v, h, Wr, Ww, ld, D, b, scale):
+def _gla_routed_ref(q, k, v, h, Wr, Ww, Wg, D, b, scale):
     """fp64 explicit-gate GLA reference for the routed un-normalized numerator (the decayed math
-    `rola_gla_routed_triton` reproduces) — `naive_rola_gla` on the tree-materialized gates."""
+    `rola_gla_routed_triton` reproduces) — `naive_rola_gla` on the tree-materialized gates + the per-state
+    log-decay built from the per-head decay weight Wg the LAYER's `_log_decay` way (#45). Differentiable
+    w.r.t. Wg/h/Ww so the in-kernel dWg/dh/dWw can be gated against autograd of this single truth."""
     B, T, H, Kd = q.shape
 
     def fold(t):
         return t.permute(0, 2, 1, 3).reshape(B * H, T, t.shape[-1])
     qf, kf, vf, hf = fold(q) * scale, fold(k), fold(v), fold(h)
     rf, wf = _per_head_gates(hf, Wr, Ww, D, b, H)         # [B*H, T, nc], fp64, per-head
+    ld = _ld_from_Wg(hf, wf, Wg, H)                        # ld(Wg) — the LAYER's per-state log-decay
 
     def unf(t):
         return t.view(B * H, T, 1, -1)
-    o = naive_rola_gla(unf(qf), unf(kf), unf(vf), unf(wf), unf(rf), unf(fold(ld)),
+    o = naive_rola_gla(unf(qf), unf(kf), unf(vf), unf(wf), unf(rf), unf(ld),
                        normalized=False).view(B * H, T, -1)
     return o.view(B, H, T, -1).permute(0, 2, 1, 3).contiguous()
 
@@ -1477,11 +1532,12 @@ def _gla_routed_ref(q, k, v, h, Wr, Ww, ld, D, b, scale):
 @pytest.mark.parametrize('Kd', [16, 64])                    # dqk: small (SRAM) + large (tiled)
 @pytest.mark.parametrize('dv', [16, 24])                    # pow2 + non-pow2 (BV=32 — the alloc-stride class)
 def test_gla_routed_bwd_faithful(D, b, dv, Kd):
-    """Routed GLA numerator BACKWARD vs autograd of the fp64 explicit-gate GLA oracle (== the non-routed
-    `naive_rola_gla` on the tree-materialized gates): the [L,nc]-free fused path == the materialized path.
-    q/k/v TIGHT (<8e-3, the stride/mask gate); the gate/decay grads drg/dwg(→dh,dWr,dWw)/dld to the
-    documented GLA fp32 decay floor (_GLA_BWD_TOL). flat/square/tree × pow2/non-pow2 dv × small/large dqk.
-    L=64, bwd chunk capped to _CHUNK/_KAPPA_BWD_CHUNK ⇒ multi-chunk (the inter-chunk decvec/Λ coupling)."""
+    """Routed GLA numerator BACKWARD (in-kernel ld from Wg, #45) vs autograd of the fp64 explicit-gate GLA
+    oracle (`naive_rola_gla` on the tree gates + the LAYER's ld(Wg)): the [L,nc]-free AND ld-free fused
+    path == the materialized path. The NEW dWg grad (the per-head decay weight) is gated here, and dh/dWr/
+    dWw now ALSO carry the decay's contribution (the fold splits dld → dWg + extra dh + the write grad).
+    q/k/v TIGHT (<8e-3); the gate/decay grads (h/Wr/Ww/Wg) to the documented GLA fp32 floor (_GLA_BWD_TOL).
+    flat/square/tree × pow2/non-pow2 dv × small/large dqk. L=64, multi-chunk (inter-chunk decvec/Λ)."""
     if device != 'cuda':
         pytest.skip('RoLA Triton kernels require CUDA')
     B, H, T, dm = 2, 2, 64, 40
@@ -1495,10 +1551,9 @@ def test_gla_routed_bwd_faithful(D, b, dv, Kd):
     v, h = mk(B, T, H, dv), mk(B, T, H, dm)
     Wr = (torch.randn(H, D, dm, b, device=device, dtype=torch.float64, generator=g) * 0.4).requires_grad_()  # per-head
     Ww = (torch.randn(H, D, dm, b, device=device, dtype=torch.float64, generator=g) * 0.4).requires_grad_()
-    ld = ((-torch.rand(B, T, H, b ** D, device=device, dtype=torch.float64, generator=g) * 0.5)
-          .clamp(min=-2.5)).requires_grad_()
+    Wg = (torch.randn(H, dm, device=device, dtype=torch.float64, generator=g) * 0.4).requires_grad_()  # per-head decay weight
     go = torch.randn(B, T, H, dv, device=device, dtype=torch.float64, generator=g)
-    sel = [q, k, v, h, Wr, Ww, ld]
+    sel = [q, k, v, h, Wr, Ww, Wg]
 
     def foldf(t):
         return t.permute(0, 2, 1, 3).reshape(B * H, T, t.shape[-1]).float().contiguous()
@@ -1506,28 +1561,26 @@ def test_gla_routed_bwd_faithful(D, b, dv, Kd):
     def unfold(t):
         return t.view(B, H, T, -1).permute(0, 2, 1, 3).contiguous()
     of = unfold(C.rola_gla_routed_triton(foldf(q) * scale, foldf(k), foldf(v), foldf(h),
-                                         Wr.float(), Ww.float(), foldf(ld), D, b))
+                                         Wr.float(), Ww.float(), Wg.float(), D, b))
     gf = torch.autograd.grad(of, sel, go.float())
-    oe = _gla_routed_ref(q, k, v, h, Wr, Ww, ld, D, b, scale)
+    oe = _gla_routed_ref(q, k, v, h, Wr, Ww, Wg, D, b, scale)
     ge = torch.autograd.grad(oe, sel, go)
-    names = ['q', 'k', 'v', 'h', 'Wr', 'Ww', 'ld']
+    names = ['q', 'k', 'v', 'h', 'Wr', 'Ww', 'Wg']
     rels = {n: _relmax(a.float(), b.float()) for n, a, b in zip(names, gf, ge)}
     assert _relmax(of.float(), oe.float()) < 1e-2, f'out {_relmax(of.float(), oe.float()):.2e}'
-    # q/k/v: the TIGHT stride/mask gate; the gate/decay grads (h/Wr/Ww via drg/dwg, and dld) to the floor.
+    # q/k/v: the TIGHT stride/mask gate; the gate/decay grads (h/Wr/Ww/Wg) to the floor.
     for n in ('q', 'k', 'v'):
         assert rels[n] < 8e-3, f'{n} grad {rels[n]:.2e} (rels={rels})'
-    for n in ('h', 'Wr', 'Ww', 'ld'):
+    for n in ('h', 'Wr', 'Ww', 'Wg'):
         assert rels[n] < _GLA_BWD_TOL, f'{n} grad {rels[n]:.2e} (rels={rels})'
 
 
 def test_gla_routed_bwd_no_LNC_materialization():
     """The fused routed GLA BACKWARD never allocates a [*,L,nc] routed read/write GATE-GRAD buffer (the
-    gda/gdr/gdw scratch is [B,chunk,nc] or [B,L,nc]-decay-adjoint; the GATE grads die in the fold). The
-    [L,nc] gate-GRADS are never materialized — only ld (an input) and the dld output are [B,L,nc], which
-    are decay tensors, NOT routed gates. d_model != nc != L so any [*,L,nc] GATE alloc is unambiguous —
-    we watch only for the (forbidden) routed read/write gate-grad pair, allowing the legit ld-shaped
-    decay tensors (dld, gda) by counting: the routed path must NOT allocate MORE [*,L,nc] than the
-    decay bookkeeping (dld + gda = 2)."""
+    gate grads die transiently in [B,chunk,nc] gdr/gdw + the in-kernel fold), and (now, #45) NEITHER ld
+    NOR dld is [L,nc]: ld is computed in-kernel from Wg:[H,d_model] and dld is assembled PER CHUNK
+    ([B,chunk,nc], freed each chunk). The ONLY [*,L,nc] backward allocation is the gda decay-adjoint
+    accumulator. d_model != nc != L so any [*,L,nc] alloc is unambiguous. Bound: <=1 (gda)."""
     if device != 'cuda':
         pytest.skip('RoLA Triton kernels require CUDA')
     D, b, nc = 2, 3, 9
@@ -1542,11 +1595,11 @@ def test_gla_routed_bwd_no_LNC_materialization():
     v, h = mk(BH, L, dv).requires_grad_(), mk(BH, L, dm).requires_grad_()
     Wr = (torch.randn(1, D, dm, b, device=device, generator=g) * 0.4).requires_grad_()   # H=1 (BH-as-batch)
     Ww = (torch.randn(1, D, dm, b, device=device, generator=g) * 0.4).requires_grad_()
-    ld = ((-torch.rand(BH, L, nc, device=device, generator=g) * 0.5).clamp(min=-2.5)).requires_grad_()
+    Wg = (torch.randn(1, dm, device=device, generator=g) * 0.4).requires_grad_()         # per-head decay weight
     go = torch.randn(BH, L, dv, device=device, generator=g)
     # warm the kernels (cold autotune calls torch.empty for bench buffers) BEFORE the allocation watch.
-    o = C.rola_gla_routed_triton(q, k, v, h, Wr, Ww, ld, D, b)
-    torch.autograd.grad(o, [q, k, v, h, Wr, Ww, ld], go, retain_graph=False)
+    o = C.rola_gla_routed_triton(q, k, v, h, Wr, Ww, Wg, D, b)
+    torch.autograd.grad(o, [q, k, v, h, Wr, Ww, Wg], go, retain_graph=False)
     hits = []
     real_zeros, real_empty = torch.zeros, torch.empty
 
@@ -1557,13 +1610,12 @@ def test_gla_routed_bwd_no_LNC_materialization():
                 hits.append(tuple(t.shape))
             return t
         return w
-    o = C.rola_gla_routed_triton(q, k, v, h, Wr, Ww, ld, D, b)
+    o = C.rola_gla_routed_triton(q, k, v, h, Wr, Ww, Wg, D, b)
     torch.zeros, torch.empty = watch(real_zeros), watch(real_empty)
     try:
-        torch.autograd.grad(o, [q, k, v, h, Wr, Ww, ld], go, retain_graph=False)
+        torch.autograd.grad(o, [q, k, v, h, Wr, Ww, Wg], go, retain_graph=False)
     finally:
         torch.zeros, torch.empty = real_zeros, real_empty
-    # the only legit [*,L,nc] backward allocations are the decay bookkeeping: dld (output) + gda (adjoint
-    # accumulator) + the ld stub/clamp copies. NO routed read/write gate-grad [L,nc] pair is allocated
-    # (the gate grads die transiently in [B,chunk,nc] gdr/gdw and the in-kernel fold). Bound: <=3.
-    assert len(hits) <= 3, f'[*,L={L},nc={nc}] backward allocations exceed the decay bookkeeping: {hits}'
+    # #45: ld is in-kernel (no input ld) and dld is per-chunk [B,chunk,nc] — the ONLY [*,L,nc] backward
+    # allocation is the gda decay-adjoint accumulator. NO routed gate-grad [L,nc], NO [L,nc] dld. Bound <=1.
+    assert len(hits) <= 1, f'[*,L={L},nc={nc}] backward allocations exceed gda (the only legit one): {hits}'
