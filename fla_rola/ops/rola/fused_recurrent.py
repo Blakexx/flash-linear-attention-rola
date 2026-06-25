@@ -32,8 +32,6 @@ import triton.language as tl
 
 from fla_rola.utils import input_guard
 
-_TUNE = None   # optional (num_warps, num_stages, BC) override for benchmarking; production uses the default
-
 # nc / value tiling for the streamed state-block. BC states × BV value-cols per inner block; the
 # feature dim dqk is loaded whole (BK=next_pow2(dqk) — dqk is small, 16/32). The combine (sum over nc +
 # divide) reduces across BC-blocks in registers, so there is no cross-program reduction. NOT autotuned:
@@ -140,8 +138,6 @@ def _decode_triton(q, k, v, r, w, g, kappa, norm, scale, eps, initial_state, out
     # Floor 4 (tl ops need the BC dim).
     BC = max(4, min(8, 8192 // max(1, BK * BV)))
     nw, ns = 4, 2
-    if _TUNE is not None:
-        nw, ns, BC = _TUNE
     NCB = triton.cdiv(nc, BC)
     q, k, v, r, w = (x.contiguous() for x in (q, k, v, r, w))
     g = g.contiguous() if g is not None else None
