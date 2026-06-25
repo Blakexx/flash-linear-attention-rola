@@ -23,16 +23,16 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
-from fla_rola.ops.rola.proto_tree_routing import (  # validated tree-routing fold kernels (reused verbatim by the routed backward)
+from fla_rola.ops.rola.routed_bwd_kernels import (  # production tree-routed backward kernels (the in-kernel router-grad fold)
     _bwd_inter_read_kernel as _proto_bwd_inter_read,
 )
-from fla_rola.ops.rola.proto_tree_routing import (
+from fla_rola.ops.rola.routed_bwd_kernels import (
     _bwd_inter_state_kernel as _proto_bwd_inter_state,
 )
-from fla_rola.ops.rola.proto_tree_routing import (
+from fla_rola.ops.rola.routed_bwd_kernels import (
     _bwd_intra_kernel as _proto_bwd_intra,
 )
-from fla_rola.ops.rola.proto_tree_routing import (
+from fla_rola.ops.rola.routed_bwd_kernels import (
     _fold_kernel as _proto_fold,
 )
 from fla_rola.utils import (
@@ -131,6 +131,12 @@ def _bv_cap(dv):
 # ND_V=cdiv(dv,BV)) so BC·BK·BV stays under a conservative budget. BK=BV=16 always survives (the floor).
 # Both loops are pure reduction-order / output-block reassociations → bit-faithful. (`_kappa_bk_cap`
 # keeps the value-free backward — which has no BV loop — fitting by capping BK against max(BV,BT).)
+#
+# CURRENT-BUDGET INVARIANT: at the 24KB budget below BOTH helpers ALWAYS return 16 for every shape
+# the kernels are tested on (dqk,dv,chunk all ≤128 — verified). The BK=32/BV=32 branches are therefore
+# UNTESTED. If you raise the budget (or the tested-shape envelope grows), the cap can return 32 and
+# silently activate those untested tile paths — re-validate the fused kappa fwd/bwd bit-faithfulness
+# (test_kappa_routed_*) BEFORE trusting BK/BV>16. The asserts in the two helpers make a >16 result LOUD.
 def _kappa_bk_cap(dqk, dv, chunk, bc=16):
     bv = _bv_cap(dv)
     want = min(64, max(16, triton.next_power_of_2(dqk)))
@@ -139,6 +145,11 @@ def _kappa_bk_cap(dqk, dv, chunk, bc=16):
     bk = want
     while bk > 16 and bk * span > budget:
         bk //= 2
+    # CURRENT-BUDGET INVARIANT (see header): bk>16 activates an UNTESTED tile path. Loud, not silent.
+    assert bk == 16, (
+        f"_kappa_bk_cap returned BK={bk}>16 (dqk={dqk}, dv={dv}, chunk={chunk}, budget={budget}). The "
+        "BK>16 path is untested — re-validate test_kappa_routed_* bit-faithfulness, then relax this assert."
+    )
     return bk
 
 
@@ -152,6 +163,11 @@ def _kappa_bv_tile(dqk, dv, bc=16, bk_cap=64):
     bv = want
     while bv > 16 and bv * span > budget:
         bv //= 2
+    # CURRENT-BUDGET INVARIANT (see header): bv>16 activates an UNTESTED value-tile path. Loud, not silent.
+    assert bv == 16, (
+        f"_kappa_bv_tile returned BV={bv}>16 (dqk={dqk}, dv={dv}, budget={budget}). The BV>16 path is "
+        "untested — re-validate test_kappa_routed_* bit-faithfulness, then relax this assert."
+    )
     return bv
 
 
@@ -236,7 +252,7 @@ def _rola_fwd_inter(q_ptr, k_ptr, v_ptr, wg_ptr, rg_ptr, outa_ptr,
                     sq_b, sq_l, sq_d, sv_b, sv_l, sv_d, sg_b, sg_l, sg_c,
                     soa_b, soa_n, soa_l, soa_v,
                     BT: tl.constexpr, BK: tl.constexpr, BV: tl.constexpr,
-                    BVF: tl.constexpr, BG: tl.constexpr, NCH: tl.constexpr):
+                    BG: tl.constexpr, NCH: tl.constexpr):
     """Inter-chunk (state) contribution for one (batch, state-block, FEATURE-block d0). Carries this
     feature-block's slice Sd[BK, BG*BV] of the Kronecker state across chunks → SRAM bounded by BK and
     the autotuned value-tile BV (value-OUTER over cdiv(dv,BV) blocks; ND_V==1 == the un-tiled kernel).
@@ -307,7 +323,7 @@ def _fwd_tiled(q, k, v, wg, rg, chunk, BG, BK=64):
     _rola_fwd_intra[(B, NCH)](q, k, v, wg, rg, out_intra, L, dqk, dv, nc, *base, *so_a,
                               BT=chunk, BK=BK, BV=BV, BG=BG, ND=ND, NB=NB)
     _rola_fwd_inter[(B, NB, ND)](q, k, v, wg, rg, out_inter, L, dqk, dv, nc, *base, *so_e,
-                                 BT=chunk, BK=BK, BVF=BV, BG=BG, NCH=NCH)
+                                 BT=chunk, BK=BK, BG=BG, NCH=NCH)   # BV is autotuned
     return out_intra[..., :dv] + out_inter[..., :dv]
 
 
@@ -393,7 +409,8 @@ def rola_rla_triton(q, k, v, r, w, chunk=None, BG=16, compute_dtype=None):
 # ============================================================================
 # In-kernel TREE-ROUTING forward (RLA). The matching BACKWARD lives just below (`_RoLARoutedFn`).
 #
-# Productionizes the validated prototype `proto_tree_routing.py`: instead of taking PRECOMPUTED gates
+# The production tree-routing forward (the validated prototype since promoted; its backward kernels now
+# live in `routed_bwd_kernels.py`): instead of taking PRECOMPUTED gates
 # r,w ∈ [L,nc] and forming R = r·wᵀ, the routing gram is built IN-KERNEL from the hidden state h and the
 # per-level router weights Wr,Ww ∈ [D, d_model, b] (b^D = nc), never materializing the [L,nc] gates.
 #
@@ -408,9 +425,9 @@ def rola_rla_triton(q, k, v, r, w, chunk=None, BG=16, compute_dtype=None):
 #   r[:, c] = Π_lvl softmax(h·Wr[lvl])[:, digit_lvl(c)],   R = r·wᵀ = ⊙_lvl (fr_lvl·fw_lvlᵀ)
 # with the per-level [BT,b] softmax factors fr,fw gathered to the nc-leaf block by Sel[lvl][b, nc].
 #
-# BACKWARD (router-grad fold dWr,dWw,d_h) is BELOW: `_RoLARoutedFn` (mirroring the prototype's
-# `_TreeRoutedFn`) wraps this forward — backward drives the validated fold kernels (`_bwd_intra_kernel`,
-# `_bwd_inter_*`, `_fold_*` from proto_tree_routing.py) at the PRODUCTION state-block width (BC=BG), and
+# BACKWARD (router-grad fold dWr,dWw,d_h) is BELOW: `_RoLARoutedFn` wraps this forward — backward drives
+# the validated fold kernels (`_bwd_intra_kernel`, `_bwd_inter_*`, `_fold_*` from
+# `routed_bwd_kernels.py`) at the PRODUCTION state-block width (BC=BG), and
 # folds the transient [BT,nc] gate-grads into dWr/dWw/d_h in-kernel (the [L,nc] grads never materialize).
 # The forward builds the SAME `sel` map the bwd needs and routes through the SAME [BT,BG] factor
 # reconstruction (`_build_rw_tile`) the fold recomputes.
@@ -419,9 +436,9 @@ def rola_rla_triton(q, k, v, r, w, chunk=None, BG=16, compute_dtype=None):
 
 def _build_sel(D, b, nc, device):
     """One-hot level→leaf selection maps Sel[lvl][d, leaf] = 1 iff digit_lvl(leaf)==d (big-endian
-    base-b digits, matching the prototype's _digits ordering). Tiny [D,b,nc] constant — reconstructs
+    base-b digit decomposition: leaf = Σ_i d_i·b^(D-1-i)). Tiny [D,b,nc] constant — reconstructs
     the [BT,nc] gate tile from the [BT,b] per-level factors IN-KERNEL. Carries NO sequence dimension,
-    so it is NOT the [L,nc] gate; identical to proto_tree_routing._build_sel."""
+    so it is NOT the [L,nc] gate."""
     sel = torch.zeros(D, b, nc, device=device, dtype=torch.float32)
     for leaf in range(nc):
         digs = [(leaf // (b ** (D - 1 - i))) % b for i in range(D)]
@@ -434,7 +451,7 @@ def _routing_bias(b_r, b_w, D, b, device, dtype=torch.float32):
     """Resolve the optional per-level routing bias b_r/b_w ∈ [D,b] (the affine term of softmax(h·W+b))
     to (br, bw, has_bias) for the kernels. None ⇒ a 1-element dummy (never read; HAS_BIAS=False gates
     every load) so the kernel signature stays uniform and the bias=None path is byte-identical to the
-    pre-bias kernel. Mirrors proto_tree_routing._bias_args."""
+    pre-bias kernel."""
     if b_r is None and b_w is None:
         dummy = torch.zeros(1, device=device, dtype=dtype)
         return dummy, dummy, False
@@ -462,9 +479,9 @@ def _build_rw_tile(h_ptr, wr_ptr, ww_ptr, sel_ptr, offs_c, cmask,
                    BG: tl.constexpr, BD: tl.constexpr, NDM: tl.constexpr,
                    HAS_BIAS: tl.constexpr):
     """Build the [BT, BG] read/write routing tiles for ONE state-block (the BG-wide nc slice offs_c),
-    IN-KERNEL from h + Wr,Ww — the production stand-in for `tl.load(rg/wg)`. Ports the prototype's
-    in-kernel factor construction (proto_tree_routing._build_factors), with the tile width = the
-    production state-block BG (not the prototype's BC). For each level: logits = h·W (+ optional bias
+    IN-KERNEL from h + Wr,Ww — the production stand-in for `tl.load(rg/wg)`. Same in-kernel factor
+    construction as the backward's `_build_factors` (routed_bwd_kernels.py), at the production
+    state-block width BG. For each level: logits = h·W (+ optional bias
     b_r/b_w ∈ [D,b], added before the softmax → softmax(h·W+b)) — loop BD-blocks of d_model so any
     d_model fits SMEM, softmax over the b branches (pad cols masked to -inf → vanish), then gather the
     [BT,b] factor to the BG leaves of THIS block via the one-hot Sel slice and Hadamard-accumulate.
@@ -582,7 +599,7 @@ def _rola_routed_fwd_inter(q_ptr, k_ptr, v_ptr, h_ptr, wr_ptr, ww_ptr, sel_ptr, 
                            sbr_lvl, sbr_b, sbw_lvl, sbw_b,
                            D: tl.constexpr, bb_: tl.constexpr, BB: tl.constexpr,
                            BT: tl.constexpr, BK: tl.constexpr, BV: tl.constexpr,
-                           BVF: tl.constexpr, BG: tl.constexpr, BD: tl.constexpr,
+                           BG: tl.constexpr, BD: tl.constexpr,
                            NCH: tl.constexpr, NDM: tl.constexpr,
                            HAS_BIAS: tl.constexpr, USE_G: tl.constexpr):
     """TREE-ROUTED inter: byte-for-byte the production `_rola_fwd_inter` NB-fused inter scan — one
@@ -684,8 +701,8 @@ def _routed_fwd_tiled(q, k, v, h, Wr, Ww, D, b, sel, chunk, BG, BK=64, b_r=None,
                                      ND=ND, NB=NB, NDM=NDM, HAS_BIAS=has_bias, USE_G=use_g)
     _rola_routed_fwd_inter[(B, NB, ND)](q, k, v, h, Wr, Ww, sel, ld, out_inter, br, bw, L, dqk, dv, nc, d_model,
                                         *base, *route, *sg, *so_e, *sbias,
-                                        D=D, bb_=b, BB=BB, BT=chunk, BK=BK, BVF=BV, BG=BG, BD=BD,
-                                        NCH=NCH, NDM=NDM, HAS_BIAS=has_bias, USE_G=use_g)
+                                        D=D, bb_=b, BB=BB, BT=chunk, BK=BK, BG=BG, BD=BD,
+                                        NCH=NCH, NDM=NDM, HAS_BIAS=has_bias, USE_G=use_g)   # BV autotuned
     return out_intra[..., :dv] + out_inter[..., :dv]
 
 
@@ -710,12 +727,12 @@ def _rola_rla_routed_fwd(q, k, v, h, Wr, Ww, D, b, chunk=None, BG=16):
 # through the SAME one-hot `Sel` map + the SAME `_build_rw_tile` factor reconstruction the forward uses,
 # and folded in-kernel (softmax jacobian → atomic dWr/dWw/d_h).
 #
-# The fold math is the PROVEN prototype backward (proto_tree_routing.py: _bwd_intra_kernel,
+# The fold math is the validated backward (routed_bwd_kernels.py: _bwd_intra_kernel,
 # _bwd_inter_state_kernel, _bwd_inter_read_kernel, _fold_kernel — validated <1e-2 vs autograd for
 # flat/square/tree). Those kernels are GENERIC over the nc-block width (their `BC` constexpr); the ONLY
-# adaptation is to drive them at the PRODUCTION state-block width BC=BG (not the prototype's fixed
-# BC=16) and through this module's `_build_sel`, so the backward routes through byte-identical factor
-# reconstruction to the production forward (`_build_rw_tile` ≡ proto `_build_factors`). dr,dw stay
+# adaptation is to drive them at the PRODUCTION state-block width BC=BG and through this module's
+# `_build_sel`, so the backward routes through byte-identical factor
+# reconstruction to the production forward (`_build_rw_tile` ≡ `_build_factors`). dr,dw stay
 # transient per-chunk [B,chunk,nc] scratch tiles (gdr/gdw), OVERWRITTEN every chunk — never [L,nc].
 #
 # The per-chunk pre-state snapshots S_j ∈ [B,nc,dqk,dv] the reverse-scan needs are the RECURRENT state
@@ -1001,7 +1018,7 @@ class _RoLARoutedFn(torch.autograd.Function):
     routed forward (`_routed_fwd_tiled`); backward drives the validated fold kernels at the production
     state-block width (BC=BG), reconstructing factors through the SAME Sel map. The [L,nc] gates AND
     their grads are never materialized (only transient [BT,BG] factor tiles + per-chunk [B,chunk,nc]
-    gate-grad scratch). Mirrors proto_tree_routing._TreeRoutedFn."""
+    gate-grad scratch)."""
     @staticmethod
     @input_guard
     @autocast_custom_fwd
@@ -1097,7 +1114,7 @@ def rola_gla_routed_triton(q, k, v, h, Wr, Ww, ld, D, b, chunk=None, BG=16, b_r=
 
 @triton.jit
 def _kappa_d_tile(q_ptr, sden_ptr, Gc, w_tile, ea, ena, cols, cmask,
-                  pid_b, rows, rmask, dqk, nc, sq_b, sq_l, sq_d, ssd_b, ssd_k,
+                  pid_b, rows, rmask, dqk, sq_b, sq_l, sq_d, ssd_b, ssd_k,
                   BT: tl.constexpr, BK: tl.constexpr, BC: tl.constexpr, ND: tl.constexpr,
                   USE_G: tl.constexpr):
     """Per-state den d[BT,BC] = (G⊙causal)·w (intra) + q·Sden^c (inter). The inter term contracts dqk →
@@ -1205,7 +1222,7 @@ def _kappa_fwd_chunk(h_ptr, q_ptr, k_ptr, v_ptr, wr_ptr, ww_ptr, sel_ptr, kap_pt
             ea = w_tile * 0.0 + 1.0
             ena = ea
         d_tile = _kappa_d_tile(q_ptr, sden_ptr, Gc, w_tile, ea, ena, cols, cmask,
-                               pid_b, rows, rmask, dqk, nc, sq_b, sq_l, sq_d, ssd_b, ssd_k,
+                               pid_b, rows, rmask, dqk, sq_b, sq_l, sq_d, ssd_b, ssd_k,
                                BT, BK, BC, ND, USE_G)
         rt_tile = _kappa_rescale(r_tile, d_tile, kap, cmask, GLOBAL, PER_STATE, EPS)
         o_den += tl.sum(rt_tile * d_tile, axis=1)
@@ -1242,7 +1259,7 @@ def _kappa_fwd_chunk(h_ptr, q_ptr, k_ptr, v_ptr, wr_ptr, ww_ptr, sel_ptr, kap_pt
                 wt = w_tile
                 w_end = w_tile
             d_tile = _kappa_d_tile(q_ptr, sden_ptr, Gc, w_tile, ea, ena, cols, cmask,
-                                   pid_b, rows, rmask, dqk, nc, sq_b, sq_l, sq_d, ssd_b, ssd_k,
+                                   pid_b, rows, rmask, dqk, sq_b, sq_l, sq_d, ssd_b, ssd_k,
                                    BT, BK, BC, ND, USE_G)
             rt_tile = _kappa_rescale(r_tile, d_tile, kap, cmask, GLOBAL, PER_STATE, EPS)
             rd_tile = (rt_tile * ea) if USE_G else rt_tile   # decayed read gate r̃·e^a (readout only)
@@ -1325,7 +1342,7 @@ def _kappa_routed_fwd(q, k, v, h, Wr, Ww, kap, D, b, sel, chunk, global_norm, pe
     dv = v.shape[-1]
     d_model = h.shape[-1]
     nc = b ** D
-    BC = max(16, min(nc, 16))   # tl.dot needs the gram dim >=16; the nc tail is cmask'd
+    BC = 16   # tl.dot needs the gram dim >=16; the nc tail is cmask'd (was max(16,min(nc,16)) ≡ 16)
     BK = _kappa_bk_cap(dqk, dv, _KAPPA_BWD_CHUNK, BC)    # feature-tile (loop ND) — bounds the [BT,BC*BK] tiles
     BV = _kappa_bv_tile(dqk, dv, BC)                     # value-tile (loop ND_V) so [BC*BK,BV] fits SRAM
     BVO = max(16, triton.next_power_of_2(dv))            # num buffer width (full padded value dim)
@@ -1578,7 +1595,7 @@ def _kappa_bwd_read(h_ptr, q_ptr, k_ptr, v_ptr, wr_ptr, ww_ptr, sel_ptr, kap_ptr
             wt = w_tile
         # d_tile/rt_tile are value-FREE (from G,Sden,r) → compute once, reused for every value-block.
         d_tile = _kappa_d_tile(q_ptr, sden_ptr, Gc, w_tile, ea, ena, cols, cmask,
-                               pid_b, rows, rmask, dqk, nc, sq_b, sq_l, sq_d, ssd_b, ssd_k,
+                               pid_b, rows, rmask, dqk, sq_b, sq_l, sq_d, ssd_b, ssd_k,
                                BT, BK, BC, ND, USE_G)
         rt_tile = _kappa_rescale(r_tile, d_tile, kap, cmask, GLOBAL, PER_STATE, EPS)   # UNDECAYED r̃
         rd_tile = (rt_tile * ea) if USE_G else rt_tile   # decayed read gate r̃·e^a (readout only)
@@ -1722,7 +1739,7 @@ def _kappa_routed_bwd(q, k, v, h, Wr, Ww, kap, snap_val, snap_den, dnum, dden,
     dqk = q.shape[-1]
     dv = v.shape[-1]
     nc = b ** D
-    BC = max(16, min(nc, 16))
+    BC = 16   # tl.dot gram dim >=16; nc tail cmask'd (was max(16,min(nc,16)) ≡ 16)
     BK = _kappa_bk_cap(dqk, dv, chunk, BC)   # feature-tile (loop ND) — bounds the [BT,BC*BK] tiles
     BV = _kappa_bv_tile(dqk, dv, BC, BK)     # value-tile (loop ND_V) so the [BC*BK,BV] state slices fit
     BD = max(16, triton.next_power_of_2(d_model))
@@ -1954,10 +1971,13 @@ def _floor_ld(ld):
     ROLA_GLA_FLOOR_CLAMP=1, clamp to the floor and warn ONCE. Returns a tensor safe for the chunk
     kernels (dtype/contiguity left to the caller).
 
-    Under torch.compile the data-dependent min-check is a graph break, so skip it while tracing — the
-    public entrypoints (`chunk_rola`/`chunk_rola_routed`/`fused_recurrent_rola`) run the EAGER guard
-    once before dispatching to the compiled region (`_guard_ld`). When compiling we only apply the
-    cheap CLAMP (clamp-mode) or pass through (default), trusting that eager guard."""
+    Under torch.compile the data-dependent min-check is a graph break, so skip it while tracing. Only
+    `chunk_rola` is compiled, so ONLY it needs the separate eager pre-guard: it runs `_guard_ld(g)` once
+    BEFORE dispatching to its compiled region, then the compiled `_floor_ld` (this fn) sees
+    is_compiling()==True and applies only the cheap CLAMP (clamp-mode) or pass-through (default),
+    trusting that eager guard. `chunk_rola_routed` and `fused_recurrent_rola` are EAGER — they call this
+    `_floor_ld` directly (is_compiling()==False), so the loud min-check/raise runs inline for them; they
+    do NOT use `_guard_ld`."""
     global _gla_floor_warned
     if torch.compiler.is_compiling():
         return ld.clamp(min=_GLA_FLOOR) if _GLA_FLOOR_CLAMP else ld
