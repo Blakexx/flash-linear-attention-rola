@@ -11,7 +11,13 @@ from fla_rola.utils import assert_close, device
 def test_generation(rola_instance):
     """Generation == forward: a chunked prefill hands its recurrent state to token-by-token recurrent
     decode (KV-cache) and reproduces the full teacher-forced forward. No padding — `chunk_rola_routed` is
-    fixed-length; the varlen/unpad path lands with `chunk_rola_routed` cu_seqlens support (follow-up)."""
+    fixed-length; the varlen/unpad path lands with `chunk_rola_routed` cu_seqlens support (follow-up).
+
+    NB on the residual (#42): the generation-vs-forward gap is the CHUNK forward's fp32 round-off, NOT the
+    decode's. The GLA chunk kernel factors the per-state decay as e^{+a}/e^{-a}/e^Λ (ops/rola/chunk.py),
+    which adds fp32 noise the un-factored recurrent decode never incurs — fused_recurrent_rola is
+    bit-accurate to an fp64 oracle (rel ~1e-7), while chunk_rola_routed sits at rel ~1e-3 (hence gla-kappa
+    > rla-kappa here). So a future tolerance tightening must tighten the CHUNK path, not chase the decode."""
     if device != 'cuda':
         pytest.skip('RoLA Triton kernels require CUDA')
     torch.manual_seed(42)
