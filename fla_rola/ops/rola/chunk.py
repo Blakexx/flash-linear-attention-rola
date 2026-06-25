@@ -1006,7 +1006,10 @@ class _RoLARoutedFn(torch.autograd.Function):
     @input_guard
     @autocast_custom_fwd
     def forward(ctx, q, k, v, h, Wr, Ww, D, b, chunk, BG, b_r, b_w, ld=None):
-        chunk = _CHUNK_FWD if chunk is None else min(chunk, _CHUNK_FWD)
+        # GLA (USE_G) caps the FORWARD chunk at _CHUNK (32) — the fp32 decay floor + SMEM wall (the BT=64
+        # decayed-gram fp32 tiles overflow the ada-class 99KB SMEM); RLA keeps the full _CHUNK_FWD (64).
+        cap = _CHUNK if ld is not None else _CHUNK_FWD
+        chunk = cap if chunk is None else min(chunk, cap)
         nc = b ** D
         sel = _build_sel(D, b, nc, q.device)
         q, k, v, h, Wr, Ww = (x.contiguous() for x in (q, k, v, h, Wr, Ww))
@@ -1835,7 +1838,10 @@ class _RoLARoutedKappaFn(torch.autograd.Function):
     @input_guard
     @autocast_custom_fwd
     def forward(ctx, q, k, v, h, Wr, Ww, kap, D, b, chunk, global_norm, per_state, eps, b_r, b_w, ld=None):
-        chunk = _CHUNK_FWD if chunk is None else min(chunk, _CHUNK_FWD)
+        # GLA (USE_G) caps the FORWARD chunk at _CHUNK (32) — the fp32 decay floor + the 3-pass kappa
+        # mega-kernel's SMEM wall at BT=64; RLA keeps the full _CHUNK_FWD (64). Chunk-size invariant.
+        cap = _CHUNK if ld is not None else _CHUNK_FWD
+        chunk = cap if chunk is None else min(chunk, cap)
         nc = b ** D
         sel = _build_sel(D, b, nc, q.device)
         q, k, v, h, Wr, Ww, kap = (x.contiguous() for x in (q, k, v, h, Wr, Ww, kap))
