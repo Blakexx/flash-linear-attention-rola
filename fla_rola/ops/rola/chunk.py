@@ -4071,7 +4071,12 @@ def _chunk_rola_impl(q, k, v, r, w, g=None, norm='kappa', kappa=None, scale=None
 
     if norm == 'raw':
         rout = _rola_readout(qf, kf, vf, fold(r).float(), wf, gf, chunk_size, compute_dtype=cdt)
-        return unfold(rout).to(v.dtype)
+        out = unfold(rout).to(v.dtype)
+        if not output_final_state:
+            return out
+        # raw carries NO per-state denominator, so the emitted state is [N, H*nc, K, V] (no +1 den
+        # column) — exactly the layout fused_recurrent_rola(norm='raw') ingests and continues.
+        return out, _final_state(kf, vf, wf, gf, B, H, raw=True)
 
     # global / per_state / kappa: per-state den pre-pass → rescale read gates → numerator-only
     # readout → divide by the reconstructed global den Σ_c r̃ᶜ·dᶜ.
@@ -4096,12 +4101,17 @@ def _chunk_rola_impl(q, k, v, r, w, g=None, norm='kappa', kappa=None, scale=None
     return out, _final_state(kf, vf, wf, gf, B, H)
 
 
-def _final_state(kf, vf, wf, gf, B, H):
+def _final_state(kf, vf, wf, gf, B, H, raw=False):
     """Final recurrent state of the chunked pass: `stateᶜ = Σ_t [e^{G_T-G_t}·]wᵗᶜ·kf_t⊗[vf_t;1]`,
     shaped `[N, H*nc, K, V+1]` (the `+1` ones-column is the per-state denominator) — byte-compatible
     with `fused_recurrent_rola`'s state so a chunked prefill hands off to recurrent decode. O(L), no
-    kernel; the backward through a carried state is not provided (decode is inference)."""
-    v1 = torch.cat([vf, torch.ones_like(vf[..., :1])], -1).float()      # [BH,T,V+1]
+    kernel; the backward through a carried state is not provided (decode is inference).
+
+    `raw=True` emits a [N, H*nc, K, V] state with NO den column: the raw readout is un-normalized
+    (no per-state denominator is ever read), so the +1 ones-column is entirely absent — matching the
+    raw decode kernel's [*,K,V] state layout (uses_v_plus_one=False)."""
+    # raw: bare value tile [BH,T,V] (no ones-column). normalized: augment with the den ones-column.
+    v1 = vf.float() if raw else torch.cat([vf, torch.ones_like(vf[..., :1])], -1).float()  # [BH,T,V(+1)]
     wgt = wf.float()                                                    # [BH,T,nc]
     if gf is not None:                                                  # GLA: token t decays by Σ_{t'>t} g
         # Apply the SAME GLA decay floor (`_floor_ld`) every chunked GLA decay site uses (readout/den/
