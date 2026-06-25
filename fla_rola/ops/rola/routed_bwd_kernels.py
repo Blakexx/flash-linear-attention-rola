@@ -161,22 +161,63 @@ def _build_factors(h_ptr, wr_ptr, ww_ptr, sel_ptr, cols, cmask,
     return r_tile, w_tile
 
 
+# ============================================================================
+# IN-KERNEL per-state log-decay (#45). The GLA scalar decay ld[t,c] is FUSED — computed in-kernel from a
+# PER-HEAD decay weight Wg ∈ [H, d_model] (the layer's `w_g.weight`, a per-head scalar gate) + the write
+# tile w that `_build_rw_tile`/`_build_factors` already produces — instead of being a precomputed
+# [B,T,H,nc] INPUT (which materialized [L,nc]). Replicates `RoLA._log_decay` (layers/rola.py) EXACTLY:
+#   alpha = sigmoid(h · Wg[head])                       # per-head scalar in (0,1); logsigmoid().exp()==sigmoid
+#   ld[t,c] = clamp(log(clamp(1 - w[t,c]·(1-alpha[t]), 1e-8)), min=GLA_FLOOR)
+# `_build_alpha` is the BD-blocked logit→sigmoid (mirrors the per-level logit loop); wg_ptr is offset to
+# THIS head (head = pid_b % H) by the CALLER, exactly like wr_ptr/ww_ptr. `_ld_from_w` turns the write
+# tile into the floored ld. Defined here (the dependency-free bwd-kernel module) and imported by chunk.py
+# (the forward kernels) so there is ONE definition — no per-file re-encode. RLA (USE_G=False) calls
+# neither. The decay-grad fold (dWg, the extra dh, and dw_decay→dWw) lives in `_fold_kernel` below.
+# ============================================================================
+@triton.jit
+def _build_alpha(h_ptr, wg_ptr, pid_b, rows, rmask, d_model,
+                 sh_b, sh_l, sh_d, swg_d,
+                 BT: tl.constexpr, BD: tl.constexpr, NDM: tl.constexpr):
+    """alpha[BT] = sigmoid(Σ_d h[t,d]·Wg[head,d]) — the per-head scalar decay gate, IN-KERNEL from h + the
+    head-offset Wg[d_model] row. BD-blocks d_model (NDM blocks) so any d_model fits SMEM; depends only on
+    `rows` (NOT the nc-state column), so the caller computes it ONCE per token-block, reused across blocks."""
+    z = tl.zeros([BT], dtype=tl.float32)
+    for dm in range(NDM):
+        offs_dm = dm * BD + tl.arange(0, BD)
+        mmask = offs_dm < d_model
+        hc = tl.load(h_ptr + pid_b * sh_b + rows[:, None] * sh_l + offs_dm[None, :] * sh_d,
+                     mask=rmask[:, None] & mmask[None, :], other=0.0)
+        wgc = tl.load(wg_ptr + offs_dm * swg_d, mask=mmask, other=0.0)
+        z += tl.sum(hc * wgc[None, :], axis=1)
+    return tl.sigmoid(z)
+
+
+@triton.jit
+def _ld_from_w(w_tile, alpha, cmask, GLA_FLOOR: tl.constexpr):
+    """ld[BT,BC] = clamp(log(clamp(1 - w·(1-alpha), 1e-8)), min=GLA_FLOOR). `w_tile` is the write gate
+    (already cmask→0 on the nc tail ⇒ m=1, ld=0 there, matching the old `tl.load(..., other=0.0)`). The
+    floor matches the layer's `ld.clamp(min=_GLA_FLOOR)` and the kernels' `_floor_ld`."""
+    m = 1.0 - w_tile * (1.0 - alpha[:, None])
+    ld = tl.maximum(tl.log(tl.maximum(m, 1e-8)), GLA_FLOOR)
+    return tl.where(cmask[None, :], ld, 0.0)
+
+
 # ============ INTRA backward kernel ============
 @triton.jit
 def _bwd_intra_kernel(
-    h_ptr, q_ptr, k_ptr, v_ptr, wr_ptr, ww_ptr, sel_ptr, ld_ptr, do_ptr,
+    h_ptr, q_ptr, k_ptr, v_ptr, wr_ptr, ww_ptr, sel_ptr, wg_ptr, do_ptr,
     dq_ptr, dk_ptr, dv_ptr, dh_ptr, dwr_ptr, dww_ptr, gda_ptr,
     br_ptr, bw_ptr, dbr_ptr, dbw_ptr,
     L, d_model, dqk, dv, nc, H, swr_head, sww_head, sbr_head, sbw_head,
     sh_b, sh_l, sh_d, sq_b, sq_l, sq_d, sv_b, sv_l, sv_d,
     swr_lvl, swr_d, swr_b, sww_lvl, sww_d, sww_b,
-    ssel_lvl, ssel_b, ssel_c, sg_b, sg_l, sg_c, sga_b, sga_l, sga_c,
+    ssel_lvl, ssel_b, ssel_c, swg_head, swg_d, sga_b, sga_l, sga_c,
     so_b, so_l, so_v, sdh_b, sdh_l, sdh_d,
     sbr_lvl, sbr_b, sbw_lvl, sbw_b,
     D: tl.constexpr, b: tl.constexpr, BB: tl.constexpr,
     BT: tl.constexpr, BK: tl.constexpr, BV: tl.constexpr, BD: tl.constexpr,
     BC: tl.constexpr, NCBLK: tl.constexpr, ND: tl.constexpr, NDM: tl.constexpr,
-    HAS_BIAS: tl.constexpr, USE_G: tl.constexpr = False,
+    HAS_BIAS: tl.constexpr, USE_G: tl.constexpr = False, GLA_FLOOR: tl.constexpr = -2.5,
 ):
     # USE_G (GLA, #30): the routing factors r_tile/w_tile feed the DECAYED intra gram rt=r·eᵃ, wt=w·e⁻ᵃ
     # (a = intra-chunk cumsum of ld over this block's c-columns), mirroring `_rola_routed_fwd_intra`.
@@ -197,6 +238,7 @@ def _bwd_intra_kernel(
     dww_ptr = dww_ptr + _hd * sww_head
     dbr_ptr = dbr_ptr + _hd * sbr_head
     dbw_ptr = dbw_ptr + _hd * sbw_head
+    wg_ptr = wg_ptr + _hd * swg_head            # per-head decay weight (read-only here; #45)
     offs_t = tl.arange(0, BT)
     offs_v = tl.arange(0, BV)
     offs_k = tl.arange(0, BK)
@@ -207,6 +249,9 @@ def _bwd_intra_kernel(
     kmask = offs_k < dqk
     rows = pid_t * BT + offs_t
     rmask = rows < L
+    if USE_G:                                   # per-head decay gate alpha[BT], once (in-kernel ld, #45)
+        alpha = _build_alpha(h_ptr, wg_ptr, pid_b, rows, rmask, d_model,
+                             sh_b, sh_l, sh_d, swg_d, BT, BD, NDM)
     qc = tl.load(q_ptr + pid_b * sq_b + rows[:, None] * sq_l + offs_k[None, :] * sq_d,
                  mask=rmask[:, None] & kmask[None, :], other=0.0)
     kc = tl.load(k_ptr + pid_b * sq_b + rows[:, None] * sq_l + offs_k[None, :] * sq_d,
@@ -230,8 +275,7 @@ def _bwd_intra_kernel(
                                         br_ptr, bw_ptr, sbr_lvl, sbr_b, sbw_lvl, sbw_b,
                                         D, BT, BB, BC, BD, NDM, HAS_BIAS)
         if USE_G:
-            ldc = tl.load(ld_ptr + pid_b * sg_b + rows[:, None] * sg_l + cols[None, :] * sg_c,
-                          mask=rmask[:, None] & cmask[None, :], other=0.0)
+            ldc = _ld_from_w(w_tile, alpha, cmask, GLA_FLOOR)
             a = tl.cumsum(ldc, axis=0)
             r_tile = r_tile * tl.exp(a)
             w_tile = w_tile * tl.exp(-a)
@@ -259,8 +303,7 @@ def _bwd_intra_kernel(
                                         br_ptr, bw_ptr, sbr_lvl, sbr_b, sbw_lvl, sbw_b,
                                         D, BT, BB, BC, BD, NDM, HAS_BIAS)
         if USE_G:
-            ldc = tl.load(ld_ptr + pid_b * sg_b + rows[:, None] * sg_l + cols[None, :] * sg_c,
-                          mask=rmask[:, None] & cmask[None, :], other=0.0)
+            ldc = _ld_from_w(w_tile, alpha, cmask, GLA_FLOOR)
             a = tl.cumsum(ldc, axis=0)
             ea = tl.exp(a)
             ena = tl.exp(-a)
@@ -292,17 +335,17 @@ def _bwd_intra_kernel(
 # Split from the state-update half to halve SMEM (only the readout [BT,BC*BK] tile lives here).
 @triton.jit
 def _bwd_inter_read_kernel(
-    h_ptr, q_ptr, wr_ptr, ww_ptr, sel_ptr, ld_ptr, s_ptr, ds_ptr, do_ptr,
+    h_ptr, q_ptr, wr_ptr, ww_ptr, sel_ptr, wg_ptr, s_ptr, ds_ptr, do_ptr,
     dq_ptr, gdr_ptr, gda_ptr, br_ptr, bw_ptr,
     L, d_model, dqk, dv, nc, t_start, H, swr_head, sww_head, sbr_head, sbw_head,
     sh_b, sh_l, sh_d, sq_b, sq_l, sq_d,
     swr_lvl, swr_d, swr_b, sww_lvl, sww_d, sww_b,
-    ssel_lvl, ssel_b, ssel_c, sgl_b, sgl_l, sgl_c, ss_b, ss_c, ss_k, ss_v,
+    ssel_lvl, ssel_b, ssel_c, swg_head, swg_d, ss_b, ss_c, ss_k, ss_v,
     so_b, so_l, so_v, sg_b, sg_t, sg_c, sga_b, sga_l, sga_c, sbr_lvl, sbr_b, sbw_lvl, sbw_b,
     D: tl.constexpr, b: tl.constexpr, BB: tl.constexpr,
     BT: tl.constexpr, BK: tl.constexpr, BV: tl.constexpr, BD: tl.constexpr,
     BC: tl.constexpr, NCBLK: tl.constexpr, ND: tl.constexpr, NDM: tl.constexpr,
-    HAS_BIAS: tl.constexpr, USE_G: tl.constexpr = False,
+    HAS_BIAS: tl.constexpr, USE_G: tl.constexpr = False, GLA_FLOOR: tl.constexpr = -2.5,
 ):
     # USE_G (GLA, #30): the inter readout uses the DECAYED read gate rt=r·eᵃ (a=intra-chunk cumsum of ld).
     # dq/dS_read flow through rt; the read routing-factor grad is drt·eᵃ (→ gdr) and the read-gate decay
@@ -313,6 +356,7 @@ def _bwd_inter_read_kernel(
     ww_ptr = ww_ptr + _hd * sww_head
     br_ptr = br_ptr + _hd * sbr_head
     bw_ptr = bw_ptr + _hd * sbw_head
+    wg_ptr = wg_ptr + _hd * swg_head            # per-head decay weight (read-only here; #45)
     ND_V = (dv + BV - 1) // BV       # value-blocks (BV is the value TILE; ND_V==1 ⇒ the un-tiled kernel)
     offs_t = tl.arange(0, BT)
     offs_bb = tl.arange(0, BB)
@@ -320,6 +364,9 @@ def _bwd_inter_read_kernel(
     bmask = offs_bb < b
     rows = t_start + offs_t
     rmask = rows < L
+    if USE_G:                                   # per-head decay gate alpha[BT], once (in-kernel ld, #45)
+        alpha = _build_alpha(h_ptr, wg_ptr, pid_b, rows, rmask, d_model,
+                             sh_b, sh_l, sh_d, swg_d, BT, BD, NDM)
     for cb in range(NCBLK):
         cols = cb * BC + offs_c
         cmask = cols < nc
@@ -330,8 +377,7 @@ def _bwd_inter_read_kernel(
                                         br_ptr, bw_ptr, sbr_lvl, sbr_b, sbw_lvl, sbw_b,
                                         D, BT, BB, BC, BD, NDM, HAS_BIAS)
         if USE_G:
-            ldc = tl.load(ld_ptr + pid_b * sgl_b + rows[:, None] * sgl_l + cols[None, :] * sgl_c,
-                          mask=rmask[:, None] & cmask[None, :], other=0.0)
+            ldc = _ld_from_w(w_tile, alpha, cmask, GLA_FLOOR)
             a = tl.cumsum(ldc, axis=0)
             ea = tl.exp(a)
             rt_tile = r_tile * ea            # decayed read gate (used in the readout/dS_read/dq)
@@ -385,17 +431,17 @@ def _bwd_inter_read_kernel(
 # Must run BEFORE the readout kernel writes dS_read into ds for this chunk (ds is still S_{j+1}'s adjoint).
 @triton.jit
 def _bwd_inter_state_kernel(
-    h_ptr, k_ptr, v_ptr, wr_ptr, ww_ptr, sel_ptr, ld_ptr, sj_ptr, ds_ptr,
+    h_ptr, k_ptr, v_ptr, wr_ptr, ww_ptr, sel_ptr, wg_ptr, sj_ptr, ds_ptr,
     dk_ptr, dv_ptr, gdw_ptr, gda_ptr, br_ptr, bw_ptr,
     L, d_model, dqk, dv, nc, t_start, H, swr_head, sww_head, sbr_head, sbw_head,
     sh_b, sh_l, sh_d, sq_b, sq_l, sq_d, sv_b, sv_l, sv_d,
     swr_lvl, swr_d, swr_b, sww_lvl, sww_d, sww_b,
-    ssel_lvl, ssel_b, ssel_c, sgl_b, sgl_l, sgl_c, ss_b, ss_c, ss_k, ss_v,
+    ssel_lvl, ssel_b, ssel_c, swg_head, swg_d, ss_b, ss_c, ss_k, ss_v,
     sg_b, sg_t, sg_c, sga_b, sga_l, sga_c, sbr_lvl, sbr_b, sbw_lvl, sbw_b,
     D: tl.constexpr, b: tl.constexpr, BB: tl.constexpr,
     BT: tl.constexpr, BK: tl.constexpr, BV: tl.constexpr, BD: tl.constexpr,
     BC: tl.constexpr, NCBLK: tl.constexpr, ND: tl.constexpr, NDM: tl.constexpr,
-    HAS_BIAS: tl.constexpr, USE_G: tl.constexpr = False,
+    HAS_BIAS: tl.constexpr, USE_G: tl.constexpr = False, GLA_FLOOR: tl.constexpr = -2.5,
 ):
     # USE_G (GLA, #30): the state write uses the DECAYED write gate w_end=w·e^{Λ−a} (Λ=chunk-total ld);
     # dk/dv flow through w_end; the write routing-factor grad += dw_end·e^{Λ−a} (→ gdw). da-pieces:
@@ -408,6 +454,7 @@ def _bwd_inter_state_kernel(
     ww_ptr = ww_ptr + _hd * sww_head
     br_ptr = br_ptr + _hd * sbr_head
     bw_ptr = bw_ptr + _hd * sbw_head
+    wg_ptr = wg_ptr + _hd * swg_head            # per-head decay weight (read-only here; #45)
     ND_V = (dv + BV - 1) // BV       # value-blocks (BV is the value TILE; ND_V==1 ⇒ the un-tiled kernel)
     offs_t = tl.arange(0, BT)
     offs_bb = tl.arange(0, BB)
@@ -415,6 +462,9 @@ def _bwd_inter_state_kernel(
     bmask = offs_bb < b
     rows = t_start + offs_t
     rmask = rows < L
+    if USE_G:                                   # per-head decay gate alpha[BT], once (in-kernel ld, #45)
+        alpha = _build_alpha(h_ptr, wg_ptr, pid_b, rows, rmask, d_model,
+                             sh_b, sh_l, sh_d, swg_d, BT, BD, NDM)
     for cb in range(NCBLK):
         cols = cb * BC + offs_c
         cmask = cols < nc
@@ -425,8 +475,7 @@ def _bwd_inter_state_kernel(
                                         br_ptr, bw_ptr, sbr_lvl, sbr_b, sbw_lvl, sbw_b,
                                         D, BT, BB, BC, BD, NDM, HAS_BIAS)
         if USE_G:
-            ldc = tl.load(ld_ptr + pid_b * sgl_b + rows[:, None] * sgl_l + cols[None, :] * sgl_c,
-                          mask=rmask[:, None] & cmask[None, :], other=0.0)
+            ldc = _ld_from_w(w_tile, alpha, cmask, GLA_FLOOR)
             a = tl.cumsum(ldc, axis=0)
             Lam = tl.sum(tl.where(offs_t[:, None] == (BT - 1), a, 0.0), axis=0)   # [BC] chunk-total
             wend_tile = w_tile * tl.exp(Lam[None, :] - a)     # decayed write gate
@@ -487,15 +536,21 @@ def _bwd_inter_state_kernel(
 def _fold_kernel(
     h_ptr, wr_ptr, ww_ptr, sel_ptr, gdr_ptr, gdw_ptr,
     dh_ptr, dwr_ptr, dww_ptr, br_ptr, bw_ptr, dbr_ptr, dbw_ptr,
+    wg_ptr, dwg_ptr, dld_ptr,
     L, d_model, nc, t_start, H, swr_head, sww_head, sbr_head, sbw_head,
     sh_b, sh_l, sh_d, swr_lvl, swr_d, swr_b, sww_lvl, sww_d, sww_b,
     ssel_lvl, ssel_b, ssel_c, sg_b, sg_t, sg_c, sdh_b, sdh_l, sdh_d,
+    swg_head, swg_d,
     sbr_lvl, sbr_b, sbw_lvl, sbw_b,
     D: tl.constexpr, b: tl.constexpr, BB: tl.constexpr,
     BT: tl.constexpr, BC: tl.constexpr, BD: tl.constexpr,
     NCBLK: tl.constexpr, NDM: tl.constexpr,
-    HAS_BIAS: tl.constexpr,
+    HAS_BIAS: tl.constexpr, USE_G: tl.constexpr = False, GLA_FLOOR: tl.constexpr = -2.5,
 ):
+    # USE_G (GLA, #45): the per-state log-decay ld is computed in-kernel from Wg + the write gate, so its
+    # gradient is folded HERE (the natural home — this kernel already rebuilds w_tile and folds w → dWw,dh).
+    # dld_ptr carries the assembled ∂L/∂ld (the driver's reverse-cumsum of gda) for this chunk [BT,nc]. We
+    # split it: ∂L/∂w (added to dw_tile → dWw,dh via the SAME tree fold) and ∂L/∂z (z=h·Wg) → dWg,dh.
     pid_b = tl.program_id(0)
     _hd = pid_b % H                              # per-head router slice (BH fold is (B,H))
     wr_ptr = wr_ptr + _hd * swr_head
@@ -506,12 +561,18 @@ def _fold_kernel(
     dww_ptr = dww_ptr + _hd * sww_head
     dbr_ptr = dbr_ptr + _hd * sbr_head
     dbw_ptr = dbw_ptr + _hd * sbw_head
+    wg_ptr = wg_ptr + _hd * swg_head
+    dwg_ptr = dwg_ptr + _hd * swg_head
     offs_t = tl.arange(0, BT)
     offs_bb = tl.arange(0, BB)
     offs_c = tl.arange(0, BC)
     bmask = offs_bb < b
     rows = t_start + offs_t
     rmask = rows < L
+    if USE_G:
+        alpha = _build_alpha(h_ptr, wg_ptr, pid_b, rows, rmask, d_model,
+                             sh_b, sh_l, sh_d, swg_d, BT, BD, NDM)
+        dz = tl.zeros([BT], dtype=tl.float32)    # Σ_c ∂L/∂z, accumulated over ALL nc-blocks
     for cb in range(NCBLK):
         cols = cb * BC + offs_c
         cmask = cols < nc
@@ -525,6 +586,16 @@ def _fold_kernel(
                           mask=rmask[:, None] & cmask[None, :], other=0.0)
         dw_tile = tl.load(gdw_ptr + pid_b * sg_b + offs_t[:, None] * sg_t + cols[None, :] * sg_c,
                           mask=rmask[:, None] & cmask[None, :], other=0.0)
+        if USE_G:
+            # split the assembled ∂L/∂ld for this block into ∂L/∂w (→ dw_tile) and ∂L/∂z (→ dz).
+            dld_tile = tl.load(dld_ptr + pid_b * sg_b + offs_t[:, None] * sg_t + cols[None, :] * sg_c,
+                               mask=rmask[:, None] & cmask[None, :], other=0.0)
+            one_minus_a = 1.0 - alpha[:, None]
+            m = 1.0 - w_tile * one_minus_a
+            active = (m > 1e-8) & (tl.log(tl.maximum(m, 1e-8)) >= GLA_FLOOR)
+            dld = tl.where(cmask[None, :] & active, dld_tile, 0.0)
+            dw_tile += dld * (-one_minus_a / m)                       # ∂ld/∂w = -(1-alpha)/m
+            dz += tl.sum(dld * (w_tile / m), axis=1) * (alpha * (1.0 - alpha))  # ∂ld/∂alpha · ∂alpha/∂z
         for lvl in range(D):
             _fold_level(dr_tile, dw_tile, r_tile, w_tile, cols, cmask,
                         h_ptr, wr_ptr, ww_ptr, sel_ptr, dwr_ptr, dww_ptr, dh_ptr,
@@ -533,3 +604,15 @@ def _fold_kernel(
                         ssel_lvl, ssel_b, ssel_c, sdh_b, sdh_l, sdh_d,
                         br_ptr, bw_ptr, sbr_lvl, sbr_b, sbw_lvl, sbw_b, dbr_ptr, dbw_ptr,
                         lvl, BT, BB, BC, BD, NDM, HAS_BIAS)
+    if USE_G:
+        # fold dz (the per-head decay-logit grad) into dWg[head,d] += Σ_t h·dz and dh[t,d] += dz·Wg[head,d].
+        for dm in range(NDM):
+            offs_dm = dm * BD + tl.arange(0, BD)
+            mmask = offs_dm < d_model
+            hc = tl.load(h_ptr + pid_b * sh_b + rows[:, None] * sh_l + offs_dm[None, :] * sh_d,
+                         mask=rmask[:, None] & mmask[None, :], other=0.0)
+            wgc = tl.load(wg_ptr + offs_dm * swg_d, mask=mmask, other=0.0)
+            dzc = tl.where(rmask, dz, 0.0)
+            tl.atomic_add(dwg_ptr + offs_dm * swg_d, tl.sum(hc * dzc[:, None], axis=0), mask=mmask)
+            tl.atomic_add(dh_ptr + pid_b * sdh_b + rows[:, None] * sdh_l + offs_dm[None, :] * sdh_d,
+                          dzc[:, None] * wgc[None, :], mask=rmask[:, None] & mmask[None, :])
