@@ -477,7 +477,7 @@ def _build_rw_tile(h_ptr, wr_ptr, ww_ptr, sel_ptr, offs_c, cmask,
                    br_ptr, bw_ptr, sbr_lvl, sbr_b, sbw_lvl, sbw_b,
                    D: tl.constexpr, BT: tl.constexpr, BB: tl.constexpr,
                    BG: tl.constexpr, BD: tl.constexpr, NDM: tl.constexpr,
-                   HAS_BIAS: tl.constexpr):
+                   HAS_BIAS: tl.constexpr, BUILD_R: tl.constexpr = True):
     """Build the [BT, BG] read/write routing tiles for ONE state-block (the BG-wide nc slice offs_c),
     IN-KERNEL from h + Wr,Ww — the production stand-in for `tl.load(rg/wg)`. Same in-kernel factor
     construction as the backward's `_build_factors` (routed_bwd_kernels.py), at the production
@@ -485,7 +485,13 @@ def _build_rw_tile(h_ptr, wr_ptr, ww_ptr, sel_ptr, offs_c, cmask,
     b_r/b_w ∈ [D,b], added before the softmax → softmax(h·W+b)) — loop BD-blocks of d_model so any
     d_model fits SMEM, softmax over the b branches (pad cols masked to -inf → vanish), then gather the
     [BT,b] factor to the BG leaves of THIS block via the one-hot Sel slice and Hadamard-accumulate.
-    r_tile,w_tile are returned masked to cmask (nc-tail cols → 0). Transient SRAM, [BT,BG]."""
+    r_tile,w_tile are returned masked to cmask (nc-tail cols → 0). Transient SRAM, [BT,BG].
+
+    BUILD_R (#37): when False, SKIP the read-factor (the read logits h·Wr, the read bias, the read
+    softmax, and the r-side Hadamard) and return r_tile as the dummy 1-tile — for the write-only callers
+    (the snapshot pass + the state-update backward) that discard the read tile, halving the per-call
+    routing-build matmul/softmax. The WRITE tile is computed identically → bit-for-bit unchanged from the
+    BUILD_R=True path (the skipped output was already discarded by those callers)."""
     r_tile = tl.full([BT, BG], 1.0, dtype=tl.float32)
     w_tile = tl.full([BT, BG], 1.0, dtype=tl.float32)
     for lvl in range(D):
@@ -496,30 +502,34 @@ def _build_rw_tile(h_ptr, wr_ptr, ww_ptr, sel_ptr, offs_c, cmask,
             mmask = offs_dm < d_model
             hc = tl.load(h_ptr + bn * sh_b + rows[:, None] * sh_l + offs_dm[None, :] * sh_d,
                          mask=rmask[:, None] & mmask[None, :], other=0.0)
-            wr = tl.load(wr_ptr + lvl * swr_lvl + offs_dm[:, None] * swr_d + offs_bb[None, :] * swr_b,
-                         mask=mmask[:, None] & bmask[None, :], other=0.0)
             ww = tl.load(ww_ptr + lvl * sww_lvl + offs_dm[:, None] * sww_d + offs_bb[None, :] * sww_b,
                          mask=mmask[:, None] & bmask[None, :], other=0.0)
-            lr += tl.dot(hc, wr)
             lw += tl.dot(hc, ww)
+            if BUILD_R:
+                wr = tl.load(wr_ptr + lvl * swr_lvl + offs_dm[:, None] * swr_d + offs_bb[None, :] * swr_b,
+                             mask=mmask[:, None] & bmask[None, :], other=0.0)
+                lr += tl.dot(hc, wr)
         if HAS_BIAS:
-            brc = tl.load(br_ptr + lvl * sbr_lvl + offs_bb * sbr_b, mask=bmask, other=0.0)
             bwc = tl.load(bw_ptr + lvl * sbw_lvl + offs_bb * sbw_b, mask=bmask, other=0.0)
-            lr += brc[None, :]
             lw += bwc[None, :]
+            if BUILD_R:
+                brc = tl.load(br_ptr + lvl * sbr_lvl + offs_bb * sbr_b, mask=bmask, other=0.0)
+                lr += brc[None, :]
         neg = tl.full([BT, BB], float('-inf'), dtype=tl.float32)
-        lr = tl.where(bmask[None, :], lr, neg)
         lw = tl.where(bmask[None, :], lw, neg)
-        er = tl.exp(lr - tl.max(lr, axis=1)[:, None])
         ew = tl.exp(lw - tl.max(lw, axis=1)[:, None])
-        fr = er / tl.sum(er, axis=1)[:, None]   # [BT, BB] read-gate level factor
         fw = ew / tl.sum(ew, axis=1)[:, None]   # [BT, BB] write-gate level factor
         sel = tl.load(sel_ptr + lvl * ssel_lvl + offs_bb[:, None] * ssel_b + offs_c[None, :] * ssel_c,
                       mask=bmask[:, None] & cmask[None, :], other=0.0)   # [BB, BG] one-hot
-        r_tile *= tl.dot(fr, sel)
         w_tile *= tl.dot(fw, sel)
-    r_tile = tl.where(cmask[None, :], r_tile, 0.0)
+        if BUILD_R:
+            lr = tl.where(bmask[None, :], lr, neg)
+            er = tl.exp(lr - tl.max(lr, axis=1)[:, None])
+            fr = er / tl.sum(er, axis=1)[:, None]   # [BT, BB] read-gate level factor
+            r_tile *= tl.dot(fr, sel)
     w_tile = tl.where(cmask[None, :], w_tile, 0.0)
+    if BUILD_R:
+        r_tile = tl.where(cmask[None, :], r_tile, 0.0)
     return r_tile, w_tile
 
 
@@ -782,7 +792,7 @@ def _rola_routed_snap_kernel(h_ptr, k_ptr, v_ptr, wr_ptr, ww_ptr, sel_ptr, ld_pt
                                        sh_b, sh_l, sh_d, swr_lvl, swr_d, swr_b, sww_lvl, sww_d, sww_b,
                                        ssel_lvl, ssel_b, ssel_c,
                                        br_ptr, bw_ptr, sbr_lvl, sbr_b, sbw_lvl, sbw_b,
-                                       D, BT, BB, BG, BD, NDM, HAS_BIAS)
+                                       D, BT, BB, BG, BD, NDM, HAS_BIAS, BUILD_R=False)  # write-only: skip read
             if USE_G:
                 ldc = tl.load(ld_ptr + pid_b*sg_b + rows[:, None]*sg_l + cols[None, :]*sg_c,
                               mask=rmask[:, None] & cmask[None, :], other=0.0)
@@ -1303,7 +1313,7 @@ def _kappa_fwd_chunk(h_ptr, q_ptr, k_ptr, v_ptr, wr_ptr, ww_ptr, sel_ptr, kap_pt
                                     sh_b, sh_l, sh_d, swr_lvl, swr_d, swr_b, sww_lvl, sww_d, sww_b,
                                     ssel_lvl, ssel_b, ssel_c,
                                     br_ptr, bw_ptr, sbr_lvl, sbr_b, sbw_lvl, sbw_b,
-                                    D, BT, BB, BC, BD, NDM, HAS_BIAS)
+                                    D, BT, BB, BC, BD, NDM, HAS_BIAS, BUILD_R=False)  # write-only: skip read
         if USE_G:
             ldc = tl.load(ld_ptr + pid_b*sg_b + rows[:, None]*sg_l + cols[None, :]*sg_c,
                           mask=rmask[:, None] & cmask[None, :], other=0.0)
@@ -1452,7 +1462,7 @@ def _kappa_bwd_state(h_ptr, k_ptr, v_ptr, wr_ptr, ww_ptr, sel_ptr, ld_ptr, sval_
                                     sh_b, sh_l, sh_d, swr_lvl, swr_d, swr_b, sww_lvl, sww_d, sww_b,
                                     ssel_lvl, ssel_b, ssel_c,
                                     br_ptr, bw_ptr, sbr_lvl, sbr_b, sbw_lvl, sbw_b,
-                                    D, BT, BB, BC, BD, NDM, HAS_BIAS)
+                                    D, BT, BB, BC, BD, NDM, HAS_BIAS, BUILD_R=False)  # write-only: skip read
         if USE_G:
             ldc = tl.load(ld_ptr + pid_b*sg_b + rows[:, None]*sg_l + cols[None, :]*sg_c,
                           mask=rmask[:, None] & cmask[None, :], other=0.0)
