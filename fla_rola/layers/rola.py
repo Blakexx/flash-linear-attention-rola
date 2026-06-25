@@ -38,6 +38,7 @@ from einops import rearrange
 from fla_rola.layers.utils import get_layer_cache, update_layer_cache
 from fla_rola.modules import RMSNorm, ShortConvolution
 from fla_rola.ops.rola import chunk_rola, fused_recurrent_rola
+from fla_rola.ops.rola.chunk import _GLA_FLOOR
 
 if TYPE_CHECKING:
     from transformers.processing_utils import Unpack
@@ -192,7 +193,12 @@ class RoLA(nn.Module):
         H = self.num_heads
         alpha = F.logsigmoid(self.w_g(x).view(B, L, H)).exp()              # [B,L,H]
         alpha_chunk = 1.0 - write_gates * (1.0 - alpha.unsqueeze(-1))       # [B,L,H,C]
-        return alpha_chunk.clamp(min=1e-8).log()
+        # Floor the log-decay to the kernel's fp32-safe domain (_GLA_FLOOR=-2.5 ⇒ retention ≥ 8.2%/tok).
+        # This is a DELIBERATE, documented modeling floor — the chunked GLA decay is factored e^{±a} and
+        # overflows fp32 for BT·|ld|≳88.7 (see ops/rola/chunk.py `_floor_ld`, #33). The kernel RAISES on
+        # ld below the floor (no silent rewrite); the layer floors explicitly here so the supported
+        # decay range is an overt architectural choice, not a kernel-internal surprise.
+        return alpha_chunk.clamp(min=1e-8).log().clamp(min=_GLA_FLOOR)
 
     def forward(
         self,

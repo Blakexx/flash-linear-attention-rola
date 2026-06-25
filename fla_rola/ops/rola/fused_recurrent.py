@@ -103,11 +103,18 @@ def _rola_decode_kernel(
             qk = tl.reshape(tl.broadcast_to(b_q[None, :], [BC, BK]), [BC * BK])               # [BC*BK]
             p = tl.sum(tl.reshape(qk[:, None] * b_s, [BC, BK, BV]), axis=1)                   # [BC, BV]
             p_den = tl.sum(tl.where(dmask[None, :], p, 0.0), axis=1)                          # [BC] per-state den
-            # rescale the read gate per the norm, inline.
+            # rescale the read gate per the norm, inline. The per-state den d^c is the canonical RAW
+            # SIGNED mass Σ_{j≤t} w_j^c (φq·φk) — matching `_kappa_rescale` (chunk), `chunk_rola` torch,
+            # and the naive oracle. The rescale r̃=r/(d+ε) | r·(d+ε)^{−κ} is only well-defined for d>0
+            # (the kappa pow / per_state divide of a signed d is ill-posed). PRODUCTION GUARANTEES d≥0:
+            # the layer is elu+1-only (φ>0) with softmax write gates (w≥0) ⇒ d≥0 structurally. We do NOT
+            # tl.abs() d here: an abs would SILENTLY rewrite the normalizer for signed d, making decode
+            # disagree with chunk/routed/oracle (all raw-signed). With raw d, every path behaves
+            # identically (matched for d>0; identically ill-posed for signed d — loud, not divergent).
             if NORM == 1:                                                                    # per_state
-                rt = b_r / (tl.abs(p_den) + eps)
+                rt = b_r / (p_den + eps)
             elif NORM == 2:                                                                  # kappa
-                rt = b_r * tl.exp(-kap * tl.log(tl.abs(p_den) + eps))
+                rt = b_r * tl.exp(-kap * tl.log(p_den + eps))
             else:                                                                            # global
                 rt = b_r
             rt = tl.where(cmask, rt, 0.0)
@@ -185,7 +192,8 @@ def fused_recurrent_rola(
     Mirrors `chunk_rola`'s routed signature, plus the recurrent triad `initial_state` /
     `output_final_state` / `cu_seqlens`. `q`/`k` are the feature-mapped queries/keys (as for
     `chunk_rola`). `norm` ∈ {'global','per_state','kappa'}; 'kappa' rescales the read gate by
-    `(|dᶜ|+eps)^{−κ}` per token. Returns `(o, final_state)`; `final_state` is the `[N, H*nc, K, V+1]`
+    `(dᶜ+eps)^{−κ}` per token (RAW signed den — the canonical convention; well-defined for d>0, which
+    the production elu+1 layer guarantees). Returns `(o, final_state)`; `final_state` is `[N, H*nc, K, V+1]`
     Kronecker state (the per-state denominator carried in the `+1` column) when `output_final_state`
     else `None`, layout-compatible with `chunk_rola(output_final_state=True)` so a chunked prefill
     hands off to this decode path.
@@ -203,6 +211,14 @@ def fused_recurrent_rola(
 
     qf, kf, vf, rf, wf = fold(q), fold(k), fold(v), fold(r), fold(w)
     gf = fold(g)
+    if gf is not None:
+        # Floor the per-token log-decay through the SAME guard the chunked GLA paths use (#33) so a
+        # floored chunked prefill hands off to a decode that decays at the matching rate. Single-token
+        # decay never overflows fp32, but an unfloored decode below `_GLA_FLOOR` would silently decay
+        # FASTER than the (floored) prefill state it continues. Raises (or clamps, ROLA_GLA_FLOOR_CLAMP)
+        # identically to the chunk path.
+        from fla_rola.ops.rola.chunk import _floor_ld
+        gf = _floor_ld(gf)
     # kappa is [B,T,H,1] -> [BH,T,1].
     kapf = fold(kappa) if (norm == 'kappa' and kappa is not None) else None
     # initial_state arrives as [N, H*nc, K, V+1] (== [B, H*nc, K, V+1]); view to [BH, nc, K, V+1].
