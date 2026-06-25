@@ -226,13 +226,18 @@ class RoLA(nn.Module):
     @staticmethod
     def _init_factor_router(W: nn.Parameter):
         """Init the per-head per-level factor weights [H, D, hidden, b] like an nn.Linear(hidden, b):
-        the routing logit is h·W[head,lvl] (== Linear with weight W[head,lvl]^T), so we kaiming-init
-        each [hidden, b] slice as a transposed Linear weight (kaiming_uniform a=sqrt(5), fan_in=hidden).
-        flat (b=nc) is then the same init recipe (per (head,level)) as the old dense Linear router."""
+        the routing logit is h·W[head,lvl] (== Linear with weight W[head,lvl]^T), so the init must be a
+        transposed Linear weight with kaiming `fan_in == hidden`. We build the Linear-weight layout as a
+        2-D [out, in] = [H*D*b, hidden] tensor — 2-D is essential: kaiming_uniform infers fan_in from a
+        2-D weight as dim 1 (== hidden), whereas a 3-D [*, b, hidden] tensor would treat b as input
+        feature-maps and inflate fan_in to b·hidden (bound √b too small). Reshape/transpose into
+        [H,D,hidden,b]. flat (b=nc) thus reproduces the old dense nn.Linear(hidden, H*nc) init
+        distribution exactly (std ≈ same; verified by the fresh-init parity test)."""
         H, D, hidden, b = W.shape
-        wt = torch.empty(H * D, b, hidden)        # [out=b, in=hidden] Linear-weight layout
+        wt = torch.empty(H * D * b, hidden)       # 2-D [out=H*D*b, in=hidden] -> kaiming fan_in == hidden
         nn.init.kaiming_uniform_(wt, a=5 ** 0.5)
-        W.data.copy_(wt.transpose(-1, -2).reshape(H, D, hidden, b))
+        # [H*D*b, hidden] -> [H,D,b,hidden] -> transpose last two -> [H,D,hidden,b] (W[head,lvl] = slice^T)
+        W.data.copy_(wt.view(H, D, b, hidden).transpose(-1, -2))
 
     # --- feature map / routing / decay (mirror the rola.py kernels exactly) ---
     def _feature_map(self, q, k):
