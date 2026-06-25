@@ -2,26 +2,33 @@
 
 """RoLA — Routed Linear Attention (canonical FLA layer).
 
-Shared q/k/v/o projections + learned dense read/write routing over `states_per_head`
-recurrent states, with a feature-mapped linear-attention inner kernel. The whole
-normalization recipe (per-state denominator pre-pass, read-gate rescale, shared-Gram
-numerator-only readout, divide) lives in the `chunk_rola` op — the layer only
-projects, routes, applies the feature map φ, and (for the scalar-GLA variant)
-computes the per-state log-decay; then a single `chunk_rola` call:
+Shared q/k/v/o projections + learned PER-HEAD read/write routing over `states_per_head`
+recurrent states, with a feature-mapped linear-attention inner kernel. Routing is FACTORED
+(`routing` ∈ {flat, square, tree}): each head holds per-level factor weights
+Wr/Ww ∈ [H, D, hidden, b] (b**D == nc), and the leaf gate is the product over levels of the
+per-level softmax. The whole normalization recipe (per-state denominator, read-gate rescale,
+shared-Gram numerator-only readout, divide) AND — for the chunk path — the routing itself and
+the GLA per-state log-decay live IN-KERNEL (`chunk_rola_routed`): the [L,nc] gates + ld are
+NEVER materialized. The layer projects, applies φ, and dispatches one weights-in interface:
 
-    x -> (q,k,v) projections -> φ(q),φ(k) ; softmax write/read gates [B,T,H,nc]
-      -> chunk_rola(qf,kf,v, r=read, w=write, g=log_decay|None, norm, kappa) -> [B,T,H,V]
+    x -> (q,k,v) projections -> φ(q),φ(k)
+      CHUNK : chunk_rola_routed(qf,kf,v, h=x⊗head, Wr,Ww, D,b, Wg=w_g|None, norm, kappa) (in-kernel
+              routing + decay; [L,nc] gates + ld never materialized)
+      DECODE: per-token gates + per-token log-decay built IN TORCH from the SAME factor weights
+              -> fused_recurrent_rola(qf,kf,v, r,w,g, norm, kappa)
       -> o_proj
 
-Two inner kernels (both route through `chunk_rola`, the paper-shipping cells):
-  * 'rla'        : un-decayed (g=None). Feature map φ ∈ {elu, hedgehog, based, rebased}.
-  * 'gla_scalar' : per-state SCALAR forget gate (g=log_decay). Feature map elu.
+flat (D=1, b=nc) is the strict equivalent of the old dense Linear(hidden, H*nc) softmax router.
+
+Two inner kernels (both route through the in-kernel routed readout, the paper-shipping cells):
+  * 'rla'        : un-decayed (Wg=None). Feature map φ ∈ {elu, hedgehog, based, rebased}.
+  * 'gla_scalar' : per-state SCALAR forget gate (per-head Wg). Feature map elu.
 
 `state_norm` ∈ {raw, global, per_state, kappa} selects the normalization (raw only for
 gla_scalar). 'kappa' learns a per-head input-dependent interpolation global↔per-state
 via r̃ = r·(d+ε)^{−κ(x)}, κ = σ(w_κ·x) (init ≈ global). `tie_routers=True` shares one
-router for read+write (symmetric); the untied read_router is left as None (not a second
-module aliasing the same tensor — that breaks HF safetensors save).
+factor router for read+write (symmetric); the untied read_W is left as None (not a second
+parameter aliasing the same tensor — that breaks HF safetensors save).
 
 This is the single source of truth for the RoLA mixer: the zoology MQAR mixer and the
 HF/LM model both wrap this layer; the perf bench instantiates it directly.
@@ -37,8 +44,29 @@ from einops import rearrange
 
 from fla_rola.layers.utils import get_layer_cache, update_layer_cache
 from fla_rola.modules import RMSNorm, ShortConvolution
-from fla_rola.ops.rola import chunk_rola, fused_recurrent_rola
+from fla_rola.ops.rola import chunk_rola_routed, fused_recurrent_rola
 from fla_rola.ops.rola.chunk import _GLA_FLOOR
+
+
+def _routing_factors(routing: str, nc: int) -> tuple[int, int]:
+    """Map a routing topology + state count nc to the (D, b) factorization with b**D == nc.
+      'flat'   -> (1, nc)        : one level, one softmax over all nc states (the dense router).
+      'square' -> (2, sqrt(nc))  : two levels, b=sqrt(nc) each (nc must be a perfect square).
+      'tree'   -> (log2(nc), 2)  : binary tree, nc must be a power of two.
+    """
+    if routing == 'flat':
+        return 1, nc
+    if routing == 'square':
+        b = int(round(nc ** 0.5))
+        if b * b != nc:
+            raise ValueError(f"routing='square' needs a perfect-square states_per_head, got nc={nc}")
+        return 2, b
+    if routing == 'tree':
+        D = nc.bit_length() - 1
+        if nc != (1 << D):
+            raise ValueError(f"routing='tree' needs a power-of-two states_per_head, got nc={nc}")
+        return D, 2
+    raise ValueError(f"unsupported routing {routing!r} (flat|square|tree)")
 
 # One-time-per-process flag for the layer-side decay-floor truncation warning (#33 F4). The kernel's
 # `_floor_ld` raises (or warns in clamp-mode) on out-of-range ld; but the layer floors the LEARNED decay
@@ -61,6 +89,10 @@ class RoLA(nn.Module):
         head_k_dim (int): per-head query/key dim (d_qk). Default 16.
         head_v_dim (int): per-head value dim (d_v). Default 32.
         states_per_head (int): number of routed recurrent states (nc). Default 16.
+        routing (str): routing topology — 'flat' (one softmax over nc; the dense router, default),
+                       'square' (two levels of sqrt(nc)) or 'tree' (binary, nc=2^D). Selects the
+                       per-head factor geometry (D, b) with b**D == nc; the layer holds per-head
+                       per-level factor weights and dispatches to the in-kernel routed kernel.
         kernel (str): 'rla' (un-decayed) or 'gla_scalar' (per-state scalar decay). Default 'rla'.
         phi (str): feature map for 'rla' — 'elu' | 'hedgehog' | 'based' | 'rebased'. Default 'elu'.
                    ('gla_scalar' always uses elu.)
@@ -82,6 +114,7 @@ class RoLA(nn.Module):
         head_k_dim: int = 16,
         head_v_dim: int = 32,
         states_per_head: int = 16,
+        routing: str = 'flat',
         kernel: str = 'rla',
         phi: str = 'elu',
         state_norm: str = 'kappa',
@@ -109,6 +142,8 @@ class RoLA(nn.Module):
         self.head_k_dim = head_k_dim
         self.head_v_dim = head_v_dim
         self.states_per_head = states_per_head
+        self.routing = routing
+        self.route_D, self.route_b = _routing_factors(routing, states_per_head)
         self.kernel = kernel
         self.phi = phi
         self.state_norm = state_norm
@@ -150,19 +185,36 @@ class RoLA(nn.Module):
             self.k_conv1d = ShortConvolution(self.key_dim, conv_size, bias=conv_bias, activation='silu')
             self.v_conv1d = ShortConvolution(self.value_dim, conv_size, bias=conv_bias, activation='silu')
 
-        # Routers on the residual stream -> dense softmax over states. sym (tie_routers) keeps
-        # read_router=None and reuses write_router in _route — registering a second module that
-        # aliases the same weight puts two keys for one tensor in the state_dict and crashes HF
-        # safetensors save ("shared tensors ... not properly defined").
-        self.write_router = nn.Linear(hidden_size, num_heads * states_per_head, bias=router_bias)
-        if tie_routers:
-            self.read_router = None
+        # PER-HEAD per-level factor routers on the residual stream. RoLA routes per head: each head h
+        # owns its OWN tree weights Wr/Ww ∈ [H, D, hidden, b] (b**D == nc), and the leaf gate is the
+        # product over levels of softmax(h·W[head,lvl] + bias). 'flat' (D=1, b=nc) is the strict
+        # equivalent of the old dense Linear(hidden, H*nc) router: W[head,0] == old per-head weight^T.
+        # The factor weights live as plain nn.Parameters (NOT nn.Linear) so the per-head/per-level
+        # structure is explicit and the in-kernel routed op consumes them directly. tie_routers keeps
+        # read_W=None (reuse write_W) — registering a second tensor aliasing the same weight crashes HF
+        # safetensors save.
+        D, b = self.route_D, self.route_b
+        self.write_W = nn.Parameter(torch.empty(num_heads, D, hidden_size, b))
+        self._init_factor_router(self.write_W)
+        if router_bias:
+            self.write_b = nn.Parameter(torch.zeros(num_heads, D, b))
         else:
-            self.read_router = nn.Linear(hidden_size, num_heads * states_per_head, bias=router_bias)
+            self.register_parameter('write_b', None)
+        if tie_routers:
+            self.register_parameter('read_W', None)
+            self.register_parameter('read_b', None)
+        else:
+            self.read_W = nn.Parameter(torch.empty(num_heads, D, hidden_size, b))
+            if router_bias:
+                self.read_b = nn.Parameter(torch.zeros(num_heads, D, b))
+            else:
+                self.register_parameter('read_b', None)
             if tie_router_init:
-                self.read_router.weight.data.copy_(self.write_router.weight.data)
+                self.read_W.data.copy_(self.write_W.data)
                 if router_bias:
-                    self.read_router.bias.data.copy_(self.write_router.bias.data)
+                    self.read_b.data.copy_(self.write_b.data)
+            else:
+                self._init_factor_router(self.read_W)
 
         if kernel == 'gla_scalar':
             self.w_g = nn.Linear(hidden_size, num_heads, bias=False)  # per-head scalar forget gate
@@ -171,23 +223,56 @@ class RoLA(nn.Module):
             nn.init.zeros_(self.w_kappa.weight)
             nn.init.constant_(self.w_kappa.bias, -4.0)  # start ≈ global (κ≈0.018), learn upward
 
+    @staticmethod
+    def _init_factor_router(W: nn.Parameter):
+        """Init the per-head per-level factor weights [H, D, hidden, b] like an nn.Linear(hidden, b):
+        the routing logit is h·W[head,lvl] (== Linear with weight W[head,lvl]^T), so the init must be a
+        transposed Linear weight with kaiming `fan_in == hidden`. We build the Linear-weight layout as a
+        2-D [out, in] = [H*D*b, hidden] tensor — 2-D is essential: kaiming_uniform infers fan_in from a
+        2-D weight as dim 1 (== hidden), whereas a 3-D [*, b, hidden] tensor would treat b as input
+        feature-maps and inflate fan_in to b·hidden (bound √b too small). Reshape/transpose into
+        [H,D,hidden,b]. flat (b=nc) thus reproduces the old dense nn.Linear(hidden, H*nc) init
+        distribution exactly (std ≈ same; verified by the fresh-init parity test)."""
+        H, D, hidden, b = W.shape
+        wt = torch.empty(H * D * b, hidden)       # 2-D [out=H*D*b, in=hidden] -> kaiming fan_in == hidden
+        nn.init.kaiming_uniform_(wt, a=5 ** 0.5)
+        # [H*D*b, hidden] -> [H,D,b,hidden] -> transpose last two -> [H,D,hidden,b] (W[head,lvl] = slice^T)
+        W.data.copy_(wt.view(H, D, b, hidden).transpose(-1, -2))
+
     # --- feature map / routing / decay (mirror the rola.py kernels exactly) ---
     def _feature_map(self, q, k):
         return F.elu(q) + 1.0, F.elu(k) + 1.0      # elu+1 — the only supported feature map
 
-    def _route(self, x):
-        B, L = x.shape[0], x.shape[1]
-        H, C = self.num_heads, self.states_per_head
-        wl = self.write_router(x).view(B, L, H, C)               # write logits (pre-softmax)
-        write_gates = F.softmax(wl, dim=-1)
-        rl = self.read_router(x).view(B, L, H, C) if self.read_router is not None else wl  # sym reuses write
-        read_gates = F.softmax(rl, dim=-1)
-        if self.router_zloss_coef > 0.0:
-            # ST-MoE router z-loss: penalize the log-partition magnitude of the routing logits.
-            def zl(lg):
-                return torch.logsumexp(lg.float(), dim=-1).square().mean()   # fp32 (bf16 loses the tail)
-            self._router_aux = self.router_zloss_coef * (zl(wl) + (zl(rl) if self.read_router is not None else 0.0))
-        return write_gates, read_gates
+    def _factor_logits(self, x, W, bias):
+        """Per-head per-level routing logits from the factor weights. x:[B,L,hidden],
+        W:[H,D,hidden,b], bias:[H,D,b]|None -> logits[B,L,H,D,b] = x·W[head,lvl] (+bias)."""
+        z = torch.einsum('bld,hkdc->blhkc', x, W.to(x.dtype))     # [B,L,H,D,b]
+        if bias is not None:
+            z = z + bias.to(x.dtype)[None, None]                  # [H,D,b] broadcast
+        return z
+
+    def _gates_from_logits(self, logits):
+        """Fold per-level softmax factors into the explicit [B,L,H,nc] leaf gates (the DECODE/CPU
+        reference path — the kernel builds these IN-KERNEL for the chunk path). logits:[B,L,H,D,b].
+        leaf gate = Π_lvl softmax(logits[...,lvl,:])[..., digit_lvl(leaf)]."""
+        D = self.route_D
+        f = F.softmax(logits, dim=-1)                             # [B,L,H,D,b]
+        g = f[..., 0, :]                                          # level 0 -> [B,L,H,b]
+        for i in range(1, D):
+            # outer product across levels: [...,b^i,1] * [...,1,b] -> [...,b^(i+1)]
+            g = (g.unsqueeze(-1) * f[..., i, :].unsqueeze(-2)).flatten(-2)
+        return g                                                  # [B,L,H,nc]
+
+    def _stash_zloss(self, wl, rl):
+        """ST-MoE router z-loss on the FACTOR logits — penalize Σ_lvl logsumexp(level logits)^2, the
+        per-level log-partition magnitude (flat: the single softmax, == the old dense z-loss). Summed
+        over the D levels of read+write. Stashed per forward; read by get_auxiliary_loss."""
+        if self.router_zloss_coef <= 0.0:
+            return
+
+        def zl(lg):  # lg:[B,L,H,D,b] -> per-level logsumexpsq, summed over levels
+            return torch.logsumexp(lg.float(), dim=-1).square().mean(dim=(0, 1, 2)).sum()
+        self._router_aux = self.router_zloss_coef * (zl(wl) + (zl(rl) if self.read_W is not None else 0.0))
 
     def get_auxiliary_loss(self):
         """Router z-loss from the last forward (zoology's trainer auto-sums this across modules; the
@@ -267,27 +352,62 @@ class RoLA(nn.Module):
             q, k = self.q_norm(q), self.k_norm(k)
 
         qf, kf = self._feature_map(q, k)
-        write_gates, read_gates = self._route(x)
-        g = self._log_decay(x, write_gates) if self.kernel == 'gla_scalar' else None
         kap = (torch.sigmoid(self.w_kappa(x)).view(B, L, H, 1)
                if self.state_norm == 'kappa' else None)
+        D, b = self.route_D, self.route_b
+        Wg = self.w_g.weight if self.kernel == 'gla_scalar' else None   # [H, hidden] per-head decay
+
+        # Router z-loss is stashed from the (cheap, [L,nc]-free) per-level FACTOR logits on BOTH paths —
+        # the chunk kernel never materializes the gates, so the layer computes the logits here purely for
+        # the auxiliary loss + (decode) gate folding.
+        wl = self._factor_logits(x, self.write_W, self.write_b)
+        rl = self._factor_logits(x, self.read_W, self.read_b) if self.read_W is not None else wl
+        self._stash_zloss(wl, rl)
 
         # The ops own dtype/autocast (their Triton autograd Functions carry @input_guard +
         # @autocast_custom_fwd/bwd), so the layer no longer hand-rolls the cast. `output_final_state`
         # emits the recurrent state for the KV-cache; decode seeds it back via `initial_state`.
         recurrent_state = last_state['recurrent_state'] if last_state is not None else None
-        common = dict(r=read_gates, w=write_gates, g=g, norm=self.state_norm, kappa=kap, scale=1.0)
         if mode == 'fused_recurrent':
+            # DECODE: build the explicit per-token gates + per-token decay IN TORCH from the SAME factor
+            # weights (cheap for the one/few decode tokens), then the fused recurrent kernel. One
+            # weights-in interface — no separate precomputed-gate chunk signature.
+            write_gates = self._gates_from_logits(wl)
+            read_gates = write_gates if self.read_W is None else self._gates_from_logits(rl)
+            g = self._log_decay(x, write_gates) if self.kernel == 'gla_scalar' else None
             out, recurrent_state = fused_recurrent_rola(
-                qf, kf, v, **common, initial_state=recurrent_state,
-                output_final_state=use_cache, cu_seqlens=cu_seqlens)
+                qf, kf, v, r=read_gates, w=write_gates, g=g, norm=self.state_norm, kappa=kap, scale=1.0,
+                initial_state=recurrent_state, output_final_state=use_cache, cu_seqlens=cu_seqlens)
         elif mode == 'chunk':
             if recurrent_state is not None:
                 raise NotImplementedError(
-                    "chunk_rola has no carried initial_state yet; continuation decode uses the "
+                    "chunk_rola_routed has no carried initial_state yet; continuation decode uses the "
                     "fused_recurrent path (auto-selected for L<=64).")
-            res = chunk_rola(qf, kf, v, **common, output_final_state=use_cache)
-            out, recurrent_state = res if use_cache else (res, None)
+            # CHUNK: in-kernel routing + decay. h is the residual stream broadcast per head ([B,L,H,hidden]);
+            # the kernel folds the routing gram, the per-state den, the read-gate rescale AND (GLA) the
+            # per-state log-decay IN-KERNEL — the [L,nc] gates + ld are NEVER materialized (the training
+            # saved-activation win).
+            h = x.unsqueeze(2).expand(B, L, H, self.hidden_size)
+            out = chunk_rola_routed(
+                qf, kf, v, h, self.write_W if self.read_W is None else self.read_W, self.write_W,
+                D, b, norm=self.state_norm, kappa=kap, scale=1.0,
+                b_r=(self.write_b if self.read_W is None else self.read_b), b_w=self.write_b, Wg=Wg)
+            recurrent_state = None
+            if use_cache:
+                # Prefill→decode handoff (inference only): the routed readout stays [L,nc]-free, but the
+                # FINAL recurrent state (a small [H*nc,K,V(+1)] tensor, independent of L) inherently needs
+                # the write gates / per-state decay. Build them in TORCH from the SAME factor weights (the
+                # decode-path gates) and fold via `_final_state` — this is state EMISSION, not a second
+                # readout path. No backward (decode is inference); training (use_cache=False) never hits it.
+                from fla_rola.ops.rola.chunk import _final_state
+                write_gates = self._gates_from_logits(wl)
+                gfull = self._log_decay(x, write_gates) if self.kernel == 'gla_scalar' else None
+
+                def _fold(t):
+                    return t.permute(0, 2, 1, 3).reshape(B * H, L, t.shape[-1])
+                recurrent_state = _final_state(
+                    _fold(kf), _fold(v), _fold(write_gates),
+                    _fold(gfull) if gfull is not None else None, B, H, raw=not self.uses_v_plus_one)
         else:
             raise NotImplementedError(f"Not supported mode `{mode}`.")
 
