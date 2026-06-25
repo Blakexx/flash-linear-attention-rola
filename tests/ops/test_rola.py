@@ -769,9 +769,9 @@ def test_signed_den_consistent_decode_chunk_routed():
     # Flat router (D=1, b=nc): the SAME (h,Wr,Ww) drives the tree-routed path AND, via _tree_gates_oop,
     # the explicit r,w the decode/chunk paths consume — so the only variable is the kernel, not the gates.
     D, b = 1, nc
-    Wr, Ww = rnd(D, dm, b) * 0.5, rnd(D, dm, b) * 0.5
+    Wr, Ww = rnd(H, D, dm, b) * 0.5, rnd(H, D, dm, b) * 0.5           # PER-HEAD router [H,D,dm,b]
     hf = h.permute(0, 2, 1, 3).reshape(B * H, T, dm)                  # [BH,T,dm] (the routed fold layout)
-    rf, wf = _tree_gates_oop(hf, Wr, Ww, D, b)                        # [BH,T,nc] each
+    rf, wf = _tree_gates_oop(hf, Wr, Ww, D, b, H)                     # [BH,T,nc] each, PER-HEAD gates
     r = rf.view(B, H, T, nc).permute(0, 2, 1, 3).contiguous()        # -> [B,T,H,nc]
     w = wf.view(B, H, T, nc).permute(0, 2, 1, 3).contiguous()
     # Confirm the den actually goes non-positive (else the test isn't exercising the signed regime).
@@ -873,10 +873,34 @@ def test_below_floor_ld_raises_and_clamps(path, monkeypatch):
 # vs an fp64 chunked reference < 1e-2; (3) NO [*,L,nc] materialization (d_model≠nc≠L to avoid false
 # hits). RLA only (g=None), matching the routed path's scope.
 # =============================================================================
-def _tree_gates_oop(hf, Wr, Ww, D, b):
-    """Out-of-place explicit tree gates (the in-place `_tree_gates_torch` breaks autograd graph reuse)."""
-    fr = torch.stack([torch.softmax(hf @ Wr[i].to(hf.dtype), -1) for i in range(D)], 0)
-    fw = torch.stack([torch.softmax(hf @ Ww[i].to(hf.dtype), -1) for i in range(D)], 0)
+# =============================================================================
+# THE SINGLE CANONICAL PER-HEAD ROUTING GROUND TRUTH.
+#
+# RoLA routes PER HEAD: each head h owns its own [D,d_model,b] tree router (Wr,Ww ∈ [H,D,d_model,b]).
+# There is ONE ground truth for "the gates a router produces" — `_per_head_gates` — and EVERYTHING is
+# anchored to it: the production `chunk_rola` consumes these explicit gates, the chunked math refs build
+# on them, and the fused `chunk_rola_routed` must compute the SAME gates IN-KERNEL from the SAME router.
+# So the canonical assertion is chunk_rola_routed(router) == chunk_rola(_per_head_gates(router)) == the
+# chunked naive — all per-head, one truth. A shared-vs-per-head divergence CANNOT pass this (it would
+# break BOTH the equality-to-chunk_rola AND the per-head-independence test below) — which is exactly the
+# class of bug a fresh fused-only reference (re-encoding the kernel's own assumption) used to hide.
+# =============================================================================
+def _per_head_gates(hf, Wr, Ww, D, b, H, b_r=None, b_w=None):
+    """THE canonical per-head tree gates. hf:[BH,T,d_model] (BH=(B,H) fold), Wr,Ww:[H,D,d_model,b],
+    optional per-head bias b_r/b_w:[H,D,b]. Each head folds with its OWN router:
+        r[...,leaf] = Π_lvl softmax(h·Wr[head,lvl] + b_r[head,lvl])[..., digit_lvl(leaf)].
+    Returns the explicit folded gates [BH,T,nc] that `chunk_rola` consumes — out-of-place (graph-reuse
+    safe). This is the ONLY routing reference; every routed test anchors to it."""
+    BH, T, dm = hf.shape
+    hr = hf.view(BH // H, H, T, dm)                       # [B,H,T,dm]
+
+    def _logit(W, bias, i):
+        z = torch.einsum('bhtd,hdc->bhtc', hr, W[:, i].to(hf.dtype))     # per-head h·W[head,i]
+        if bias is not None:
+            z = z + bias[:, i].to(hf.dtype)[None, :, None, :]
+        return z.reshape(BH, T, -1)
+    fr = torch.stack([torch.softmax(_logit(Wr, b_r, i), -1) for i in range(D)], 0)   # [D,BH,T,b]
+    fw = torch.stack([torch.softmax(_logit(Ww, b_w, i), -1) for i in range(D)], 0)
     rc, wc = [], []
     for leaf in range(b ** D):
         digs = [(leaf // (b ** (D - 1 - i))) % b for i in range(D)]
@@ -888,11 +912,18 @@ def _tree_gates_oop(hf, Wr, Ww, D, b):
     return torch.stack(rc, -1), torch.stack(wc, -1)
 
 
+def _tree_gates_oop(hf, Wr, Ww, D, b, H=1, b_r=None, b_w=None):
+    """Per-head explicit tree gates (thin alias of the canonical `_per_head_gates`; default H=1 = the
+    single-router fold for the BH-as-batch op-level tests)."""
+    return _per_head_gates(hf, Wr, Ww, D, b, H, b_r=b_r, b_w=b_w)
+
+
 def _kappa_ref_chunked(q, k, v, h, Wr, Ww, kappa, D, b, norm, scale, chunk, eps=EPS):
     """Differentiable chunked reference mirroring the fused global/kappa/per_state math EXACTLY (carries
-    the value + den states across chunks), on explicit tree gates. The semantic anchor the fused path
-    reproduces bit-for-bit; used for both the faithfulness and the fp64-autograd gates. `global` skips
-    the read-gate rescale (r̃=r) — the den D_i=Σ_c r^c d^c is still reduced over c."""
+    the value + den states across chunks), on the CANONICAL per-head tree gates (`_per_head_gates`). The
+    semantic anchor the fused path reproduces bit-for-bit; used for both the faithfulness and the
+    fp64-autograd gates. `global` skips the read-gate rescale (r̃=r) — the den D_i=Σ_c r^c d^c is still
+    reduced over c. Routes PER HEAD (Wr,Ww:[H,D,d_model,b]) — the same truth chunk_rola consumes."""
     B, T, H, Kd = q.shape
     nc = b ** D
     def fold(t):
@@ -901,7 +932,7 @@ def _kappa_ref_chunked(q, k, v, h, Wr, Ww, kappa, D, b, norm, scale, chunk, eps=
     def unfold(t):
         return t.view(B, H, T, -1).permute(0, 2, 1, 3).contiguous()
     qf, kf, vf, hf = fold(q) * scale, fold(k), fold(v), fold(h)
-    rf, wf = _tree_gates_oop(hf, Wr, Ww, D, b)
+    rf, wf = _per_head_gates(hf, Wr, Ww, D, b, H)
     kapf = fold(kappa) if kappa is not None else None   # kappa only used by norm='kappa'
     BH = B * H
     Sval = qf.new_zeros(BH, nc, Kd, vf.shape[-1])
@@ -959,8 +990,8 @@ def test_kappa_routed_autograd_fp64(D, b, Kd, V, norm):
         return ((torch.nn.functional.elu(x) + 1.0) if f else x).requires_grad_()
     q, k = mk(B, T, H, Kd, f=True), mk(B, T, H, Kd, f=True)
     v, h = mk(B, T, H, V), mk(B, T, H, dm)
-    Wr = (torch.randn(D, dm, b, device=device, dtype=torch.float64, generator=g) * 0.4).requires_grad_()
-    Ww = (torch.randn(D, dm, b, device=device, dtype=torch.float64, generator=g) * 0.4).requires_grad_()
+    Wr = (torch.randn(H, D, dm, b, device=device, dtype=torch.float64, generator=g) * 0.4).requires_grad_()  # per-head
+    Ww = (torch.randn(H, D, dm, b, device=device, dtype=torch.float64, generator=g) * 0.4).requires_grad_()
     kappa = (torch.rand(B, T, H, 1, device=device, dtype=torch.float64, generator=g) * 0.5).requires_grad_()
     go = torch.randn(B, T, H, V, device=device, dtype=torch.float64, generator=g)
     sel = [q, k, v, h, Wr, Ww] + ([kappa] if norm == 'kappa' else [])
@@ -974,6 +1005,17 @@ def test_kappa_routed_autograd_fp64(D, b, Kd, V, norm):
     rels = {n: _relmax(a.float(), b.float()) for n, a, b in zip(names, gf, ge)}
     assert _relmax(of.float(), oe.float()) < 1e-2, f'out {_relmax(of.float(), oe.float()):.2e}'
     assert all(r < 1e-2 for r in rels.values()), f'grads {rels}'
+    # UNIFIED-TRUTH cross-check: the fused routed output == the PRODUCTION chunk_rola fed the SAME
+    # router's per-head gates (the gates `_per_head_gates` produces) — so the fused kernel is anchored to
+    # what chunk_rola does, not a fused-only reference. A shared-vs-per-head divergence fails this.
+    hf = h.float().permute(0, 2, 1, 3).reshape(B * H, T, dm)
+    rg, wg = _per_head_gates(hf, Wr.float(), Ww.float(), D, b, H)
+    rg = rg.view(B, H, T, -1).permute(0, 2, 1, 3).contiguous()
+    wg = wg.view(B, H, T, -1).permute(0, 2, 1, 3).contiguous()
+    o_chunk = chunk_rola(q.float(), k.float(), v.float(), r=rg, w=wg,
+                         norm=norm, kappa=(kappa.float() if norm == 'kappa' else None), scale=scale)
+    assert _relmax(of.float(), o_chunk.float()) < 1e-2, \
+        f'routed != chunk_rola(per-head gates): {_relmax(of.float(), o_chunk.float()):.2e}'
 
 
 @pytest.mark.parametrize('norm', ['global', 'kappa', 'per_state'])
@@ -993,8 +1035,8 @@ def test_kappa_routed_faithful_bf16(D, b, norm):
     k = fm(torch.randn(B, T, H, Kd, device=device, generator=g)).to(torch.bfloat16)
     v = torch.randn(B, T, H, V, device=device, generator=g).to(torch.bfloat16)
     h = torch.randn(B, T, H, dm, device=device, generator=g).to(torch.bfloat16)
-    Wr = (torch.randn(D, dm, b, device=device, generator=g) * 0.5).to(torch.bfloat16)
-    Ww = (torch.randn(D, dm, b, device=device, generator=g) * 0.5).to(torch.bfloat16)
+    Wr = (torch.randn(H, D, dm, b, device=device, generator=g) * 0.5).to(torch.bfloat16)   # per-head
+    Ww = (torch.randn(H, D, dm, b, device=device, generator=g) * 0.5).to(torch.bfloat16)
     kappa = (torch.rand(B, T, H, 1, device=device, generator=g) * 0.6).to(torch.bfloat16)
     of = C.chunk_rola_routed(q, k, v, h, Wr, Ww, D, b, norm=norm,
                              kappa=(kappa if norm == 'kappa' else None), scale=scale)
@@ -1016,8 +1058,8 @@ def test_kappa_routed_no_LNC_materialization(norm):
         x = torch.randn(*s, device=device)
         return ((torch.nn.functional.elu(x) + 1.0) if f else x).to(torch.bfloat16).requires_grad_()
     q, k, v, h = mk(B, T, H, Kd, f=True), mk(B, T, H, Kd, f=True), mk(B, T, H, V), mk(B, T, H, dm)
-    Wr = (torch.randn(D, dm, b, device=device) * 0.5).to(torch.bfloat16).requires_grad_()
-    Ww = (torch.randn(D, dm, b, device=device) * 0.5).to(torch.bfloat16).requires_grad_()
+    Wr = (torch.randn(H, D, dm, b, device=device) * 0.5).to(torch.bfloat16).requires_grad_()   # per-head
+    Ww = (torch.randn(H, D, dm, b, device=device) * 0.5).to(torch.bfloat16).requires_grad_()
     kappa = (torch.rand(B, T, H, 1, device=device) * 0.5).to(torch.bfloat16).requires_grad_()
     hits = []
     real_zeros, real_empty = torch.zeros, torch.empty
@@ -1038,6 +1080,52 @@ def test_kappa_routed_no_LNC_materialization(norm):
     finally:
         torch.zeros, torch.empty = real_zeros, real_empty
     assert not hits, f'[*,L={T},nc={nc}] buffer(s) materialized: {hits}'
+
+
+# =============================================================================
+# PER-HEAD ROUTING INDEPENDENCE — the assertion the OLD shared-router reference structurally COULD NOT
+# make (and why the shared-router bug slipped through). RoLA routes per head: Wr,Ww ∈ [H,D,d_model,b],
+# each head folds with its OWN tree weights. PROOF by construction: feed IDENTICAL (q,k,v,h) to every
+# head so the ONLY thing that varies across heads is the router; then
+#   - DISTINCT per-head routers  ⇒ the per-head outputs MUST DIFFER (the routing is genuinely per-head),
+#   - a SHARED router (broadcast) ⇒ the per-head outputs are BIT-IDENTICAL (control: isolates the router).
+# A shared-across-heads kernel (the bug) would collapse the distinct-router case to ~0 too — so this is
+# the structural gate that catches it. fp32, flat/square/tree, all norms.
+# =============================================================================
+@pytest.mark.parametrize('norm', ['raw', 'global', 'per_state', 'kappa'])
+@pytest.mark.parametrize('D,b', [(1, 8), (2, 3), (3, 2)])   # flat, square(nc=9), tree(nc=8)
+def test_routed_per_head_independence(D, b, norm):
+    """Distinct per-head routers ⇒ distinct per-head routing; shared router ⇒ identical. The structural
+    per-head gate — a shared-across-heads kernel would FAIL the DISTINCT case (the bug the old shared
+    reference could not catch)."""
+    if device != 'cuda':
+        pytest.skip('RoLA Triton kernels require CUDA')
+    B, H, T, Kd, V, dm = 2, 4, 64, 16, 16, 24
+    g = torch.Generator(device=device).manual_seed(5)
+
+    def fm(x):
+        return torch.nn.functional.elu(x) + 1.0
+    # IDENTICAL inputs across all H heads (broadcast a single head) — head outputs depend ONLY on the router.
+    q = fm(torch.randn(B, T, 1, Kd, device=device, generator=g)).expand(B, T, H, Kd).contiguous()
+    k = fm(torch.randn(B, T, 1, Kd, device=device, generator=g)).expand(B, T, H, Kd).contiguous()
+    v = torch.randn(B, T, 1, V, device=device, generator=g).expand(B, T, H, V).contiguous()
+    h = torch.randn(B, T, 1, dm, device=device, generator=g).expand(B, T, H, dm).contiguous()
+    kap = (torch.rand(B, T, 1, 1, device=device, generator=g) * 0.5 + 0.3).expand(B, T, H, 1).contiguous() \
+        if norm == 'kappa' else None
+    Wr = torch.randn(H, D, dm, b, device=device, generator=g)        # DISTINCT per head
+    Ww = torch.randn(H, D, dm, b, device=device, generator=g)
+    kw = dict(norm=norm, kappa=kap, scale=1.0)
+    o = C.chunk_rola_routed(q, k, v, h, Wr, Ww, D, b, **kw)          # [B,T,H,V]
+    diffs = [(o[:, :, i] - o[:, :, j]).abs().max().item() for i in range(H) for j in range(i + 1, H)]
+    assert min(diffs) > 1e-3, \
+        f'per-head routing collapsed: identical inputs + DISTINCT routers gave near-identical head ' \
+        f'outputs (min cross-head diff {min(diffs):.2e}) — the router is being SHARED across heads'
+    # CONTROL: broadcast head-0's router to all heads ⇒ identical inputs + identical router ⇒ identical out.
+    Wr_s = Wr[:1].expand(H, D, dm, b).contiguous()
+    Ww_s = Ww[:1].expand(H, D, dm, b).contiguous()
+    o_s = C.chunk_rola_routed(q, k, v, h, Wr_s, Ww_s, D, b, **kw)
+    same = max((o_s[:, :, i] - o_s[:, :, 0]).abs().max().item() for i in range(H))
+    assert same < 1e-4, f'shared-router control: head outputs should be identical, got {same:.2e}'
 
 
 # =============================================================================
@@ -1066,7 +1154,7 @@ def _routed_raw_ref(q, k, v, h, Wr, Ww, D, b, scale):
     def unfold(t):
         return t.view(B, H, T, -1).permute(0, 2, 1, 3).contiguous()
     qf, kf, vf, hf = fold(q) * scale, fold(k), fold(v), fold(h)
-    rf, wf = _tree_gates_oop(hf, Wr, Ww, D, b)
+    rf, wf = _per_head_gates(hf, Wr, Ww, D, b, H)
     G = torch.einsum('bid,bjd->bij', qf, kf)
     caus = torch.tril(torch.ones(T, T, device=q.device, dtype=qf.dtype))
     R = torch.einsum('bic,bjc->bij', rf, wf)
@@ -1096,8 +1184,8 @@ def test_routed_bwd_nonpow2_dv(path, D, b, dv, Kd):
         return ((torch.nn.functional.elu(x) + 1.0) if f else x).requires_grad_()
     q, k = mk(B, T, H, Kd, f=True), mk(B, T, H, Kd, f=True)
     v, h = mk(B, T, H, dv), mk(B, T, H, dm)
-    Wr = (torch.randn(D, dm, b, device=device, dtype=torch.float64, generator=g) * 0.4).requires_grad_()
-    Ww = (torch.randn(D, dm, b, device=device, dtype=torch.float64, generator=g) * 0.4).requires_grad_()
+    Wr = (torch.randn(H, D, dm, b, device=device, dtype=torch.float64, generator=g) * 0.4).requires_grad_()  # per-head
+    Ww = (torch.randn(H, D, dm, b, device=device, dtype=torch.float64, generator=g) * 0.4).requires_grad_()
     go = torch.randn(B, T, H, dv, device=device, dtype=torch.float64, generator=g)
     sel = [q, k, v, h, Wr, Ww]
     if path == 'raw':
@@ -1138,18 +1226,8 @@ def _bias_norm_ref(q, k, v, h, Wr, Ww, kappa, D, b, norm, scale, b_r, b_w):
     def unfold(t):
         return t.view(B, H, T, -1).permute(0, 2, 1, 3).contiguous()
     qf, kf, vf, hf = fold(q) * scale, fold(k), fold(v), fold(h)
-    # explicit tree gates WITH the per-level bias added before the softmax.
-    fr = torch.stack([torch.softmax(hf @ Wr[i] + b_r[i], -1) for i in range(D)], 0)
-    fw = torch.stack([torch.softmax(hf @ Ww[i] + b_w[i], -1) for i in range(D)], 0)
-    rc, wc = [], []
-    for leaf in range(b ** D):
-        digs = [(leaf // (b ** (D - 1 - i))) % b for i in range(D)]
-        rr, ww = fr[0][..., digs[0]], fw[0][..., digs[0]]
-        for i in range(1, D):
-            rr, ww = rr * fr[i][..., digs[i]], ww * fw[i][..., digs[i]]
-        rc.append(rr)
-        wc.append(ww)
-    rf, wf = torch.stack(rc, -1), torch.stack(wc, -1)
+    # the canonical per-head gates WITH the per-head bias added before each level's softmax.
+    rf, wf = _per_head_gates(hf, Wr, Ww, D, b, H, b_r=b_r, b_w=b_w)
     G = qf @ kf.transpose(-1, -2)
     caus = torch.tril(torch.ones(T, T, device=q.device, dtype=qf.dtype))
     d = (G * caus) @ wf
@@ -1183,10 +1261,10 @@ def test_routed_bias_fwd_bwd(norm, D, b, dv):
         return ((torch.nn.functional.elu(x) + 1.0) if f else x).requires_grad_()
     q, k = mk(B, T, H, Kd, f=True), mk(B, T, H, Kd, f=True)
     v, h = mk(B, T, H, dv), mk(B, T, H, dm)
-    Wr = (torch.randn(D, dm, b, device=device, dtype=torch.float64, generator=g) * 0.4).requires_grad_()
-    Ww = (torch.randn(D, dm, b, device=device, dtype=torch.float64, generator=g) * 0.4).requires_grad_()
-    b_r = (torch.randn(D, b, device=device, dtype=torch.float64, generator=g) * 0.7).requires_grad_()
-    b_w = (torch.randn(D, b, device=device, dtype=torch.float64, generator=g) * 0.7).requires_grad_()
+    Wr = (torch.randn(H, D, dm, b, device=device, dtype=torch.float64, generator=g) * 0.4).requires_grad_()  # per-head
+    Ww = (torch.randn(H, D, dm, b, device=device, dtype=torch.float64, generator=g) * 0.4).requires_grad_()
+    b_r = (torch.randn(H, D, b, device=device, dtype=torch.float64, generator=g) * 0.7).requires_grad_()  # per-head bias [H,D,b]
+    b_w = (torch.randn(H, D, b, device=device, dtype=torch.float64, generator=g) * 0.7).requires_grad_()
     kappa = (torch.rand(B, T, H, 1, device=device, dtype=torch.float64, generator=g) * 0.5 + 0.5).requires_grad_()
     go = torch.randn(B, T, H, dv, device=device, dtype=torch.float64, generator=g)
     sel = [q, k, v, h, Wr, Ww, b_r, b_w] + ([kappa] if norm == 'kappa' else [])
@@ -1218,8 +1296,8 @@ def test_routed_bias_none_backcompat(norm, D, b):
             return (torch.nn.functional.elu(x) + 1.0) if f else x
         q, k = mk(B, T, H, Kd, f=True), mk(B, T, H, Kd, f=True)
         v, h = mk(B, T, H, dv), mk(B, T, H, dm)
-        Wr = torch.randn(D, dm, b, device=device, dtype=dt, generator=g) * 0.4
-        Ww = torch.randn(D, dm, b, device=device, dtype=dt, generator=g) * 0.4
+        Wr = torch.randn(H, D, dm, b, device=device, dtype=dt, generator=g) * 0.4   # per-head
+        Ww = torch.randn(H, D, dm, b, device=device, dtype=dt, generator=g) * 0.4
         kappa = torch.rand(B, T, H, 1, device=device, dtype=dt, generator=g) * 0.5 + 0.5
         kw = dict(norm=norm, kappa=(kappa if norm == 'kappa' else None), scale=scale)
         o_implicit = C.chunk_rola_routed(q, k, v, h, Wr, Ww, D, b, **kw)
@@ -1315,12 +1393,12 @@ def test_gla_routed_fwd_faithful(D, b, chunk):
         return torch.nn.functional.elu(x) + 1.0 if f else x
     q, k = mk(BH, L, dqk, f=True), mk(BH, L, dqk, f=True)
     v, h = mk(BH, L, dv), mk(BH, L, dm)
-    Wr = torch.randn(D, dm, b, device=device, generator=g_) * 0.4
-    Ww = torch.randn(D, dm, b, device=device, generator=g_) * 0.4
+    Wr = torch.randn(1, D, dm, b, device=device, generator=g_) * 0.4   # H=1 (BH-as-batch op-level test)
+    Ww = torch.randn(1, D, dm, b, device=device, generator=g_) * 0.4
     ld = (-torch.rand(BH, L, nc, device=device, generator=g_) * 0.5).clamp(min=-2.5)
     sel = C._build_sel(D, b, nc, device)
     o_routed = C._routed_fwd_tiled(q, k, v, h, Wr, Ww, D, b, sel, chunk=chunk, BG=16, ld=ld)
-    r, w = C._tree_gates_torch(h, Wr, Ww, D, b)
+    r, w = C._tree_gates_torch(h, Wr, Ww, D, b, 1)
 
     def unf(t):
         return t.view(BH, L, 1, -1)
@@ -1343,8 +1421,8 @@ def test_gla_routed_fwd_no_LNC_materialization():
         return torch.nn.functional.elu(x) + 1.0 if f else x
     q, k = mk(BH, L, dqk, f=True), mk(BH, L, dqk, f=True)
     v, h = mk(BH, L, dv), mk(BH, L, dm)
-    Wr = torch.randn(D, dm, b, device=device, generator=g_) * 0.4
-    Ww = torch.randn(D, dm, b, device=device, generator=g_) * 0.4
+    Wr = torch.randn(1, D, dm, b, device=device, generator=g_) * 0.4   # H=1 (BH-as-batch op-level test)
+    Ww = torch.randn(1, D, dm, b, device=device, generator=g_) * 0.4
     ld = (-torch.rand(BH, L, nc, device=device, generator=g_) * 0.5).clamp(min=-2.5)
     sel = C._build_sel(D, b, nc, device)
     # warm the kernel (cold Triton autotune itself calls torch.empty for its bench buffers) BEFORE the
@@ -1386,7 +1464,7 @@ def _gla_routed_ref(q, k, v, h, Wr, Ww, ld, D, b, scale):
     def fold(t):
         return t.permute(0, 2, 1, 3).reshape(B * H, T, t.shape[-1])
     qf, kf, vf, hf = fold(q) * scale, fold(k), fold(v), fold(h)
-    rf, wf = _tree_gates_oop(hf, Wr, Ww, D, b)            # [B*H, T, nc], fp64
+    rf, wf = _per_head_gates(hf, Wr, Ww, D, b, H)         # [B*H, T, nc], fp64, per-head
 
     def unf(t):
         return t.view(B * H, T, 1, -1)
@@ -1415,8 +1493,8 @@ def test_gla_routed_bwd_faithful(D, b, dv, Kd):
         return ((torch.nn.functional.elu(x) + 1.0) if f else x).requires_grad_()
     q, k = mk(B, T, H, Kd, f=True), mk(B, T, H, Kd, f=True)
     v, h = mk(B, T, H, dv), mk(B, T, H, dm)
-    Wr = (torch.randn(D, dm, b, device=device, dtype=torch.float64, generator=g) * 0.4).requires_grad_()
-    Ww = (torch.randn(D, dm, b, device=device, dtype=torch.float64, generator=g) * 0.4).requires_grad_()
+    Wr = (torch.randn(H, D, dm, b, device=device, dtype=torch.float64, generator=g) * 0.4).requires_grad_()  # per-head
+    Ww = (torch.randn(H, D, dm, b, device=device, dtype=torch.float64, generator=g) * 0.4).requires_grad_()
     ld = ((-torch.rand(B, T, H, b ** D, device=device, dtype=torch.float64, generator=g) * 0.5)
           .clamp(min=-2.5)).requires_grad_()
     go = torch.randn(B, T, H, dv, device=device, dtype=torch.float64, generator=g)
@@ -1462,8 +1540,8 @@ def test_gla_routed_bwd_no_LNC_materialization():
     q = mk(BH, L, dqk, f=True).requires_grad_()
     k = mk(BH, L, dqk, f=True).requires_grad_()
     v, h = mk(BH, L, dv).requires_grad_(), mk(BH, L, dm).requires_grad_()
-    Wr = (torch.randn(D, dm, b, device=device, generator=g) * 0.4).requires_grad_()
-    Ww = (torch.randn(D, dm, b, device=device, generator=g) * 0.4).requires_grad_()
+    Wr = (torch.randn(1, D, dm, b, device=device, generator=g) * 0.4).requires_grad_()   # H=1 (BH-as-batch)
+    Ww = (torch.randn(1, D, dm, b, device=device, generator=g) * 0.4).requires_grad_()
     ld = ((-torch.rand(BH, L, nc, device=device, generator=g) * 0.5).clamp(min=-2.5)).requires_grad_()
     go = torch.randn(BH, L, dv, device=device, generator=g)
     # warm the kernels (cold autotune calls torch.empty for bench buffers) BEFORE the allocation watch.
