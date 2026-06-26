@@ -64,7 +64,12 @@ _AT_CFGS = [triton.Config({}, num_warps=w, num_stages=s) for w in _WARPS for s i
 # other's tuned warps/stages/BV. USE_G is a constexpr (so it specializes the compile regardless), but
 # it must also gate config SELECTION so each variant tunes its own (the GLA decay-replay has a heavier
 # SMEM profile than RLA, so the best config differs). Perf-only; no correctness change. (#22)
-_SCAN_KEY = ['dqk', 'dv', 'nc', 'USE_G']
+# nc is EXCLUDED on purpose: it only sets the host-side grid trip count `NB = cdiv(nc, BG)` (see ~L494)
+# — the per-program state block is a fixed BG-wide tile, so nc changes NEITHER a kernel constexpr tile
+# NOR per-program SMEM. The best warps/stages/BV is therefore nc-INVARIANT, and keying on nc forced a
+# needless full re-tune at every states-per-head in the scaling sweep. Perf-only (config REUSE across
+# nc); correctness is unaffected — the kernel still specializes on its real constexprs.
+_SCAN_KEY = ['dqk', 'dv', 'USE_G']
 _CHUNK_FWD = 64 if _BIG_SMEM else 16     # RLA forward
 _CHUNK = 32 if _BIG_SMEM else 16         # GLA forward + all backwards (GLA fp32 decay floor caps BT<=32)
 _KAPPA_BWD_CHUNK = 16                     # fused kappa backward (single mega-kernel, heavy fp32 SMEM)
