@@ -1,5 +1,4 @@
 import inspect
-import os
 from unittest.mock import patch
 
 import pytest
@@ -108,28 +107,6 @@ def _guarded_new_empty(self, *args, **kwargs):
         return _ORIGINAL_NEW_EMPTY(self, *args, **kwargs)
 
     return _poison(_ORIGINAL_NEW_EMPTY(self, *args, **kwargs))
-
-
-# -----------------------------------------------------------------------------
-# Session-scoped Triton cache warm (RoLA autotuned kernels)
-# -----------------------------------------------------------------------------
-# Opt-in: set ROLA_WARM_SESSION=1 to parallel-precompile the registered RoLA shapes at
-# session start, so the per-test first fwd+bwd is a cache HIT instead of a multi-minute
-# cold autotune-codegen. A test module can extend the set with
-# ``fla_rola.precompile.register_test_shapes([...])`` at import time. The warm is a no-op
-# without CUDA. See fla_rola/precompile.py for the mechanism + caveats.
-@pytest.fixture(scope="session", autouse=True)
-def warm_rola_cache():
-    if os.environ.get("ROLA_WARM_SESSION", "0") != "1" or not torch.cuda.is_available():
-        yield
-        return
-    from fla_rola.precompile import registered_test_shapes, warm_gate
-    shapes = registered_test_shapes()
-    summary = warm_gate(shapes, progress=True)
-    print(f"\n[warm_rola_cache] warmed {summary['n_warmed']} configs across "
-          f"{summary['n_shapes']} shapes in {summary['total_wall_s']:.1f}s "
-          f"({summary['n_workers']} workers, {summary['n_failed']} failed)")
-    yield
 
 
 @pytest.fixture(scope="function", autouse=True)

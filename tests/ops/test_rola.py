@@ -34,8 +34,8 @@ independence, signed-den consistency, the below-floor ld guard, the *_no_LNC_mat
 watches, and (tests/layers/test_rola_routing_init) the init-parity.
 
 Run:  PYTHONPATH=. pytest tests/ops/test_rola.py -q   (CUDA required; CPU is skipped).
-      Mind the GLA-routed cold autotune (~40min); warm via ROLA_WARM_SESSION=1 (the #41 warmer) or run
-      with ROLA_NO_COMPILE=1 where the chunk_rola compile flag is not under test.
+      Mind the GLA-routed cold autotune (~40min); run with ROLA_NO_COMPILE=1 where the chunk_rola
+      compile flag is not under test.
 """
 
 import pytest
