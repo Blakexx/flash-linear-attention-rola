@@ -336,8 +336,12 @@ class RoLA(nn.Module):
         x = hidden_states
         B, L, _ = x.shape
         H = self.num_heads
-        # Short sequences (decode) take the recurrent path; training/prefill stay chunked.
-        mode = 'fused_recurrent' if L <= 64 else self.mode
+        # Short sequences take the recurrent DECODE path ONLY under inference (grad disabled). A
+        # grad-requiring forward — training, an autograd check, the fleet smoke — MUST use the
+        # differentiable chunk path even at L<=64: fused_recurrent_rola is a forward-only inference
+        # kernel with NO backward, so dispatching a grad forward to it silently breaks the autograd
+        # graph (x.grad comes back None). The length-only threshold was the fleet-smoke failure.
+        mode = 'fused_recurrent' if (L <= 64 and not torch.is_grad_enabled()) else self.mode
         last_state = get_layer_cache(self, past_key_values)
         cu_seqlens = kwargs.get('cu_seqlens')
 
