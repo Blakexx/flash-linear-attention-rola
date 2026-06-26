@@ -1202,10 +1202,13 @@ def _kappa_fwd_chunk(h_ptr, q_ptr, k_ptr, v_ptr, wr_ptr, ww_ptr, sel_ptr, kap_pt
 
 
 def _kappa_routed_fwd(q, k, v, h, Wr, Ww, kap, D, b, sel, chunk, global_norm, per_state, eps,
-                      b_r=None, b_w=None, Wg=None):
-    """Fused global/kappa/per_state tree-routed forward. Returns (num[B,L,BV], den[B,L]) and the per-chunk
-    pre-state snapshots (Sval, Sden) the backward needs. Optional routing bias b_r/b_w ∈ [D,b]
-    (softmax(h·W+b)). No [L,nc] gate/den/r̃ buffer is allocated.
+                      b_r=None, b_w=None, Wg=None, need_snapshots=False):
+    """Fused global/kappa/per_state tree-routed forward. Returns (num[B,L,BV], den[B,L], snap_val, snap_den).
+    The per-chunk pre-state snapshots are ONLY built when need_snapshots=True (the BACKWARD's recompute):
+    the forward pass discards them (it saves the inputs, not the snapshots — the backward regenerates its
+    own), and inference has no backward at all. Building them on the forward/prefill path is a pure
+    [B,NCH,nc,dqk,dv] fp32 transient written for nothing — the prefill-memory blowup. Default False →
+    (..., None, None). Optional routing bias b_r/b_w ∈ [D,b] (softmax(h·W+b)). No [L,nc] gate/den/r̃ buffer.
     Optional per-head decay weight Wg:[H,d_model] (GLA, #45) → USE_G decayed scan, the per-state log-decay
     computed IN-KERNEL (clamped at _GLA_FLOOR, never a [L,nc] ld); Wg=None is RLA (USE_G=False)."""
     B, L, dqk = q.shape
@@ -1229,8 +1232,14 @@ def _kappa_routed_fwd(q, k, v, h, Wr, Ww, kap, D, b, sel, chunk, global_norm, pe
     Sden = torch.zeros(B, nc, dqk, device=q.device, dtype=torch.float32)
     num = torch.zeros(B, L, BVO, device=q.device, dtype=torch.float32)   # full padded width; BV tiles it
     den = torch.zeros(B, L, device=q.device, dtype=torch.float32)
-    snap_val = torch.zeros(B, NCH, nc, dqk, dv, device=q.device, dtype=torch.float32)
-    snap_den = torch.zeros(B, NCH, nc, dqk, device=q.device, dtype=torch.float32)
+    # Snapshots = the per-chunk pre-state the BACKWARD recompute consumes — NOT the forward (which
+    # discards them) and NOT inference (no backward). Allocating+writing them unconditionally was a
+    # [B,NCH,nc,dqk,dv] fp32 transient built for nothing on the forward/prefill path.
+    if need_snapshots:
+        snap_val = torch.zeros(B, NCH, nc, dqk, dv, device=q.device, dtype=torch.float32)
+        snap_den = torch.zeros(B, NCH, nc, dqk, device=q.device, dtype=torch.float32)
+    else:
+        snap_val = snap_den = None
     H = Wr.shape[0]
     br, bw, has_bias = _routing_bias(b_r, b_w, H, D, b, q.device, dtype=q.dtype)
     sbias = _bias_strides(br, bw, has_bias)
@@ -1242,8 +1251,9 @@ def _kappa_routed_fwd(q, k, v, h, Wr, Ww, kap, D, b, sel, chunk, global_norm, pe
                   BK=BK, BV=BV, BD=BD, BC=BC, NCBLK=NCBLK, ND=ND, NDM=NDM, HAS_BIAS=has_bias,
                   USE_G=use_g, GLA_FLOOR=_GLA_FLOOR, num_warps=4, num_stages=1)
     for c in range(NCH):
-        snap_val[:, c].copy_(Sval)
-        snap_den[:, c].copy_(Sden)
+        if need_snapshots:
+            snap_val[:, c].copy_(Sval)
+            snap_den[:, c].copy_(Sden)
         _kappa_fwd_chunk[(B,)](
             h, q, k, v, Wr, Ww, sel, kap, Wg, Sval, Sden, num, den, br, bw,
             L, d_model, dqk, dv, nc, c * chunk, *head,
@@ -1798,7 +1808,7 @@ class _RoLARoutedKappaFn(torch.autograd.Function):
         Wgf = Wg.float().contiguous() if use_g else None
         _num, _den, snap_val, snap_den = _kappa_routed_fwd(
             q, k, v, h, Wr, Ww, kap, D, b, sel, chunk, global_norm, per_state, eps,
-            b_r=brf, b_w=bwf, Wg=Wgf)
+            b_r=brf, b_w=bwf, Wg=Wgf, need_snapshots=True)
         grads = _kappa_routed_bwd(
             q, k, v, h, Wr, Ww, kap, snap_val, snap_den, dnum.float(), dden.float(),
             D, b, sel, chunk, global_norm, per_state, eps, b_r=brf, b_w=bwf, Wg=Wgf)
