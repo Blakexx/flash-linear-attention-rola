@@ -1852,7 +1852,14 @@ class _RoLARoutedKappaFn(torch.autograd.Function):
         chunk = min(chunk, _KAPPA_BWD_CHUNK)
         brf = None if b_r is None else b_r.float()
         bwf = None if b_w is None else b_w.float()
-        q, k, v, h, Wr, Ww, kap = (x.float().contiguous() for x in (q, k, v, h, Wr, Ww, kap))
+        # F4: the ROUTER operands (h/Wr/Ww) stay in their input dtype (bf16). The router build is a softmax
+        # (bounded, NOT precision-critical), and the bwd router kernels load it + accumulate in fp32
+        # internally (the `.to(dtype)` casts in _build_factors/_fold_level). fp32-upcasting h/Wr/Ww here
+        # DOUBLED the [BD,BB] router tile → the bwd recompute-fwd OOM'd at d_model=1024 (Req 131072 > 101376).
+        # q/k/v/kap keep fp32 (the den/decay-sensitive content path). The recompute-fwd already runs the
+        # router in bf16 in the normal forward, so this just matches that.
+        q, k, v, kap = (x.float().contiguous() for x in (q, k, v, kap))
+        h, Wr, Ww = (x.contiguous() for x in (h, Wr, Ww))
         Wgf = Wg.float().contiguous() if use_g else None
         _num, _den, snap_val, snap_den = _kappa_routed_fwd(
             q, k, v, h, Wr, Ww, kap, D, b, sel, chunk, global_norm, per_state, eps,
