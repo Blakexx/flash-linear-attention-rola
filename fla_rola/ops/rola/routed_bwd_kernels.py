@@ -49,17 +49,17 @@ import triton.language as tl
 
 @triton.jit
 def _fold_level(dr_tile, dw_tile, r_tile, w_tile, fr, fw, sel,
-                h_ptr, wr_ptr, ww_ptr, dwr_ptr, dww_ptr, dh_ptr,
-                pid_b, rows, rmask, offs_bb, bmask, d_model,
-                sh_b, sh_l, sh_d, swr_lvl, swr_d, swr_b, sww_lvl, sww_d, sww_b,
-                sdh_b, sdh_l, sdh_d,
-                sbr_lvl, sbr_b, sbw_lvl, sbw_b, dbr_ptr, dbw_ptr,
-                lvl, BT: tl.constexpr, BB: tl.constexpr,
-                BD: tl.constexpr, NDM: tl.constexpr,
-                HAS_BIAS: tl.constexpr):
-    # F3: fr,fw,sel are the per-level softmax factors + selector CACHED by `_build_factors` (the SAME
-    # fp32 values, computed ONCE) — no longer recomputed here. The router math is unchanged: this folds
-    # dr_tile,dw_tile -> dWr,dWw,dh (+db) via the softmax jacobian, reusing the cached factors verbatim.
+                dlr_ptr, dlw_ptr,
+                pid_b, rows, rmask, offs_bb, bmask,
+                slo_b, slo_l, slo_lvl, slo_bb, lvl,
+                BT: tl.constexpr, BB: tl.constexpr):
+    # F2b: the router-grad fold for ONE tree level. fr,fw,sel are the per-level softmax factors + selector
+    # CACHED by `_build_factors` (the SAME fp32 values). The gate-grads dr_tile,dw_tile are gathered to the
+    # per-level logit grads dlr,dlw [BT,b] via the Sel gather + softmax jacobian, then EMITTED into the
+    # [BH,L,D,b] dlogit buffers (atomic-add: the nc-blocks + the intra/inter folds accumulate into the same
+    # per-(token,level,branch) slot). The d_model-contraction backward (dlogit -> dWr,dWw,dh,db) is now a
+    # cuBLAS GEMM-backward in torch (autograd through `_router_logits`) — NOT an in-kernel atomic h·W fold.
+    # The [L,nc] gate-grads never materialize; the dlogit buffer is the tiny [L,D,b] (tree/square) footprint.
     drr = dr_tile * r_tile
     dww_ = dw_tile * w_tile
     dfr = tl.dot(drr, tl.trans(sel)) / fr
@@ -68,68 +68,33 @@ def _fold_level(dr_tile, dw_tile, r_tile, w_tile, fr, fw, sel,
     dfw = tl.where(bmask[None, :], dfw, 0.0)
     dlr = fr * (dfr - tl.sum(fr * dfr, axis=1)[:, None])
     dlw = fw * (dfw - tl.sum(fw * dfw, axis=1)[:, None])
-    for dm in range(NDM):
-        offs_dm = dm * BD + tl.arange(0, BD)
-        mmask = offs_dm < d_model
-        hc = tl.load(h_ptr + pid_b * sh_b + rows[:, None] * sh_l + offs_dm[None, :] * sh_d,
-                     mask=rmask[:, None] & mmask[None, :], other=0.0)
-        wr = tl.load(wr_ptr + lvl * swr_lvl + offs_dm[:, None] * swr_d + offs_bb[None, :] * swr_b,
-                     mask=mmask[:, None] & bmask[None, :], other=0.0)
-        ww = tl.load(ww_ptr + lvl * sww_lvl + offs_dm[:, None] * sww_d + offs_bb[None, :] * sww_b,
-                     mask=mmask[:, None] & bmask[None, :], other=0.0)
-        tl.atomic_add(dwr_ptr + lvl * swr_lvl + offs_dm[:, None] * swr_d + offs_bb[None, :] * swr_b,
-                      tl.dot(tl.trans(hc), dlr.to(hc.dtype)), mask=mmask[:, None] & bmask[None, :])
-        tl.atomic_add(dww_ptr + lvl * sww_lvl + offs_dm[:, None] * sww_d + offs_bb[None, :] * sww_b,
-                      tl.dot(tl.trans(hc), dlw.to(hc.dtype)), mask=mmask[:, None] & bmask[None, :])
-        dh_blk = tl.dot(dlr.to(wr.dtype), tl.trans(wr)) + tl.dot(dlw.to(ww.dtype), tl.trans(ww))
-        tl.atomic_add(dh_ptr + pid_b * sdh_b + rows[:, None] * sdh_l + offs_dm[None, :] * sdh_d,
-                      dh_blk, mask=rmask[:, None] & mmask[None, :])
-    if HAS_BIAS:
-        # db_lvl[branch] = Σ_t dlr[t,branch] (the logit-grad summed over the chunk's tokens). Transient;
-        # never an [L,nc] tensor. Pad branches (¬bmask) contribute 0 (dlr already 0 there via softmax).
-        dbr = tl.sum(tl.where(rmask[:, None], dlr, 0.0), axis=0)
-        dbw = tl.sum(tl.where(rmask[:, None], dlw, 0.0), axis=0)
-        tl.atomic_add(dbr_ptr + lvl * sbr_lvl + offs_bb * sbr_b, dbr, mask=bmask)
-        tl.atomic_add(dbw_ptr + lvl * sbw_lvl + offs_bb * sbw_b, dbw, mask=bmask)
+    off = pid_b * slo_b + rows[:, None] * slo_l + lvl * slo_lvl + offs_bb[None, :] * slo_bb
+    m = rmask[:, None] & bmask[None, :]
+    tl.atomic_add(dlr_ptr + off, dlr, mask=m)
+    tl.atomic_add(dlw_ptr + off, dlw, mask=m)
 
 
 @triton.jit
-def _build_factors(h_ptr, wr_ptr, ww_ptr, sel_ptr, cols, cmask,
-                   pid_b, rows, rmask, offs_bb, bmask, d_model,
-                   sh_b, sh_l, sh_d, swr_lvl, swr_d, swr_b, sww_lvl, sww_d, sww_b,
-                   ssel_lvl, ssel_b, ssel_c,
-                   br_ptr, bw_ptr, sbr_lvl, sbr_b, sbw_lvl, sbw_b,
+def _build_factors(lr_ptr, lw_ptr, sel_ptr, cols, cmask,
+                   pid_b, rows, rmask, offs_bb, bmask,
+                   slo_b, slo_l, slo_lvl, slo_bb, ssel_lvl, ssel_b, ssel_c,
                    D: tl.constexpr, BT: tl.constexpr,
-                   BB: tl.constexpr, BC: tl.constexpr, BD: tl.constexpr, NDM: tl.constexpr,
-                   HAS_BIAS: tl.constexpr):
-    # F3: collect the per-level softmax factors fr/fw + selector sel so the router-grad fold
-    # (`_fold_level`) can REUSE them instead of recomputing the h·W logits + softmax. `tl.static_range`
-    # unrolls the D levels (D constexpr) so frs/fws/sels are compile-time tuples indexable by level.
+                   BB: tl.constexpr, BC: tl.constexpr):
+    # F2b: rebuild the [BT,BC] read/write gate tiles for an nc-block from the PRECOMPUTED per-level logits
+    # lr,lw ∈ [BH,L,D,b] (the cuBLAS-GEMM stand-in for the in-kernel h·W d_model-contraction). Collects the
+    # per-level softmax factors fr/fw + selector sel so the router-grad fold (`_fold_level`) REUSES them.
+    # `tl.static_range` unrolls the D levels (D constexpr) so frs/fws/sels are compile-time tuples. The
+    # routing bias is already folded into the logits. Mirrors the forward `_build_rw_tile_logits`.
     r_tile = tl.full([BT, BC], 1.0, dtype=tl.float32)
     w_tile = tl.full([BT, BC], 1.0, dtype=tl.float32)
     frs = ()
     fws = ()
     sels = ()
+    neg = tl.full([BT, BB], float('-inf'), dtype=tl.float32)
     for lvl in tl.static_range(D):
-        lr = tl.zeros([BT, BB], dtype=tl.float32)
-        lw = tl.zeros([BT, BB], dtype=tl.float32)
-        for dm in range(NDM):
-            offs_dm = dm * BD + tl.arange(0, BD)
-            mmask = offs_dm < d_model
-            hc = tl.load(h_ptr + pid_b * sh_b + rows[:, None] * sh_l + offs_dm[None, :] * sh_d,
-                         mask=rmask[:, None] & mmask[None, :], other=0.0)
-            wr = tl.load(wr_ptr + lvl * swr_lvl + offs_dm[:, None] * swr_d + offs_bb[None, :] * swr_b,
-                         mask=mmask[:, None] & bmask[None, :], other=0.0)
-            ww = tl.load(ww_ptr + lvl * sww_lvl + offs_dm[:, None] * sww_d + offs_bb[None, :] * sww_b,
-                         mask=mmask[:, None] & bmask[None, :], other=0.0)
-            lr += tl.dot(hc, wr)
-            lw += tl.dot(hc, ww)
-        if HAS_BIAS:
-            brc = tl.load(br_ptr + lvl * sbr_lvl + offs_bb * sbr_b, mask=bmask, other=0.0)
-            bwc = tl.load(bw_ptr + lvl * sbw_lvl + offs_bb * sbw_b, mask=bmask, other=0.0)
-            lr += brc[None, :]
-            lw += bwc[None, :]
-        neg = tl.full([BT, BB], float('-inf'), dtype=tl.float32)
+        off = pid_b * slo_b + rows[:, None] * slo_l + lvl * slo_lvl + offs_bb[None, :] * slo_bb
+        lr = tl.load(lr_ptr + off, mask=rmask[:, None] & bmask[None, :], other=0.0).to(tl.float32)
+        lw = tl.load(lw_ptr + off, mask=rmask[:, None] & bmask[None, :], other=0.0).to(tl.float32)
         lr = tl.where(bmask[None, :], lr, neg)
         lw = tl.where(bmask[None, :], lw, neg)
         er = tl.exp(lr - tl.max(lr, axis=1)[:, None])
@@ -217,20 +182,22 @@ def _decay_factors(a):
 # ============ INTRA backward kernel ============
 @triton.jit
 def _bwd_intra_kernel(
-    h_ptr, q_ptr, k_ptr, v_ptr, wr_ptr, ww_ptr, sel_ptr, wg_ptr, do_ptr,
-    dq_ptr, dk_ptr, dv_ptr, dh_ptr, dwr_ptr, dww_ptr, gda_ptr,
-    br_ptr, bw_ptr, dbr_ptr, dbw_ptr,
-    L, d_model, dqk, dv, nc, H, swr_head, sww_head, sbr_head, sbw_head,
+    h_ptr, q_ptr, k_ptr, v_ptr, lr_ptr, lw_ptr, sel_ptr, wg_ptr, do_ptr,
+    dq_ptr, dk_ptr, dv_ptr, dlr_ptr, dlw_ptr, gda_ptr,
+    L, d_model, dqk, dv, nc, H,
     sh_b, sh_l, sh_d, sq_b, sq_l, sq_d, sv_b, sv_l, sv_d,
-    swr_lvl, swr_d, swr_b, sww_lvl, sww_d, sww_b,
+    slo_b, slo_l, slo_lvl, slo_bb,
     ssel_lvl, ssel_b, ssel_c, swg_head, swg_d, sga_b, sga_l, sga_c,
-    so_b, so_l, so_v, sdh_b, sdh_l, sdh_d,
-    sbr_lvl, sbr_b, sbw_lvl, sbw_b,
+    so_b, so_l, so_v,
     D: tl.constexpr, b: tl.constexpr, BB: tl.constexpr,
     BT: tl.constexpr, BK: tl.constexpr, BV: tl.constexpr, BD: tl.constexpr,
     BC: tl.constexpr, NCBLK: tl.constexpr, ND: tl.constexpr, NDM: tl.constexpr,
-    HAS_BIAS: tl.constexpr, USE_G: tl.constexpr = False, GLA_FLOOR: tl.constexpr = -2.5,
+    USE_G: tl.constexpr = False, GLA_FLOOR: tl.constexpr = -2.5,
 ):
+    # F2b: the routing factors are rebuilt from the PRECOMPUTED logits lr,lw (`_build_factors`); the
+    # router-grad fold emits per-level LOGIT grads dlr,dlw (`_fold_level`) — the dWr/dWw/dh d_model
+    # contraction is a cuBLAS GEMM-backward in torch. No in-kernel router-weight fold, no dh here (router
+    # dh flows through the GEMM; intra carries no decay-dh — that lives in `_fold_kernel`).
     # USE_G (GLA, #30): the routing factors r_tile/w_tile feed the DECAYED intra gram rt=r·eᵃ, wt=w·e⁻ᵃ
     # (a = intra-chunk cumsum of ld over this block's c-columns), mirroring `_rola_routed_fwd_intra`.
     # The fold then consumes the routing-factor grads (drt·eᵃ, dwt·e⁻ᵃ), and the per-token log-decay
@@ -238,18 +205,9 @@ def _bwd_intra_kernel(
     # buffer (the read/state kernels add their da-pieces; the driver reverse-cumsums gda → dld).
     pid_b = tl.program_id(0)
     pid_t = tl.program_id(1)
-    # Per-head router: BH fold is (B,H) -> head = pid_b % H. Offset the READ (Wr/Ww/bias) AND the
-    # WRITE (dWr/dWw/dbias) pointers to THIS head's [D,d_model,b] slice; the fold's atomic-adds then
-    # accumulate into the head's own grad slice. dh/h stay per-row (already head-indexed by pid_b).
+    # The logits lr/lw and dlogits dlr/dlw are already per-head ([BH,L,D,b], indexed by pid_b). Only the
+    # GLA decay weight Wg:[H,d_model] needs the per-head offset (BH fold is (B,H) -> head = pid_b % H).
     _hd = pid_b % H
-    wr_ptr = wr_ptr + _hd * swr_head
-    ww_ptr = ww_ptr + _hd * sww_head
-    br_ptr = br_ptr + _hd * sbr_head
-    bw_ptr = bw_ptr + _hd * sbw_head
-    dwr_ptr = dwr_ptr + _hd * swr_head
-    dww_ptr = dww_ptr + _hd * sww_head
-    dbr_ptr = dbr_ptr + _hd * sbr_head
-    dbw_ptr = dbw_ptr + _hd * sbw_head
     wg_ptr = wg_ptr + _hd * swg_head            # per-head decay weight (read-only here; #45)
     offs_t = tl.arange(0, BT)
     offs_v = tl.arange(0, BV)
@@ -281,12 +239,10 @@ def _bwd_intra_kernel(
         cols = cb * BC + offs_c
         cmask = cols < nc
         r_tile, w_tile, _frs, _fws, _sels = _build_factors(
-                                        h_ptr, wr_ptr, ww_ptr, sel_ptr, cols, cmask,
-                                        pid_b, rows, rmask, offs_bb, bmask, d_model,
-                                        sh_b, sh_l, sh_d, swr_lvl, swr_d, swr_b, sww_lvl, sww_d, sww_b,
-                                        ssel_lvl, ssel_b, ssel_c,
-                                        br_ptr, bw_ptr, sbr_lvl, sbr_b, sbw_lvl, sbw_b,
-                                        D, BT, BB, BC, BD, NDM, HAS_BIAS)
+                                        lr_ptr, lw_ptr, sel_ptr, cols, cmask,
+                                        pid_b, rows, rmask, offs_bb, bmask,
+                                        slo_b, slo_l, slo_lvl, slo_bb, ssel_lvl, ssel_b, ssel_c,
+                                        D, BT, BB, BC)
         if USE_G:
             ldc = _ld_from_w(w_tile, alpha, cmask, GLA_FLOOR)
             a = tl.cumsum(ldc, axis=0)
@@ -314,12 +270,10 @@ def _bwd_intra_kernel(
         cols = cb * BC + offs_c
         cmask = cols < nc
         r_tile, w_tile, frs, fws, sels = _build_factors(
-                                        h_ptr, wr_ptr, ww_ptr, sel_ptr, cols, cmask,
-                                        pid_b, rows, rmask, offs_bb, bmask, d_model,
-                                        sh_b, sh_l, sh_d, swr_lvl, swr_d, swr_b, sww_lvl, sww_d, sww_b,
-                                        ssel_lvl, ssel_b, ssel_c,
-                                        br_ptr, bw_ptr, sbr_lvl, sbr_b, sbw_lvl, sbw_b,
-                                        D, BT, BB, BC, BD, NDM, HAS_BIAS)
+                                        lr_ptr, lw_ptr, sel_ptr, cols, cmask,
+                                        pid_b, rows, rmask, offs_bb, bmask,
+                                        slo_b, slo_l, slo_lvl, slo_bb, ssel_lvl, ssel_b, ssel_c,
+                                        D, BT, BB, BC)
         if USE_G:
             ldc = _ld_from_w(w_tile, alpha, cmask, GLA_FLOOR)
             a = tl.cumsum(ldc, axis=0)
@@ -342,39 +296,32 @@ def _bwd_intra_kernel(
             dw_tile = tl.dot(tl.trans(dRgram).to(r_tile.dtype), r_tile)
         for lvl in tl.static_range(D):
             _fold_level(dr_tile, dw_tile, r_tile, w_tile, frs[lvl], fws[lvl], sels[lvl],
-                        h_ptr, wr_ptr, ww_ptr, dwr_ptr, dww_ptr, dh_ptr,
-                        pid_b, rows, rmask, offs_bb, bmask, d_model,
-                        sh_b, sh_l, sh_d, swr_lvl, swr_d, swr_b, sww_lvl, sww_d, sww_b,
-                        sdh_b, sdh_l, sdh_d,
-                        sbr_lvl, sbr_b, sbw_lvl, sbw_b, dbr_ptr, dbw_ptr,
-                        lvl, BT, BB, BD, NDM, HAS_BIAS)
+                        dlr_ptr, dlw_ptr, pid_b, rows, rmask, offs_bb, bmask,
+                        slo_b, slo_l, slo_lvl, slo_bb, lvl, BT, BB)
 
 
 # ============ INTER readout backward (dr, dq from o_inter; accumulates dS_read into ds) ============
 # Split from the state-update half to halve SMEM (only the readout [BT,BC*BK] tile lives here).
 @triton.jit
 def _bwd_inter_read_kernel(
-    h_ptr, q_ptr, wr_ptr, ww_ptr, sel_ptr, wg_ptr, s_ptr, ds_ptr, do_ptr,
-    dq_ptr, gdr_ptr, gda_ptr, br_ptr, bw_ptr,
-    L, d_model, dqk, dv, nc, t_start, H, swr_head, sww_head, sbr_head, sbw_head,
+    h_ptr, q_ptr, lr_ptr, lw_ptr, sel_ptr, wg_ptr, s_ptr, ds_ptr, do_ptr,
+    dq_ptr, gdr_ptr, gda_ptr,
+    L, d_model, dqk, dv, nc, t_start, H,
     sh_b, sh_l, sh_d, sq_b, sq_l, sq_d,
-    swr_lvl, swr_d, swr_b, sww_lvl, sww_d, sww_b,
+    slo_b, slo_l, slo_lvl, slo_bb,
     ssel_lvl, ssel_b, ssel_c, swg_head, swg_d, ss_b, ss_c, ss_k, ss_v,
-    so_b, so_l, so_v, sg_b, sg_t, sg_c, sga_b, sga_l, sga_c, sbr_lvl, sbr_b, sbw_lvl, sbw_b,
+    so_b, so_l, so_v, sg_b, sg_t, sg_c, sga_b, sga_l, sga_c,
     D: tl.constexpr, b: tl.constexpr, BB: tl.constexpr,
     BT: tl.constexpr, BK: tl.constexpr, BV: tl.constexpr, BD: tl.constexpr,
     BC: tl.constexpr, NCBLK: tl.constexpr, ND: tl.constexpr, NDM: tl.constexpr,
-    HAS_BIAS: tl.constexpr, USE_G: tl.constexpr = False, GLA_FLOOR: tl.constexpr = -2.5,
+    USE_G: tl.constexpr = False, GLA_FLOOR: tl.constexpr = -2.5,
 ):
-    # USE_G (GLA, #30): the inter readout uses the DECAYED read gate rt=r·eᵃ (a=intra-chunk cumsum of ld).
-    # dq/dS_read flow through rt; the read routing-factor grad is drt·eᵃ (→ gdr) and the read-gate decay
-    # adjoint dart_inter=drt·rt is accumulated into the persistent gda buffer (the driver reverse-cumsums).
+    # F2b: read factors rebuilt from logits (`_build_factors`); the read-gate grad is stored to gdr (the
+    # `_fold_kernel` later folds gdr → dlogit). USE_G (GLA, #30): the inter readout uses the DECAYED read
+    # gate rt=r·eᵃ (a=intra-chunk cumsum of ld). dq/dS_read flow through rt; the read routing-factor grad
+    # is drt·eᵃ (→ gdr) and the read-gate decay adjoint dart_inter=drt·rt accumulates into gda.
     pid_b = tl.program_id(0)
-    _hd = pid_b % H                              # per-head router slice (BH fold is (B,H)); read-only here
-    wr_ptr = wr_ptr + _hd * swr_head
-    ww_ptr = ww_ptr + _hd * sww_head
-    br_ptr = br_ptr + _hd * sbr_head
-    bw_ptr = bw_ptr + _hd * sbw_head
+    _hd = pid_b % H                              # per-head decay-weight slice (BH fold is (B,H))
     wg_ptr = wg_ptr + _hd * swg_head            # per-head decay weight (read-only here; #45)
     ND_V = (dv + BV - 1) // BV       # value-blocks (BV is the value TILE; ND_V==1 ⇒ the un-tiled kernel)
     offs_t = tl.arange(0, BT)
@@ -390,12 +337,10 @@ def _bwd_inter_read_kernel(
         cols = cb * BC + offs_c
         cmask = cols < nc
         r_tile, w_tile, _frs, _fws, _sels = _build_factors(
-                                        h_ptr, wr_ptr, ww_ptr, sel_ptr, cols, cmask,
-                                        pid_b, rows, rmask, offs_bb, bmask, d_model,
-                                        sh_b, sh_l, sh_d, swr_lvl, swr_d, swr_b, sww_lvl, sww_d, sww_b,
-                                        ssel_lvl, ssel_b, ssel_c,
-                                        br_ptr, bw_ptr, sbr_lvl, sbr_b, sbw_lvl, sbw_b,
-                                        D, BT, BB, BC, BD, NDM, HAS_BIAS)
+                                        lr_ptr, lw_ptr, sel_ptr, cols, cmask,
+                                        pid_b, rows, rmask, offs_bb, bmask,
+                                        slo_b, slo_l, slo_lvl, slo_bb, ssel_lvl, ssel_b, ssel_c,
+                                        D, BT, BB, BC)
         if USE_G:
             ldc = _ld_from_w(w_tile, alpha, cmask, GLA_FLOOR)
             a = tl.cumsum(ldc, axis=0)
@@ -451,29 +396,26 @@ def _bwd_inter_read_kernel(
 # Must run BEFORE the readout kernel writes dS_read into ds for this chunk (ds is still S_{j+1}'s adjoint).
 @triton.jit
 def _bwd_inter_state_kernel(
-    h_ptr, k_ptr, v_ptr, wr_ptr, ww_ptr, sel_ptr, wg_ptr, sj_ptr, ds_ptr,
-    dk_ptr, dv_ptr, gdw_ptr, gda_ptr, br_ptr, bw_ptr,
-    L, d_model, dqk, dv, nc, t_start, H, swr_head, sww_head, sbr_head, sbw_head,
+    h_ptr, k_ptr, v_ptr, lr_ptr, lw_ptr, sel_ptr, wg_ptr, sj_ptr, ds_ptr,
+    dk_ptr, dv_ptr, gdw_ptr, gda_ptr,
+    L, d_model, dqk, dv, nc, t_start, H,
     sh_b, sh_l, sh_d, sq_b, sq_l, sq_d, sv_b, sv_l, sv_d,
-    swr_lvl, swr_d, swr_b, sww_lvl, sww_d, sww_b,
+    slo_b, slo_l, slo_lvl, slo_bb,
     ssel_lvl, ssel_b, ssel_c, swg_head, swg_d, ss_b, ss_c, ss_k, ss_v,
-    sg_b, sg_t, sg_c, sga_b, sga_l, sga_c, sbr_lvl, sbr_b, sbw_lvl, sbw_b,
+    sg_b, sg_t, sg_c, sga_b, sga_l, sga_c,
     D: tl.constexpr, b: tl.constexpr, BB: tl.constexpr,
     BT: tl.constexpr, BK: tl.constexpr, BV: tl.constexpr, BD: tl.constexpr,
     BC: tl.constexpr, NCBLK: tl.constexpr, ND: tl.constexpr, NDM: tl.constexpr,
-    HAS_BIAS: tl.constexpr, USE_G: tl.constexpr = False, GLA_FLOOR: tl.constexpr = -2.5,
+    USE_G: tl.constexpr = False, GLA_FLOOR: tl.constexpr = -2.5,
 ):
-    # USE_G (GLA, #30): the state write uses the DECAYED write gate w_end=w·e^{Λ−a} (Λ=chunk-total ld);
-    # dk/dv flow through w_end; the write routing-factor grad += dw_end·e^{Λ−a} (→ gdw). da-pieces:
-    # −da_wend (=dw_end·w_end), and the chunk-total Λ coupling dlam = e^Λ·Σ(S_j∘ds_in) − Σ_t da_wend
-    # placed on the LAST row of gda. ds_in MUST be the pre-decvec adjoint of S_{j+1} (the driver applies
-    # the e^Λ state-carry decay to ds AFTER this kernel, before the read kernel folds dS_read).
+    # F2b: write factors rebuilt from logits (`_build_factors`); the write-gate grad is stored to gdw (the
+    # `_fold_kernel` later folds gdw → dlogit). USE_G (GLA, #30): the state write uses the DECAYED write
+    # gate w_end=w·e^{Λ−a} (Λ=chunk-total ld); dk/dv flow through w_end; the write routing-factor grad +=
+    # dw_end·e^{Λ−a} (→ gdw). da-pieces: −da_wend (=dw_end·w_end), and the chunk-total Λ coupling
+    # dlam = e^Λ·Σ(S_j∘ds_in) − Σ_t da_wend placed on the LAST row of gda. ds_in MUST be the pre-decvec
+    # adjoint of S_{j+1} (the driver applies the e^Λ state-carry decay to ds AFTER this kernel).
     pid_b = tl.program_id(0)
-    _hd = pid_b % H                              # per-head router slice (BH fold is (B,H)); read-only here
-    wr_ptr = wr_ptr + _hd * swr_head
-    ww_ptr = ww_ptr + _hd * sww_head
-    br_ptr = br_ptr + _hd * sbr_head
-    bw_ptr = bw_ptr + _hd * sbw_head
+    _hd = pid_b % H                              # per-head decay-weight slice (BH fold is (B,H))
     wg_ptr = wg_ptr + _hd * swg_head            # per-head decay weight (read-only here; #45)
     ND_V = (dv + BV - 1) // BV       # value-blocks (BV is the value TILE; ND_V==1 ⇒ the un-tiled kernel)
     offs_t = tl.arange(0, BT)
@@ -489,12 +431,10 @@ def _bwd_inter_state_kernel(
         cols = cb * BC + offs_c
         cmask = cols < nc
         r_tile, w_tile, _frs, _fws, _sels = _build_factors(
-                                        h_ptr, wr_ptr, ww_ptr, sel_ptr, cols, cmask,
-                                        pid_b, rows, rmask, offs_bb, bmask, d_model,
-                                        sh_b, sh_l, sh_d, swr_lvl, swr_d, swr_b, sww_lvl, sww_d, sww_b,
-                                        ssel_lvl, ssel_b, ssel_c,
-                                        br_ptr, bw_ptr, sbr_lvl, sbr_b, sbw_lvl, sbw_b,
-                                        D, BT, BB, BC, BD, NDM, HAS_BIAS)
+                                        lr_ptr, lw_ptr, sel_ptr, cols, cmask,
+                                        pid_b, rows, rmask, offs_bb, bmask,
+                                        slo_b, slo_l, slo_lvl, slo_bb, ssel_lvl, ssel_b, ssel_c,
+                                        D, BT, BB, BC)
         if USE_G:
             ldc = _ld_from_w(w_tile, alpha, cmask, GLA_FLOOR)
             a = tl.cumsum(ldc, axis=0)
@@ -555,33 +495,27 @@ def _bwd_inter_state_kernel(
 # ============ FOLD kernel: gate-grad tiles [BT,nc] -> dWr,dWw,dh (router-grad fold) ============
 @triton.jit
 def _fold_kernel(
-    h_ptr, wr_ptr, ww_ptr, sel_ptr, gdr_ptr, gdw_ptr,
-    dh_ptr, dwr_ptr, dww_ptr, br_ptr, bw_ptr, dbr_ptr, dbw_ptr,
+    h_ptr, lr_ptr, lw_ptr, sel_ptr, gdr_ptr, gdw_ptr,
+    dh_ptr, dlr_ptr, dlw_ptr,
     wg_ptr, dwg_ptr, dld_ptr,
-    L, d_model, nc, t_start, H, swr_head, sww_head, sbr_head, sbw_head,
-    sh_b, sh_l, sh_d, swr_lvl, swr_d, swr_b, sww_lvl, sww_d, sww_b,
+    L, d_model, nc, t_start, H,
+    sh_b, sh_l, sh_d, slo_b, slo_l, slo_lvl, slo_bb,
     ssel_lvl, ssel_b, ssel_c, sg_b, sg_t, sg_c, sdh_b, sdh_l, sdh_d,
     swg_head, swg_d,
-    sbr_lvl, sbr_b, sbw_lvl, sbw_b,
     D: tl.constexpr, b: tl.constexpr, BB: tl.constexpr,
     BT: tl.constexpr, BC: tl.constexpr, BD: tl.constexpr,
     NCBLK: tl.constexpr, NDM: tl.constexpr,
-    HAS_BIAS: tl.constexpr, USE_G: tl.constexpr = False, GLA_FLOOR: tl.constexpr = -2.5,
+    USE_G: tl.constexpr = False, GLA_FLOOR: tl.constexpr = -2.5,
 ):
-    # USE_G (GLA, #45): the per-state log-decay ld is computed in-kernel from Wg + the write gate, so its
-    # gradient is folded HERE (the natural home — this kernel already rebuilds w_tile and folds w → dWw,dh).
-    # dld_ptr carries the assembled ∂L/∂ld (the driver's reverse-cumsum of gda) for this chunk [BT,nc]. We
-    # split it: ∂L/∂w (added to dw_tile → dWw,dh via the SAME tree fold) and ∂L/∂z (z=h·Wg) → dWg,dh.
+    # F2b: folds the transient [BT,nc] gate-grads (gdr/gdw) into the per-level dlogit buffers dlr/dlw via
+    # `_build_factors`(logits) + `_fold_level`(dlogits); the dWr/dWw/dh router contraction is a cuBLAS
+    # GEMM-backward in torch. USE_G (GLA, #45): the per-state log-decay ld is computed in-kernel from Wg +
+    # the write gate, so ITS gradient is folded HERE (the natural home — this kernel already rebuilds
+    # w_tile and folds w → dlogit_w). dld_ptr carries the assembled ∂L/∂ld (the driver's reverse-cumsum
+    # of gda) for this chunk [BT,nc]; we split it into ∂L/∂w (added to dw_tile → dlogit_w via the SAME tree
+    # fold) and ∂L/∂z (z=h·Wg) → dWg, dh (the decay's dh STAYS in-kernel; h·Wg is the tiny [d_model]→1).
     pid_b = tl.program_id(0)
-    _hd = pid_b % H                              # per-head router slice (BH fold is (B,H))
-    wr_ptr = wr_ptr + _hd * swr_head
-    ww_ptr = ww_ptr + _hd * sww_head
-    br_ptr = br_ptr + _hd * sbr_head
-    bw_ptr = bw_ptr + _hd * sbw_head
-    dwr_ptr = dwr_ptr + _hd * swr_head
-    dww_ptr = dww_ptr + _hd * sww_head
-    dbr_ptr = dbr_ptr + _hd * sbr_head
-    dbw_ptr = dbw_ptr + _hd * sbw_head
+    _hd = pid_b % H                              # per-head decay-weight slice (BH fold is (B,H))
     wg_ptr = wg_ptr + _hd * swg_head
     dwg_ptr = dwg_ptr + _hd * swg_head
     offs_t = tl.arange(0, BT)
@@ -598,12 +532,10 @@ def _fold_kernel(
         cols = cb * BC + offs_c
         cmask = cols < nc
         r_tile, w_tile, frs, fws, sels = _build_factors(
-                                        h_ptr, wr_ptr, ww_ptr, sel_ptr, cols, cmask,
-                                        pid_b, rows, rmask, offs_bb, bmask, d_model,
-                                        sh_b, sh_l, sh_d, swr_lvl, swr_d, swr_b, sww_lvl, sww_d, sww_b,
-                                        ssel_lvl, ssel_b, ssel_c,
-                                        br_ptr, bw_ptr, sbr_lvl, sbr_b, sbw_lvl, sbw_b,
-                                        D, BT, BB, BC, BD, NDM, HAS_BIAS)
+                                        lr_ptr, lw_ptr, sel_ptr, cols, cmask,
+                                        pid_b, rows, rmask, offs_bb, bmask,
+                                        slo_b, slo_l, slo_lvl, slo_bb, ssel_lvl, ssel_b, ssel_c,
+                                        D, BT, BB, BC)
         dr_tile = tl.load(gdr_ptr + pid_b * sg_b + offs_t[:, None] * sg_t + cols[None, :] * sg_c,
                           mask=rmask[:, None] & cmask[None, :], other=0.0)
         dw_tile = tl.load(gdw_ptr + pid_b * sg_b + offs_t[:, None] * sg_t + cols[None, :] * sg_c,
@@ -620,12 +552,8 @@ def _fold_kernel(
             dz += tl.sum(dld * (w_tile / m), axis=1) * (alpha * (1.0 - alpha))  # ∂ld/∂alpha · ∂alpha/∂z
         for lvl in tl.static_range(D):
             _fold_level(dr_tile, dw_tile, r_tile, w_tile, frs[lvl], fws[lvl], sels[lvl],
-                        h_ptr, wr_ptr, ww_ptr, dwr_ptr, dww_ptr, dh_ptr,
-                        pid_b, rows, rmask, offs_bb, bmask, d_model,
-                        sh_b, sh_l, sh_d, swr_lvl, swr_d, swr_b, sww_lvl, sww_d, sww_b,
-                        sdh_b, sdh_l, sdh_d,
-                        sbr_lvl, sbr_b, sbw_lvl, sbw_b, dbr_ptr, dbw_ptr,
-                        lvl, BT, BB, BD, NDM, HAS_BIAS)
+                        dlr_ptr, dlw_ptr, pid_b, rows, rmask, offs_bb, bmask,
+                        slo_b, slo_l, slo_lvl, slo_bb, lvl, BT, BB)
     if USE_G:
         # fold dz (the per-head decay-logit grad) into dWg[head,d] += Σ_t h·dz and dh[t,d] += dz·Wg[head,d].
         for dm in range(NDM):
