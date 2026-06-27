@@ -1262,7 +1262,6 @@ def _kappa_routed_fwd(q, k, v, h, Wr, Ww, kap, D, b, sel, chunk, global_norm, pe
     BC = 16   # tl.dot needs the gram dim >=16; the nc tail is cmask'd (was max(16,min(nc,16)) ≡ 16)
     BK = _kappa_bk_cap(dqk, dv, _KAPPA_BWD_CHUNK, BC)    # feature-tile (loop ND) — bounds the [BT,BC*BK] tiles
     BV = _kappa_bv_tile(dqk, dv, BC)                     # value-tile (loop ND_V) so [BC*BK,BV] fits SRAM
-    BVO = max(16, triton.next_power_of_2(dv))            # num buffer width (full padded value dim)
     BD, NDM = _router_bd_ndm(d_model, b)                  # F5: cap BD so the [BD,BB] router tile fits SRAM
     BB = max(16, triton.next_power_of_2(b))
     # The [BT,BC*BK] rq/wk tiles scale with BT, so the heavy-tile fwd chunk is capped like the bwd (the
@@ -1273,14 +1272,20 @@ def _kappa_routed_fwd(q, k, v, h, Wr, Ww, kap, D, b, sel, chunk, global_norm, pe
     NCH = triton.cdiv(L, chunk)
     Sval = torch.zeros(B, nc, dqk, dv, device=q.device, dtype=torch.float32)
     Sden = torch.zeros(B, nc, dqk, device=q.device, dtype=torch.float32)
-    num = torch.zeros(B, L, BVO, device=q.device, dtype=torch.float32)   # full padded width; BV tiles it
+    # F7: num at the TRUE dv (not the padded next_pow2(dv)) — the in-kernel store is already vfmask'd to
+    # `offs_vf < dv` (the [dv, NDVP*BV) pad lanes never touch memory), so the buffer needs only dv columns,
+    # exactly like dq/dk/dvv above. Saves the BVO−dv pad columns (the [B,L,*] alloc) every forward.
+    num = torch.zeros(B, L, dv, device=q.device, dtype=torch.float32)
     den = torch.zeros(B, L, device=q.device, dtype=torch.float32)
     # Snapshots = the per-chunk pre-state the BACKWARD recompute consumes — NOT the forward (which
     # discards them) and NOT inference (no backward). Allocating+writing them unconditionally was a
-    # [B,NCH,nc,dqk,dv] fp32 transient built for nothing on the forward/prefill path.
+    # [NCH,B,nc,dqk,dv] fp32 transient built for nothing on the forward/prefill path.
+    # F6: NCH is the LEADING axis so the backward's per-chunk slice `snap_*[c]` is an already-contiguous
+    # [B,nc,dqk,dv]/[B,nc,dqk] view (identical strides to the contiguous dSval/dSden the kernels assume) —
+    # dropping the per-chunk `.contiguous()` copy in `_kappa_routed_bwd` (output byte-identical).
     if need_snapshots:
-        snap_val = torch.zeros(B, NCH, nc, dqk, dv, device=q.device, dtype=torch.float32)
-        snap_den = torch.zeros(B, NCH, nc, dqk, device=q.device, dtype=torch.float32)
+        snap_val = torch.zeros(NCH, B, nc, dqk, dv, device=q.device, dtype=torch.float32)
+        snap_den = torch.zeros(NCH, B, nc, dqk, device=q.device, dtype=torch.float32)
     else:
         snap_val = snap_den = None
     H = Wr.shape[0]
@@ -1296,8 +1301,8 @@ def _kappa_routed_fwd(q, k, v, h, Wr, Ww, kap, D, b, sel, chunk, global_norm, pe
                   HAS_BIAS=has_bias, USE_G=use_g, GLA_FLOOR=_GLA_FLOOR, num_warps=4, num_stages=1)
     for c in range(NCH):
         if need_snapshots:
-            snap_val[:, c].copy_(Sval)
-            snap_den[:, c].copy_(Sden)
+            snap_val[c].copy_(Sval)
+            snap_den[c].copy_(Sden)
         _kappa_fwd_chunk[(B,)](
             h, q, k, v, Wr, Ww, sel, kap, Wg, Sval, Sden, num, den, br, bw,
             L, d_model, dqk, dv, nc, c * chunk, *head,
@@ -1310,7 +1315,7 @@ def _kappa_routed_fwd(q, k, v, h, Wr, Ww, kap, D, b, sel, chunk, global_norm, pe
             num.stride(0), num.stride(1), num.stride(2), den.stride(0), den.stride(1),
             *sbias,
             **common)
-    return num[..., :dv], den, snap_val, snap_den
+    return num, den, snap_val, snap_den
 
 
 @triton.jit
@@ -1745,8 +1750,8 @@ def _kappa_routed_bwd(q, k, v, h, Wr, Ww, kap, snap_val, snap_den, dnum, dden,
     fold_common = dict(D=D, b=b, BB=BB, BT=chunk, BC=BC, BD=BD, NCBLK=NCBLK, NDM=NDM,
                        HAS_BIAS=has_bias, USE_G=use_g, GLA_FLOOR=_GLA_FLOOR, num_warps=4, num_stages=1)
     for c in reversed(range(NCH)):
-        Sval = snap_val[:, c].contiguous()
-        Sden = snap_den[:, c].contiguous()
+        Sval = snap_val[c]    # F6: NCH-leading layout → per-chunk slice is already contiguous (no copy)
+        Sden = snap_den[c]
         gdw.zero_()
         # K1: state-update bwd (reads adjoint of Sval_{j+1}/Sden_{j+1}; produces dk,dv + state half of dw +
         # the USE_G carry/w_end da-pieces, using the chunk-start snapshot Sval_j/Sden_j for the Λ-coupling).
