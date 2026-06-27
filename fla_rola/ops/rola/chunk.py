@@ -174,6 +174,33 @@ def _kappa_bv_tile(dqk, dv, bc=16, bk_cap=64):
     return bv
 
 
+_ROUTER_BD_BUDGET = 8192   # elements (32KB fp32) for the in-kernel router's [BD, BB] weight tile (one
+#                            tile live at a time — the kappa kernels run num_stages=1, no double-buffer)
+_ROUTER_BD_MAX = 256       # absolute BD cap (bounds the hc[BT,BD] tile + keeps the NDM-unroll IR small)
+
+
+def _router_bd_ndm(d_model, b):
+    """BD (the d_model tile width of the IN-KERNEL router build — `_build_rw_tile`/`_build_factors`/
+    `_build_alpha`, all of which loop `for dm in range(NDM)`) RIGHT-SIZED to the LARGEST pow2 whose
+    [BD, BB] router-weight tile fits a safe SRAM fraction, with NDM=cdiv(d_model, BD) tiling the rest.
+    For small d_model this returns BD=next_pow2(d_model), NDM=1 — byte-identical to the un-tiled build.
+
+    F5: with the old BD=next_pow2(d_model) the whole router weight was ONE block (NDM=1), so flat
+    nc=64/256 at d_model=1024 (BD=1024) OOM'd. Capping BD by a FIXED byte budget keeps the tile in SRAM;
+    crucially we pick the LARGEST BD that fits (small NDM) — NOT the smallest — so the constexpr `for dm in
+    range(NDM)` unroll stays short (fast compile + good ILP). For the common small-b routings (BB=16) BD
+    lands at the 256 cap (NDM=4 at d_model=1024); only true flat routing (BB=nc large) drives NDM up,
+    because [BD,BB] is intrinsically wide there. All builders NDM-loop, so the cap only splits the d_model
+    reduction into NDM blocks (output unchanged to fp tolerance)."""
+    BB = max(16, triton.next_power_of_2(b))
+    bd_full = max(16, triton.next_power_of_2(d_model))
+    bd_cap = triton.next_power_of_2(max(1, _ROUTER_BD_BUDGET // BB))
+    while bd_cap > 16 and bd_cap * BB > _ROUTER_BD_BUDGET:
+        bd_cap //= 2          # round DOWN to the largest pow2 keeping [BD,BB] within budget (floor 16)
+    BD = max(16, min(bd_full, bd_cap, _ROUTER_BD_MAX))
+    return BD, triton.cdiv(d_model, BD)
+
+
 def _prune_bv(configs, named_args, **kwargs):
     """Cap BV at next_pow2(d_v): a bigger value-tile than the value dim is pure waste (and would blow
     up the config grid). Floor 16 always survives — the routed forward inter-scan's value-axis prune."""
@@ -1236,14 +1263,13 @@ def _kappa_routed_fwd(q, k, v, h, Wr, Ww, kap, D, b, sel, chunk, global_norm, pe
     BK = _kappa_bk_cap(dqk, dv, _KAPPA_BWD_CHUNK, BC)    # feature-tile (loop ND) — bounds the [BT,BC*BK] tiles
     BV = _kappa_bv_tile(dqk, dv, BC)                     # value-tile (loop ND_V) so [BC*BK,BV] fits SRAM
     BVO = max(16, triton.next_power_of_2(dv))            # num buffer width (full padded value dim)
-    BD = max(16, triton.next_power_of_2(d_model))
+    BD, NDM = _router_bd_ndm(d_model, b)                  # F5: cap BD so the [BD,BB] router tile fits SRAM
     BB = max(16, triton.next_power_of_2(b))
     # The [BT,BC*BK] rq/wk tiles scale with BT, so the heavy-tile fwd chunk is capped like the bwd (the
     # chunked scan is chunk-size invariant). Cheap dqk/dv keep the full fwd chunk (BC*BK*BT then fits).
     chunk = chunk if BK * BC * chunk * 4 <= 24 * 1024 else min(chunk, _KAPPA_BWD_CHUNK)
     NCBLK = triton.cdiv(nc, BC)
     ND = triton.cdiv(dqk, BK)
-    NDM = triton.cdiv(d_model, BD)
     NCH = triton.cdiv(L, chunk)
     Sval = torch.zeros(B, nc, dqk, dv, device=q.device, dtype=torch.float32)
     Sden = torch.zeros(B, nc, dqk, device=q.device, dtype=torch.float32)
@@ -1661,11 +1687,10 @@ def _kappa_routed_bwd(q, k, v, h, Wr, Ww, kap, snap_val, snap_den, dnum, dden,
     BC = 16   # tl.dot gram dim >=16; nc tail cmask'd (was max(16,min(nc,16)) ≡ 16)
     BK = _kappa_bk_cap(dqk, dv, chunk, BC)   # feature-tile (loop ND) — bounds the [BT,BC*BK] tiles
     BV = _kappa_bv_tile(dqk, dv, BC, BK)     # value-tile (loop ND_V) so the [BC*BK,BV] state slices fit
-    BD = max(16, triton.next_power_of_2(d_model))
+    BD, NDM = _router_bd_ndm(d_model, b)     # F5: cap BD so the [BD,BB] router tile fits SRAM (NDM-tiled)
     BB = max(16, triton.next_power_of_2(b))
     NCBLK = triton.cdiv(nc, BC)
     ND = triton.cdiv(dqk, BK)
-    NDM = triton.cdiv(d_model, BD)
     NCH = triton.cdiv(L, chunk)
     # dvv/dq/dk are written with v's / q's row strides (sv_l=v.stride(1)=dv, sq_l=q.stride(1)=dqk), so
     # they MUST be allocated at the TRUE dv/dqk width (NOT padded BV/BK) or the row layout corrupts for
