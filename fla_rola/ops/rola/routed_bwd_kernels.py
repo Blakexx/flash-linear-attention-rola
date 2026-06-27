@@ -7,32 +7,38 @@
 # a prototype, they are the live backward.
 #
 # RoLA's intra readout is  o = (G ⊙ R ⊙ causal) · v,  G = q·kᵀ (content gram over dqk), R = r·wᵀ
-# (routing gram over nc states). Tree-routing computes R IN-KERNEL from the hidden state h + per-level
-# router weights, so the [L,nc] read/write gates r,w (and their grads dr,dw) are NEVER materialized —
-# the nc states are leaves of a D-level tree with branching b (b^D = nc) and the routing gram factorizes
-# as a Hadamard of per-level rank-b grams  R = ⊙_i softmax(h·Wr_i)·softmax(h·Ww_i)ᵀ.
+# (routing gram over nc states). Tree-routing builds R IN-KERNEL from the PRECOMPUTED per-level logits
+# lr,lw ∈ [BH,L,D,b] (F2b: the per-head h·Wr/h·Ww d_model-contraction is a cuBLAS GEMM in the layer), so
+# the [L,nc] read/write gates r,w (and their grads dr,dw) are NEVER materialized — the nc states are leaves
+# of a D-level tree with branching b (b^D = nc) and the routing gram factorizes as a Hadamard of per-level
+# rank-b grams  R = ⊙_i softmax(lr_i)·softmax(lw_i)ᵀ.
 #
 # BACKWARD chain (validated vs torch.autograd.grad(ref) to rel < 5e-3 bf16 for flat/square/tree):
 #   d_o -> (intra gram bwd + inter recurrent reverse state-adjoint scan) -> dr,dw [BT,nc] TRANSIENT
-#       -> tree factorization bwd (Sel gather + softmax jacobian) -> dWr,dWw,d_h ; plus dq,dk,dv.
+#       -> tree factorization bwd (Sel gather + softmax jacobian) -> per-level LOGIT grads dlr,dlw ; plus
+#          dq,dk,dv,d_h(decay-only). dWr/dWw/d_h(routing)/db then flow through the cuBLAS GEMM-backward
+#          (autograd through `_router_logits`/`_factor_logits`) — NOT an in-kernel atomic h·W fold.
 # The gate grads dr,dw live ONLY as transient [BT,nc] tiles, consumed in-kernel and folded — never [L,nc].
 #
 # Device helpers (shared by the four kernels below):
-#   _build_factors : rebuilds the [BT,BC] read/write gate tiles for an nc-block (mirrors the forward's
-#                    in-kernel factor construction; recomputed, never saved as [L,nc]). Also returns the
-#                    per-level softmax factors fr/fw + selector sel (F3) so the fold can REUSE them.
+#   _build_factors : rebuilds the [BT,BC] read/write gate tiles for an nc-block by softmax+gathering the
+#                    PRECOMPUTED logits (mirrors the forward `_build_rw_tile_logits`; never saved as
+#                    [L,nc]). Also returns the per-level softmax factors fr/fw + selector sel (F3) so the
+#                    fold can REUSE them.
 #   _fold_level    : the router-grad fold for ONE tree level — takes the CACHED fr,fw,sel (no recompute;
 #                    F3), gathers the transient [BT,BC] gate-grads to dfr,dfw [BT,b], applies the softmax
-#                    jacobian to get the logit grads, and atomic-adds into dWr,dWw,d_h (+ optional bias
-#                    db). This is where dr,dw die.
+#                    jacobian, and atomic-adds the result into the per-level LOGIT-grad buffers dlr,dlw
+#                    [BH,L,D,b] (the routing bias grad db + dWr/dWw/d_h come from the GEMM-backward). This
+#                    is where dr,dw die.
 # Backward kernels (one launch / per-chunk launches; see chunk.py drivers):
 #   _bwd_intra_kernel       : intra gram bwd — dq,dk,dv-intra + the dr,dw-intra fold (one launch).
 #   _bwd_inter_read_kernel  : inter readout bwd — dr,dq from o_inter; folds dS_read into the ds adjoint.
 #   _bwd_inter_state_kernel : inter state-update bwd — dw,dk,dv from the state write (reads ds = adjoint
 #                             of S_{j+1}); must run BEFORE the read kernel folds dS_read for this chunk.
-#   _fold_kernel            : folds the combined inter gate-grad tiles (gdr,gdw [BT,nc]) -> dWr,dWw,d_h.
-# All four honor the optional per-level routing bias b_r/b_w and the optional per-state log-decay (USE_G,
-# the GLA variant) exactly as the forward does.
+#   _fold_kernel            : folds the combined inter gate-grad tiles (gdr,gdw [BT,nc]) -> dlr,dlw (+ the
+#                             GLA decay's dWg/dh, which stay in-kernel).
+# All four take the precomputed logits and the optional per-state log-decay (USE_G, the GLA variant), with
+# the routing bias folded into the logits — exactly as the forward does.
 
 import triton
 import triton.language as tl
@@ -40,12 +46,12 @@ import triton.language as tl
 # --- backward kernels --------------------------------------------------------------------------
 #
 # In-kernel device helpers shared by the backward kernels:
-#   _build_factors : rebuilds the [BT,BC] read/write gate tiles for an nc-block (mirrors the
-#                    forward's in-kernel factor construction; recomputed, never saved as [L,nc]).
+#   _build_factors : rebuilds the [BT,BC] read/write gate tiles for an nc-block by softmax+gathering the
+#                    PRECOMPUTED logits (mirrors the forward `_build_rw_tile_logits`; never saved as [L,nc]).
 #                    Returns the per-level softmax factors fr/fw + selector sel (F3) for fold reuse.
 #   _fold_level    : the router-grad fold for ONE tree level — takes the CACHED fr,fw,sel (no
 #                    recompute; F3), gathers the transient [BT,BC] gate-grads to dfr,dfw [BT,b],
-#                    applies the softmax jacobian to the logit grads, atomic-adds into dWr,dWw,d_h.
+#                    applies the softmax jacobian, atomic-adds into the per-level LOGIT grads dlr,dlw.
 
 @triton.jit
 def _fold_level(dr_tile, dw_tile, r_tile, w_tile, fr, fw, sel,
@@ -116,12 +122,14 @@ def _build_factors(lr_ptr, lw_ptr, sel_ptr, cols, cmask,
 # ============================================================================
 # IN-KERNEL per-state log-decay (#45). The GLA scalar decay ld[t,c] is FUSED — computed in-kernel from a
 # PER-HEAD decay weight Wg ∈ [H, d_model] (the layer's `w_g.weight`, a per-head scalar gate) + the write
-# tile w that `_build_rw_tile`/`_build_factors` already produces — instead of being a precomputed
-# [B,T,H,nc] INPUT (which materialized [L,nc]). Replicates `RoLA._log_decay` (layers/rola.py) EXACTLY:
+# tile w that `_build_rw_tile_logits`/`_build_factors` already produces (by softmax+gathering the
+# precomputed logits) — instead of being a precomputed [B,T,H,nc] INPUT (which materialized [L,nc]).
+# Replicates `RoLA._log_decay` (layers/rola.py) EXACTLY:
 #   alpha = sigmoid(h · Wg[head])                       # per-head scalar in (0,1); logsigmoid().exp()==sigmoid
 #   ld[t,c] = clamp(log(clamp(1 - w[t,c]·(1-alpha[t]), 1e-8)), min=GLA_FLOOR)
-# `_build_alpha` is the BD-blocked logit→sigmoid (mirrors the per-level logit loop); wg_ptr is offset to
-# THIS head (head = pid_b % H) by the CALLER, exactly like wr_ptr/ww_ptr. `_ld_from_w` turns the write
+# `_build_alpha` is the BD-blocked h·Wg sigmoid — the GENUINE in-kernel d_model contraction that REMAINS
+# post-F2b (the routing h·Wr/h·Ww moved to a cuBLAS GEMM; this tiny [d_model]→1 per-head decay logit stays
+# fused). wg_ptr is offset to THIS head (head = pid_b % H) by the CALLER. `_ld_from_w` turns the write
 # tile into the floored ld. Defined here (the dependency-free bwd-kernel module) and imported by chunk.py
 # (the forward kernels) so there is ONE definition — no per-file re-encode. RLA (USE_G=False) calls
 # neither. The decay-grad fold (dWg, the extra dh, and dw_decay→dWw) lives in `_fold_kernel` below.

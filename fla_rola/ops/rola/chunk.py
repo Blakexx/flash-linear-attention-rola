@@ -187,18 +187,20 @@ _ROUTER_BD_MAX = 256       # absolute BD cap (bounds the hc[BT,BD] tile + keeps 
 
 
 def _router_bd_ndm(d_model, b):
-    """BD (the d_model tile width of the IN-KERNEL router build — `_build_rw_tile`/`_build_factors`/
-    `_build_alpha`, all of which loop `for dm in range(NDM)`) RIGHT-SIZED to the LARGEST pow2 whose
-    [BD, BB] router-weight tile fits a safe SRAM fraction, with NDM=cdiv(d_model, BD) tiling the rest.
-    For small d_model this returns BD=next_pow2(d_model), NDM=1 — byte-identical to the un-tiled build.
+    """BD (the d_model tile width of the IN-KERNEL DECAY build — post-F2b only `_build_alpha` (the GLA
+    decay h·Wg) loops `for dm in range(NDM)`; the routing factors are now precomputed logits loaded by
+    `_build_rw_tile_logits`/`_build_factors`, NOT an in-kernel h·W contraction) RIGHT-SIZED to the LARGEST
+    pow2 whose [BD, BB] decay-weight tile fits a safe SRAM fraction, with NDM=cdiv(d_model, BD) tiling the
+    rest. For small d_model this returns BD=next_pow2(d_model), NDM=1 — byte-identical to the un-tiled build.
 
-    F5: with the old BD=next_pow2(d_model) the whole router weight was ONE block (NDM=1), so flat
+    F5: with the old BD=next_pow2(d_model) the whole decay weight was ONE block (NDM=1), so flat
     nc=64/256 at d_model=1024 (BD=1024) OOM'd. Capping BD by a FIXED byte budget keeps the tile in SRAM;
     crucially we pick the LARGEST BD that fits (small NDM) — NOT the smallest — so the constexpr `for dm in
     range(NDM)` unroll stays short (fast compile + good ILP). For the common small-b routings (BB=16) BD
     lands at the 256 cap (NDM=4 at d_model=1024); only true flat routing (BB=nc large) drives NDM up,
-    because [BD,BB] is intrinsically wide there. All builders NDM-loop, so the cap only splits the d_model
-    reduction into NDM blocks (output unchanged to fp tolerance)."""
+    because [BD,BB] is intrinsically wide there. `_build_alpha` NDM-loops, so the cap only splits the d_model
+    decay reduction into NDM blocks (output unchanged to fp tolerance). (Pre-F2b this also sized the router
+    h·W build; that contraction is now a cuBLAS GEMM in the layer, so BD/NDM gate only the decay now.)"""
     BB = max(16, triton.next_power_of_2(b))
     bd_full = max(16, triton.next_power_of_2(d_model))
     bd_cap = triton.next_power_of_2(max(1, _ROUTER_BD_BUDGET // BB))
@@ -223,28 +225,30 @@ def _prune_bv(configs, named_args, **kwargs):
 # In-kernel TREE-ROUTING forward (RLA). The matching BACKWARD lives just below (`_RoLARoutedFn`).
 #
 # The production tree-routing forward (the validated prototype since promoted; its backward kernels now
-# live in `routed_bwd_kernels.py`): instead of taking PRECOMPUTED gates
-# r,w ∈ [L,nc] and forming R = r·wᵀ, the routing gram is built IN-KERNEL from the hidden state h and the
-# PER-HEAD router weights Wr,Ww ∈ [H, D, d_model, b] (b^D = nc, per head; the kernel indexes head = the
-# B·H fold-row % H), never materializing the [L,nc] gates.
+# live in `routed_bwd_kernels.py`): instead of taking PRECOMPUTED gates r,w ∈ [L,nc] and forming R = r·wᵀ,
+# the routing gram is built IN-KERNEL from the PRECOMPUTED per-level logits lr,lw ∈ [BH,L,D,b] (F2b: the
+# per-head h·Wr/h·Ww d_model-contraction is a cuBLAS GEMM in the layer — `_router_logits`/`_factor_logits`),
+# never materializing the [L,nc] gates.
 #
 # This is a SOURCE SWAP, not a new pipeline: the inner machinery is the same shared-gram RLA forward
 # structure (collapse-intra over state-blocks + NB-fused inter scan, the same
 # autotune configs, the same BG state-block SMEM-tiling). The ONLY change is the block that produced the
-# [BT,BG] routing tiles:  `tl.load(rg/wg)`  →  `_build_rw_tile` (per-level softmax factors gathered to
-# the BG state-block via one-hot Sel maps). The reconstructed gate tiles live transiently in SRAM at the
-# state-block width BG; the dominant [L,nc] gate tensor is never allocated.
+# [BT,BG] routing tiles:  `tl.load(rg/wg)`  →  `_build_rw_tile_logits` (load the per-level logits, softmax,
+# then gather via one-hot Sel maps and Hadamard-fold over levels — NO in-kernel h·W contraction). The
+# reconstructed gate tiles live transiently in SRAM at the state-block width BG; the dominant [L,nc] gate
+# tensor is never allocated.
 #
 # The factorization (proven in the prototype, validated <1e-2 vs autograd):
-#   r[:, c] = Π_lvl softmax(h·Wr[lvl])[:, digit_lvl(c)],   R = r·wᵀ = ⊙_lvl (fr_lvl·fw_lvlᵀ)
-# with the per-level [BT,b] softmax factors fr,fw gathered to the nc-leaf block by Sel[lvl][b, nc].
+#   r[:, c] = Π_lvl softmax(lr[lvl])[:, digit_lvl(c)],   R = r·wᵀ = ⊙_lvl (fr_lvl·fw_lvlᵀ)
+# with the per-level [BT,b] softmax factors fr,fw (of the precomputed logits lr=h·Wr+b_r) gathered to the
+# nc-leaf block by Sel[lvl][b, nc].
 #
-# BACKWARD (router-grad fold dWr,dWw,d_h) is BELOW: `_RoLARoutedFn` wraps this forward — backward drives
-# the validated fold kernels (`_bwd_intra_kernel`, `_bwd_inter_*`, `_fold_*` from
-# `routed_bwd_kernels.py`) at the PRODUCTION state-block width (BC=BG), and
-# folds the transient [BT,nc] gate-grads into dWr/dWw/d_h in-kernel (the [L,nc] grads never materialize).
-# The forward builds the SAME `sel` map the bwd needs and routes through the SAME [BT,BG] factor
-# reconstruction (`_build_rw_tile`) the fold recomputes.
+# BACKWARD is BELOW: `_RoLARoutedFn` wraps this forward — backward drives the validated fold kernels
+# (`_bwd_intra_kernel`, `_bwd_inter_*`, `_fold_*` from `routed_bwd_kernels.py`) at the PRODUCTION
+# state-block width (BC=BG), and folds the transient [BT,nc] gate-grads into the per-level LOGIT grads
+# dlr/dlw in-kernel (the [L,nc] grads never materialize); dWr/dWw/d_h then flow through the cuBLAS
+# GEMM-backward (autograd). The forward builds the SAME `sel` map the bwd needs and routes through the SAME
+# [BT,BG] factor reconstruction (`_build_rw_tile_logits` ≡ `_build_factors`) the fold reuses.
 # ============================================================================
 
 
@@ -306,18 +310,19 @@ def _build_rw_tile_logits(lr_ptr, lw_ptr, sel_ptr, offs_c, cmask,
                           D: tl.constexpr, BT: tl.constexpr, BB: tl.constexpr,
                           BG: tl.constexpr, BUILD_R: tl.constexpr = True):
     """F2b: build the [BT, BG] read/write routing tiles for ONE state-block (the BG-wide nc slice offs_c)
-    from PRECOMPUTED per-level logits lr,lw ∈ [BH, L, D, b] — the cuBLAS-GEMM stand-in for the in-kernel
-    h·Wr/h·Ww d_model-contraction (`_build_rw_tile`). The expensive d_model reduction is now a cuBLAS
-    GEMM in the layer (full occupancy + tensor cores); the kernel does ONLY softmax + the one-hot Sel
-    gather + the Hadamard fold over levels. The optional routing bias is ALREADY folded into the logits
-    (the GEMM computes softmax-input h·W+b), so no bias arg here. The per-(token,level,branch) logits are
-    indexed by bn (the BH fold-row, == pid; NO per-head offset — the logits tensor is already per-head).
-    The [L,nc] gates are NEVER materialized — only this state-block's transient [BT,BG] tiles. BUILD_R
-    (#37): when False skip the read factor (write-only callers), bit-identical write tile.
+    from PRECOMPUTED per-level logits lr,lw ∈ [BH, L, D, b] — the per-head h·Wr/h·Ww d_model-contraction is
+    now a cuBLAS GEMM in the layer (`_router_logits`/`_factor_logits`, full occupancy + tensor cores), so
+    the kernel does ONLY softmax + the one-hot Sel gather + the Hadamard fold over levels (NO in-kernel h·W).
+    The optional routing bias is ALREADY folded into the logits (the GEMM computes softmax-input h·W+b), so
+    no bias arg here. The per-(token,level,branch) logits are indexed by bn (the BH fold-row, == pid; NO
+    per-head offset — the logits tensor is already per-head). The [L,nc] gates are NEVER materialized — only
+    this state-block's transient [BT,BG] tiles. BUILD_R (#37): when False skip the read factor (write-only
+    callers), bit-identical write tile.
 
-    Bit-faithful to `_build_rw_tile`: the per-level softmax (stable max-subtraction), the Sel gather, and
-    the Hadamard accumulation are byte-for-byte the same ops — only the logit SOURCE changed (load vs
-    in-kernel h·W). lr/lw are loaded at their stored dtype and upcast to fp32 for the softmax."""
+    The per-level softmax (stable max-subtraction), the Sel gather, and the Hadamard accumulation are
+    exactly the proven shared-gram factor reconstruction (≡ the backward's `_build_factors`) — only the
+    logit SOURCE is a load, not an in-kernel h·W contraction. lr/lw are loaded at their stored dtype and
+    upcast to fp32 for the softmax."""
     r_tile = tl.full([BT, BG], 1.0, dtype=tl.float32)
     w_tile = tl.full([BT, BG], 1.0, dtype=tl.float32)
     neg = tl.full([BT, BB], float('-inf'), dtype=tl.float32)
@@ -554,24 +559,27 @@ def _rola_rla_routed_fwd(q, k, v, h, Wr, Ww, D, b, chunk=None, BG=16):
 
 # ============================================================================
 # In-kernel TREE-ROUTING BACKWARD (RLA) — the router-grad fold that makes the production routed path
-# trainable end-to-end. Given d_o, compute dq,dk,dv,d_h,dWr,dWw with the [L,nc] gate grads dr,dw NEVER
-# materialized: they live only as transient [BT,BG] tiles (production state-block width), gathered
-# through the SAME one-hot `Sel` map + the SAME `_build_rw_tile` factor reconstruction the forward uses,
-# and folded in-kernel (softmax jacobian → atomic dWr/dWw/d_h).
+# trainable end-to-end. Given d_o, compute dq,dk,dv,d_h plus the per-level LOGIT grads dlr,dlw with the
+# [L,nc] gate grads dr,dw NEVER materialized: they live only as transient [BT,BG] tiles (production
+# state-block width), gathered through the SAME one-hot `Sel` map + the SAME factor reconstruction
+# (`_build_factors`, loading the precomputed logits) the forward uses, and folded in-kernel (softmax
+# jacobian → atomic dlr/dlw); dWr/dWw/d_h then flow through the cuBLAS GEMM-backward (F2b; autograd
+# through `_router_logits`/`_factor_logits`).
 #
 # The fold math is the validated backward (routed_bwd_kernels.py: _bwd_intra_kernel,
 # _bwd_inter_state_kernel, _bwd_inter_read_kernel, _fold_kernel — validated <1e-2 vs autograd for
 # flat/square/tree). Those kernels are GENERIC over the nc-block width (their `BC` constexpr); the ONLY
 # adaptation is to drive them at the PRODUCTION state-block width BC=BG and through this module's
-# `_build_sel`, so the backward routes through byte-identical factor
-# reconstruction to the production forward (`_build_rw_tile` ≡ `_build_factors`). dr,dw stay
-# transient per-chunk [B,chunk,nc] scratch tiles (gdr/gdw), OVERWRITTEN every chunk — never [L,nc].
+# `_build_sel`, so the backward routes through byte-identical factor reconstruction to the production
+# forward (`_build_factors` ≡ `_build_rw_tile_logits`). dr,dw stay transient per-chunk [B,chunk,nc] scratch
+# tiles (gdr/gdw), OVERWRITTEN every chunk — never [L,nc].
 #
 # The per-chunk pre-state snapshots S_j ∈ [B,nc,dqk,dv] the reverse-scan needs are the RECURRENT state
 # (NOT the gates), built by a dedicated in-kernel snapshot scan `_rola_routed_snap` (write gates built
-# in-kernel via `_build_rw_tile` — gates never materialized in the snapshot pass either). The forward
-# saves these snapshots; backward consumes them. The validated fold kernels are imported at module top
-# (_routed_bwd_intra / _routed_bwd_inter_state / _routed_bwd_inter_read / _routed_bwd_fold), reused VERBATIM.
+# in-kernel via `_build_rw_tile_logits` from the precomputed write logits — gates never materialized in the
+# snapshot pass either). The forward saves these snapshots; backward consumes them. The validated fold
+# kernels are imported at module top (_routed_bwd_intra / _routed_bwd_inter_state / _routed_bwd_inter_read
+# / _routed_bwd_fold), reused VERBATIM.
 # ============================================================================
 
 
