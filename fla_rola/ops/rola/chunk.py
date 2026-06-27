@@ -875,7 +875,7 @@ def _rola_rla_routed_bwd(q, k, v, h, lr, lw, do, D, b, chunk, BG, H, Wg=None):
     dld_chunk = torch.zeros(B, chunk, nc, device=q.device, dtype=torch.float32) if use_g \
         else q.new_zeros(B, 1, 1)
     inter_common = dict(D=D, b=b, BB=BB, BT=chunk, BK=BK, BV=BV, BD=BD, BC=BC,
-                        NCBLK=NCBLK, ND=ND, NDM=NDM, USE_G=use_g,
+                        ND=ND, NDM=NDM, USE_G=use_g,
                         GLA_FLOOR=_GLA_FLOOR, num_warps=4, num_stages=1)
     for c in reversed(range(NCH)):
         Sj = snap[:, c].contiguous()
@@ -922,7 +922,7 @@ def _rola_rla_routed_bwd(q, k, v, h, lr, lw, do, D, b, chunk, BG, H, Wg=None):
             sel.stride(0), sel.stride(1), sel.stride(2),
             gdr.stride(0), gdr.stride(1), gdr.stride(2), dh.stride(0), dh.stride(1), dh.stride(2),
             swg[0], swg[1],
-            D=D, b=b, BB=BB, BT=chunk, BC=BC, BD=BD, NCBLK=NCBLK, NDM=NDM,
+            D=D, b=b, BB=BB, BT=chunk, BC=BC, BD=BD, NDM=NDM,
             USE_G=use_g, GLA_FLOOR=_GLA_FLOOR, num_warps=4, num_stages=1)
     if use_g:
         return dq[..., :dqk], dk[..., :dqk], dvv[..., :dv], dh, dlr, dlw, dWg
@@ -1383,7 +1383,7 @@ def _kappa_bwd_state(h_ptr, k_ptr, v_ptr, lr_ptr, lw_ptr, sel_ptr, wg_ptr, sval_
                      ssv_b, ssv_k, ssv_v, ssd_b, ssd_k, sgd_b, sgd_t, sgd_c, sga_b, sga_l, sga_c,
                      D: tl.constexpr, b: tl.constexpr, BB: tl.constexpr,
                      BT: tl.constexpr, BK: tl.constexpr, BV: tl.constexpr, BD: tl.constexpr,
-                     BC: tl.constexpr, NCBLK: tl.constexpr, ND: tl.constexpr, NDM: tl.constexpr,
+                     BC: tl.constexpr, ND: tl.constexpr, NDM: tl.constexpr,
                      USE_G: tl.constexpr, GLA_FLOOR: tl.constexpr):
     """State-update backward (split #1, SMEM-bound by the dSval tile). Grid (B·H, NCBLK): ONE program owns
     ONE nc-state-block cb=program_id(1) (was an in-program serial `for cb` loop) — the #58 occupancy widen
@@ -1496,7 +1496,7 @@ def _kappa_bwd_read(h_ptr, q_ptr, k_ptr, v_ptr, lr_ptr, lw_ptr, sel_ptr, kap_ptr
                     GLOBAL: tl.constexpr, PER_STATE: tl.constexpr, EPS: tl.constexpr,
                     D: tl.constexpr, b: tl.constexpr, BB: tl.constexpr,
                     BT: tl.constexpr, BK: tl.constexpr, BV: tl.constexpr, BD: tl.constexpr,
-                    BC: tl.constexpr, NCBLK: tl.constexpr, ND: tl.constexpr, NDM: tl.constexpr,
+                    BC: tl.constexpr, ND: tl.constexpr, NDM: tl.constexpr,
                     USE_G: tl.constexpr, GLA_FLOOR: tl.constexpr):
     """Readout/den/d backward (split #2, SMEM-bound by the sval snapshot tile). Grid (B·H, NCBLK): ONE
     program owns ONE nc-state-block cb=program_id(1) (was an in-program serial `for cb` loop) — the #58
@@ -1763,10 +1763,10 @@ def _kappa_routed_bwd(q, k, v, h, lr, lw, kap, snap_val, snap_den, dnum, dden,
     sSV = (dSval.stride(0), dSval.stride(2), dSval.stride(3))   # (B, flat-k=dqk-axis, v)
     sSD = (dSden.stride(0), dSden.stride(2))                    # (B, flat-k)
     sGD = (gdr.stride(0), gdr.stride(1), gdr.stride(2))
-    state_common = dict(D=D, b=b, BB=BB, BT=chunk, BK=BK, BV=BV, BD=BD, BC=BC, NCBLK=NCBLK, ND=ND,
+    state_common = dict(D=D, b=b, BB=BB, BT=chunk, BK=BK, BV=BV, BD=BD, BC=BC, ND=ND,
                         NDM=NDM, USE_G=use_g, GLA_FLOOR=_GLA_FLOOR, num_warps=4, num_stages=1)
     read_common = dict(GLOBAL=global_norm, PER_STATE=per_state, EPS=eps, D=D, b=b, BB=BB, BT=chunk,
-                       BK=BK, BV=BV, BD=BD, BC=BC, NCBLK=NCBLK, ND=ND, NDM=NDM,
+                       BK=BK, BV=BV, BD=BD, BC=BC, ND=ND, NDM=NDM,
                        USE_G=use_g, GLA_FLOOR=_GLA_FLOOR, num_warps=4, num_stages=1)
     for c in reversed(range(NCH)):
         Sval = snap_val[c]    # F6: NCH-leading layout → per-chunk slice is already contiguous (no copy)
@@ -1809,7 +1809,7 @@ def _kappa_routed_bwd(q, k, v, h, lr, lw, kap, snap_val, snap_den, dnum, dden,
             L, d_model, nc, c * chunk, H, *sH, *slo, *sSel,
             gdr.stride(0), gdr.stride(1), gdr.stride(2), dh.stride(0), dh.stride(1), dh.stride(2),
             swg[0], swg[1],
-            D=D, b=b, BB=BB, BT=chunk, BC=BC, BD=BD, NCBLK=NCBLK, NDM=NDM,
+            D=D, b=b, BB=BB, BT=chunk, BC=BC, BD=BD, NDM=NDM,
             USE_G=use_g, GLA_FLOOR=_GLA_FLOOR, num_warps=4, num_stages=1)
     if use_g:
         return (dq[..., :dqk], dk[..., :dqk], dvv[..., :dv], dh, dlr, dlw, dkap, dWg)

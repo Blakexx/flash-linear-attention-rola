@@ -321,7 +321,7 @@ def _bwd_inter_read_kernel(
     so_b, so_l, so_v, sg_b, sg_t, sg_c, sga_b, sga_l, sga_c,
     D: tl.constexpr, b: tl.constexpr, BB: tl.constexpr,
     BT: tl.constexpr, BK: tl.constexpr, BV: tl.constexpr, BD: tl.constexpr,
-    BC: tl.constexpr, NCBLK: tl.constexpr, ND: tl.constexpr, NDM: tl.constexpr,
+    BC: tl.constexpr, ND: tl.constexpr, NDM: tl.constexpr,
     USE_G: tl.constexpr = False, GLA_FLOOR: tl.constexpr = -2.5,
 ):
     # #58 grid (B·H, NCBLK): ONE program owns ONE nc-state-block cb=program_id(1) (was an in-program serial
@@ -417,7 +417,7 @@ def _bwd_inter_state_kernel(
     sg_b, sg_t, sg_c, sga_b, sga_l, sga_c,
     D: tl.constexpr, b: tl.constexpr, BB: tl.constexpr,
     BT: tl.constexpr, BK: tl.constexpr, BV: tl.constexpr, BD: tl.constexpr,
-    BC: tl.constexpr, NCBLK: tl.constexpr, ND: tl.constexpr, NDM: tl.constexpr,
+    BC: tl.constexpr, ND: tl.constexpr, NDM: tl.constexpr,
     USE_G: tl.constexpr = False, GLA_FLOOR: tl.constexpr = -2.5,
 ):
     # #58 grid (B·H, NCBLK): ONE program owns ONE nc-state-block cb=program_id(1) (was an in-program serial
@@ -519,7 +519,7 @@ def _fold_kernel(
     swg_head, swg_d,
     D: tl.constexpr, b: tl.constexpr, BB: tl.constexpr,
     BT: tl.constexpr, BC: tl.constexpr, BD: tl.constexpr,
-    NCBLK: tl.constexpr, NDM: tl.constexpr,
+    NDM: tl.constexpr,
     USE_G: tl.constexpr = False, GLA_FLOOR: tl.constexpr = -2.5,
 ):
     # #58 grid (B·H, NCBLK): ONE program owns ONE nc-state-block cb=program_id(1) (was an in-program serial
@@ -547,7 +547,7 @@ def _fold_kernel(
     if USE_G:
         alpha = _build_alpha(h_ptr, wg_ptr, pid_b, rows, rmask, d_model,
                              sh_b, sh_l, sh_d, swg_d, BT, BD, NDM)
-        dz = tl.zeros([BT], dtype=tl.float32)    # Σ_c ∂L/∂z, accumulated over ALL nc-blocks
+        dz = tl.zeros([BT], dtype=tl.float32)    # this block's ∂L/∂z PARTIAL → recombined via atomic_add into dWg/dh post-loop
     cb = tl.program_id(1)
     cols = cb * BC + offs_c
     cmask = cols < nc

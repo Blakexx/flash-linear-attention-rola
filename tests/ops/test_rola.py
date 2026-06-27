@@ -781,6 +781,28 @@ class TestInterCorrectness:
             pytest.skip('RoLA Triton kernels require CUDA')
         self._routed_fwd_bwd_check(norm, gla=False, bias=bias, D=D, b=b, Kd=16, dv=16)
 
+    @pytest.mark.parametrize('norm', ['kappa', 'global', 'raw'])
+    @pytest.mark.parametrize('gla', [False, True])
+    def test_routed_bwd_nc256_concurrent_cb(self, gla, norm):
+        """#58 regression — LOCKS the parallel nc-state-block axis in the routed BACKWARD. The standard
+        routed-bwd grid (test_routed_fwd_bwd / nc16_depth4) tops out at nc≤16 → NCBLK=cdiv(nc,BC)=1, so it
+        runs exactly ONE nc-state-block per (batch-head) program and NEVER exercises CONCURRENT cb programs.
+        This node runs nc=256 (tree D=8,b=2 → NCBLK=16), so the backward kernels launch grid (B·H, NCBLK)
+        with 16 cb-axis programs PER batch-head writing dk/dv/dq (token-indexed `tl.atomic_add`) and the
+        gd*/gda/dWg/dh partials CONCURRENTLY into shared locations. norm='raw' drives the RLA-raw inter
+        kernels (`_bwd_inter_state`/`_bwd_inter_read`); 'kappa'/'global' drive the kappa kernels
+        (`_kappa_bwd_state`/`_kappa_bwd_read`); both paths hit `_fold_kernel` — all five #58-parallelized
+        kernels. Validated against the SAME fp64 canonical per-head-gate reference + `_chunk_rola_impl` as
+        test_routed_fwd_bwd (dq/dk/dv to the tight 8e-3 floor, the gate/kappa grads to their bounds). FAILS
+        BY CONSTRUCTION if a cross-cb atomic is reverted to a plain store: the 16 concurrent cb partials
+        race / last-writer-win on the shared output, dropping ~15/16 of that gradient. Verified — reverting
+        the dkappa atomic_add (a SOLE-source cross-cb reduction, unmaskable) drives the kappa grad to ~9.7e-1
+        vs ~1e-3 for every untouched grad, far past the 2.5e-2 bound; this node trips. RLA + GLA. Small
+        B/H/T — the point is NCBLK=16, not size."""
+        if device != 'cuda':
+            pytest.skip('RoLA Triton kernels require CUDA')
+        self._routed_fwd_bwd_check(norm, gla=gla, bias=False, D=8, b=2, Kd=16, dv=16)
+
     def _routed_fwd_bwd_check(self, norm, gla, bias, D, b, Kd, dv):
         """The shared fused-vs-fp64-reference forward+backward check body (see test_routed_fwd_bwd)."""
         B, H, T, dm = 2, 2, 64, 40
