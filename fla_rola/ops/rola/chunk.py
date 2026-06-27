@@ -1338,7 +1338,10 @@ def _kappa_routed_fwd(q, k, v, h, lr, lw, kap, D, b, sel, chunk, global_norm, pe
             Sden.stride(0), Sden.stride(1), Sden.stride(2),
             num.stride(0), num.stride(1), num.stride(2), den.stride(0), den.stride(1),
             **common)
-    return num, den, snap_val, snap_den
+    # Return the SMEM-fitted `chunk` actually used: the backward's reverse-scan must drive the SAME chunk
+    # as this recompute (NCH / per-chunk snapshot alignment) — threading it out is the single source of
+    # truth (no re-fit-must-match-the-fit coupling).
+    return num, den, snap_val, snap_den, chunk
 
 
 @triton.jit
@@ -1821,8 +1824,8 @@ class _RoLARoutedKappaFn(torch.autograd.Function):
         sel = _build_sel(D, b, nc, q.device)
         q, k, v, h, lr, lw, kap = (x.contiguous() for x in (q, k, v, h, lr, lw, kap))
         Wgc = Wg.contiguous() if Wg is not None else None
-        num, den, _sv, _sd = _kappa_routed_fwd(q, k, v, h, lr, lw, kap, D, b, sel, chunk,
-                                               global_norm, per_state, eps, H, Wg=Wgc)
+        num, den, _sv, _sd, _ck = _kappa_routed_fwd(q, k, v, h, lr, lw, kap, D, b, sel, chunk,
+                                                    global_norm, per_state, eps, H, Wg=Wgc)
         # #45: the GLA decay's saved activation is the [H,d_model] Wg (NOT a [L,nc] ld) — the saved-act win.
         ctx.save_for_backward(q, k, v, h, lr, lw, kap, Wgc)
         ctx.D, ctx.b, ctx.chunk, ctx.H = D, b, chunk, H
@@ -1839,19 +1842,18 @@ class _RoLARoutedKappaFn(torch.autograd.Function):
         global_norm, per_state, eps = ctx.global_norm, ctx.per_state, ctx.eps
         nc = b ** D
         sel = _build_sel(D, b, nc, q.device)
-        # SMEM-derive the backward chunk ONCE here so the recompute-forward AND the reverse-scan agree on
-        # NCH / the per-chunk snapshot alignment (both receive this fitted `chunk`). The fused kappa backward
-        # is a single mega-kernel; its dominant fp32 tile is the SAME [BT, BC·BK] as the forward, so it fits
-        # against the SAME budget — on a 99KB card this lands at the full 64 (the bwd read kernel measures
-        # 61KB < 99KB at chunk=64), graded down on smaller cards. No separate _KAPPA_BWD_CHUNK constant.
-        dqkb, dvb = q.shape[-1], v.shape[-1]
-        chunk = _fit_chunk(min(chunk, _CHUNK), _kappa_row_bytes(_kappa_bk_cap(dqkb, dvb, min(chunk, _CHUNK), 16)))
         # F4: the routing LOGITS lr/lw stay in their input dtype (bf16) — the router build is a bounded
         # softmax (the kernels upcast to fp32 internally). q/k/v/kap keep fp32 (den/decay-sensitive path).
         q, k, v, kap = (x.float().contiguous() for x in (q, k, v, kap))
         h, lr, lw = (x.contiguous() for x in (h, lr, lw))
         Wgf = Wg.float().contiguous() if use_g else None
-        _num, _den, snap_val, snap_den = _kappa_routed_fwd(
+        # The recompute-forward SMEM-fits the chunk internally and RETURNS the value it used; the reverse-scan
+        # below drives that SAME chunk → NCH / per-chunk snapshot alignment is guaranteed (single source of
+        # truth, no separate _KAPPA_BWD_CHUNK and no re-fit-must-match coupling). The fused kappa backward is a
+        # single mega-kernel; its dominant fp32 tile is the SAME [BT, BC·BK] as the forward, so it fits the
+        # SAME budget — on a 99KB card the full 64 (the bwd read kernel measures 61KB < 99KB), graded down on
+        # smaller cards.
+        _num, _den, snap_val, snap_den, chunk = _kappa_routed_fwd(
             q, k, v, h, lr, lw, kap, D, b, sel, chunk, global_norm, per_state, eps,
             H, Wg=Wgf, need_snapshots=True)
         grads = _kappa_routed_bwd(
