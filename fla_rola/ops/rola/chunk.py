@@ -261,6 +261,30 @@ def _build_sel(D, b, nc, device):
     return sel
 
 
+def _router_logits(h, Wr, Ww, b_r, b_w, H, build_r=True):
+    """F2b: the per-level routing logits lr,lw ∈ [BH, L, D, b] = (h·Wr+b_r, h·Ww+b_w) — the cuBLAS GEMM
+    that REPLACES the in-kernel h·W d_model-contraction (the design-point kernel's 72%). h is the folded
+    [BH, L, d_model] (BH=(B,H)); Wr,Ww ∈ [H,D,d_model,b] per-head; bias ∈ [H,D,b] or None. Returns the
+    per-head-folded logits the kernel loads (`_build_rw_tile_logits`) instead of recomputing — the routing
+    bias is folded in HERE (softmax(h·W+b) input), so the kernel never sees the weights/bias. `build_r`
+    False (write-only callers) returns lr=None. This is a torch einsum → cuBLAS, autograd-tracked when
+    h/Wr/Ww require grad (F2b backward routes dWr/dWw/dh through this GEMM).
+    For tree/square the logits are tiny ([L, 2·logₙc] / [L, 2√nc]); flat's are [L,1,nc] (=[L,nc], flat's
+    inherent routing cost — a topology/config choice, not a kernel branch)."""
+    BH, L, dm = h.shape
+    Bb = BH // H
+    hr = h.reshape(Bb, H, L, dm)
+
+    def _lg(W, bias):
+        z = torch.einsum('bhld,hkdc->bhlkc', hr, W.to(h.dtype))        # [B,H,L,D,b]
+        if bias is not None:
+            z = z + bias.to(h.dtype)[None, :, None]                    # [H,D,b] -> [1,H,1,D,b]
+        return z.reshape(BH, L, W.shape[1], W.shape[3]).contiguous()   # [BH,L,D,b]
+    lw = _lg(Ww, b_w)
+    lr = _lg(Wr, b_r) if build_r else None
+    return lr, lw
+
+
 def _routing_bias(b_r, b_w, H, D, b, device, dtype=torch.float32):
     """Resolve the optional PER-HEAD routing bias b_r/b_w ∈ [H,D,b] (the affine term of softmax(h·W+b),
     per head) to (br, bw, has_bias) for the kernels. None ⇒ a 1-element dummy (never read; HAS_BIAS=False
@@ -358,36 +382,77 @@ def _build_rw_tile(h_ptr, wr_ptr, ww_ptr, sel_ptr, offs_c, cmask,
     return r_tile, w_tile
 
 
+@triton.jit
+def _build_rw_tile_logits(lr_ptr, lw_ptr, sel_ptr, offs_c, cmask,
+                          bn, rows, rmask, offs_bb, bmask,
+                          slr_b, slr_l, slr_lvl, slr_bb, slw_b, slw_l, slw_lvl, slw_bb,
+                          ssel_lvl, ssel_b, ssel_c,
+                          D: tl.constexpr, BT: tl.constexpr, BB: tl.constexpr,
+                          BG: tl.constexpr, BUILD_R: tl.constexpr = True):
+    """F2b: build the [BT, BG] read/write routing tiles for ONE state-block (the BG-wide nc slice offs_c)
+    from PRECOMPUTED per-level logits lr,lw ∈ [BH, L, D, b] — the cuBLAS-GEMM stand-in for the in-kernel
+    h·Wr/h·Ww d_model-contraction (`_build_rw_tile`). The expensive d_model reduction is now a cuBLAS
+    GEMM in the layer (full occupancy + tensor cores); the kernel does ONLY softmax + the one-hot Sel
+    gather + the Hadamard fold over levels. The optional routing bias is ALREADY folded into the logits
+    (the GEMM computes softmax-input h·W+b), so no bias arg here. The per-(token,level,branch) logits are
+    indexed by bn (the BH fold-row, == pid; NO per-head offset — the logits tensor is already per-head).
+    The [L,nc] gates are NEVER materialized — only this state-block's transient [BT,BG] tiles. BUILD_R
+    (#37): when False skip the read factor (write-only callers), bit-identical write tile.
+
+    Bit-faithful to `_build_rw_tile`: the per-level softmax (stable max-subtraction), the Sel gather, and
+    the Hadamard accumulation are byte-for-byte the same ops — only the logit SOURCE changed (load vs
+    in-kernel h·W). lr/lw are loaded at their stored dtype and upcast to fp32 for the softmax."""
+    r_tile = tl.full([BT, BG], 1.0, dtype=tl.float32)
+    w_tile = tl.full([BT, BG], 1.0, dtype=tl.float32)
+    neg = tl.full([BT, BB], float('-inf'), dtype=tl.float32)
+    for lvl in range(D):
+        lw = tl.load(lw_ptr + bn * slw_b + rows[:, None] * slw_l + lvl * slw_lvl + offs_bb[None, :] * slw_bb,
+                     mask=rmask[:, None] & bmask[None, :], other=0.0).to(tl.float32)
+        lw = tl.where(bmask[None, :], lw, neg)
+        ew = tl.exp(lw - tl.max(lw, axis=1)[:, None])
+        fw = ew / tl.sum(ew, axis=1)[:, None]   # [BT, BB] write-gate level factor
+        sel = tl.load(sel_ptr + lvl * ssel_lvl + offs_bb[:, None] * ssel_b + offs_c[None, :] * ssel_c,
+                      mask=bmask[:, None] & cmask[None, :], other=0.0)   # [BB, BG] one-hot
+        w_tile *= tl.dot(fw, sel)
+        if BUILD_R:
+            lr = tl.load(lr_ptr + bn * slr_b + rows[:, None] * slr_l + lvl * slr_lvl + offs_bb[None, :] * slr_bb,
+                         mask=rmask[:, None] & bmask[None, :], other=0.0).to(tl.float32)
+            lr = tl.where(bmask[None, :], lr, neg)
+            er = tl.exp(lr - tl.max(lr, axis=1)[:, None])
+            fr = er / tl.sum(er, axis=1)[:, None]   # [BT, BB] read-gate level factor
+            r_tile *= tl.dot(fr, sel)
+    w_tile = tl.where(cmask[None, :], w_tile, 0.0)
+    if BUILD_R:
+        r_tile = tl.where(cmask[None, :], r_tile, 0.0)
+    return r_tile, w_tile
+
+
 @triton.autotune(configs=_AT_CFGS, key=_SCAN_KEY, **autotune_cache_kwargs)  # _SCAN_KEY: +USE_G (RLA/GLA split)
 @triton.jit
-def _rola_routed_fwd_intra(q_ptr, k_ptr, v_ptr, h_ptr, wr_ptr, ww_ptr, sel_ptr, wg_ptr, outa_ptr,
-                           br_ptr, bw_ptr,
-                           L, dqk, dv, nc, d_model, H, swr_head, sww_head, sbr_head, sbw_head,
+def _rola_routed_fwd_intra(q_ptr, k_ptr, v_ptr, h_ptr, lr_ptr, lw_ptr, sel_ptr, wg_ptr, outa_ptr,
+                           L, dqk, dv, nc, d_model, H, swg_head,
                            sq_b, sq_l, sq_d, sv_b, sv_l, sv_d,
-                           sh_b, sh_l, sh_d, swr_lvl, swr_d, swr_b, sww_lvl, sww_d, sww_b,
-                           ssel_lvl, ssel_b, ssel_c, swg_head, swg_d, soa_b, soa_l, soa_v,
-                           sbr_lvl, sbr_b, sbw_lvl, sbw_b,
+                           sh_b, sh_l, sh_d, slo_b, slo_l, slo_lvl, slo_bb,
+                           ssel_lvl, ssel_b, ssel_c, swg_d, soa_b, soa_l, soa_v,
                            D: tl.constexpr, bb_: tl.constexpr, BB: tl.constexpr,
                            BT: tl.constexpr, BK: tl.constexpr, BV: tl.constexpr,
                            BG: tl.constexpr, BD: tl.constexpr,
                            ND: tl.constexpr, NB: tl.constexpr, NDM: tl.constexpr,
-                           HAS_BIAS: tl.constexpr, USE_G: tl.constexpr, GLA_FLOOR: tl.constexpr):
+                           USE_G: tl.constexpr, GLA_FLOOR: tl.constexpr):
     """TREE-ROUTED intra: the shared-gram collapse-intra structure — content gram G
     built ONCE, the full routing gram R accumulated over state-blocks IN-KERNEL, A=G⊙R⊙causal, o=A·v —
-    with the ONLY change being R's source: each state-block's [BT,BG] r/w tiles are BUILT from h+Wr,Ww via
-    `_build_rw_tile` instead of loading precomputed gates. nc collapses; output is [B,L,dv].
+    with R's source being the PRECOMPUTED per-level logits lr,lw (F2b: the h·Wr/h·Ww d_model-contraction
+    is a cuBLAS GEMM in the layer; the kernel softmax+gathers via `_build_rw_tile_logits`). nc collapses;
+    output is [B,L,dv].
     USE_G (GLA, #30 V1): the per-block gram uses the DECAYED gates rt=rgc·e^a, wt=wgc·e^-a (a = intra-chunk
-    cumsum of the per-state log-decay ld over this block's c-columns). The
+    cumsum of the per-state log-decay ld over this block's c-columns). The decay logit h·Wg STAYS in-kernel
+    (`_build_alpha`, tiny [d_model]→1 per head). The
     nc-collapse still holds (each block's decayed [BT,BG]·[BG,BT] gram is still a [BT,BT] partial)."""
     b = tl.program_id(0)
     t = tl.program_id(1)
-    # Per-head router: the BH fold is (B,H) -> head = pid_b % H. Offset Wr/Ww (and the bias) to THIS
-    # head's [D,d_model,b] slice; the inner `_build_rw_tile` then reads the head-correct factors.
+    # The routing logits lr/lw are already per-head ([BH,L,D,b], indexed by b=pid). Only the GLA decay
+    # weight Wg:[H,d_model] needs the per-head offset (BH fold is (B,H) -> head = pid % H).
     _hd = b % H
-    wr_ptr = wr_ptr + _hd * swr_head
-    ww_ptr = ww_ptr + _hd * sww_head
-    br_ptr = br_ptr + _hd * sbr_head
-    bw_ptr = bw_ptr + _hd * sbw_head
     wg_ptr = wg_ptr + _hd * swg_head
     offs_t = tl.arange(0, BT)
     offs_v = tl.arange(0, BV)
@@ -410,12 +475,10 @@ def _rola_routed_fwd_intra(q_ptr, k_ptr, v_ptr, h_ptr, wr_ptr, ww_ptr, sel_ptr, 
     for sb in range(NB):
         offs_c = sb * BG + tl.arange(0, BG)
         cmask = offs_c < nc
-        rgc, wgc = _build_rw_tile(h_ptr, wr_ptr, ww_ptr, sel_ptr, offs_c, cmask,
-                                  b, rows, rmask, offs_bb, bmask, d_model,
-                                  sh_b, sh_l, sh_d, swr_lvl, swr_d, swr_b, sww_lvl, sww_d, sww_b,
-                                  ssel_lvl, ssel_b, ssel_c,
-                                  br_ptr, bw_ptr, sbr_lvl, sbr_b, sbw_lvl, sbw_b,
-                                  D, BT, BB, BG, BD, NDM, HAS_BIAS)
+        rgc, wgc = _build_rw_tile_logits(lr_ptr, lw_ptr, sel_ptr, offs_c, cmask,
+                                         b, rows, rmask, offs_bb, bmask,
+                                         slo_b, slo_l, slo_lvl, slo_bb, slo_b, slo_l, slo_lvl, slo_bb,
+                                         ssel_lvl, ssel_b, ssel_c, D, BT, BB, BG)
         if USE_G:
             ldc = _ld_from_w(wgc, alpha, cmask, GLA_FLOOR)
             a = tl.cumsum(ldc, axis=0)
@@ -437,34 +500,28 @@ def _rola_routed_fwd_intra(q_ptr, k_ptr, v_ptr, h_ptr, wr_ptr, ww_ptr, sel_ptr, 
 @triton.autotune(configs=_SCAN_CFGS, key=_SCAN_KEY, reset_to_zero=['outa_ptr'],  # _SCAN_KEY: +USE_G
                  prune_configs_by={'early_config_prune': _prune_bv}, **autotune_cache_kwargs)
 @triton.jit
-def _rola_routed_fwd_inter(q_ptr, k_ptr, v_ptr, h_ptr, wr_ptr, ww_ptr, sel_ptr, wg_ptr, outa_ptr,
-                           br_ptr, bw_ptr,
-                           L, dqk, dv: tl.constexpr, nc, d_model,
-                           H, swr_head, sww_head, sbr_head, sbw_head,
+def _rola_routed_fwd_inter(q_ptr, k_ptr, v_ptr, h_ptr, lr_ptr, lw_ptr, sel_ptr, wg_ptr, outa_ptr,
+                           L, dqk, dv: tl.constexpr, nc, d_model, H, swg_head,
                            sq_b, sq_l, sq_d, sv_b, sv_l, sv_d,
-                           sh_b, sh_l, sh_d, swr_lvl, swr_d, swr_b, sww_lvl, sww_d, sww_b,
-                           ssel_lvl, ssel_b, ssel_c, swg_head, swg_d, soa_b, soa_n, soa_l, soa_v,
-                           sbr_lvl, sbr_b, sbw_lvl, sbw_b,
+                           sh_b, sh_l, sh_d, slo_b, slo_l, slo_lvl, slo_bb,
+                           ssel_lvl, ssel_b, ssel_c, swg_d, soa_b, soa_n, soa_l, soa_v,
                            D: tl.constexpr, bb_: tl.constexpr, BB: tl.constexpr,
                            BT: tl.constexpr, BK: tl.constexpr, BV: tl.constexpr,
                            BG: tl.constexpr, BD: tl.constexpr,
                            NCH: tl.constexpr, NDM: tl.constexpr,
-                           HAS_BIAS: tl.constexpr, USE_G: tl.constexpr, GLA_FLOOR: tl.constexpr):
+                           USE_G: tl.constexpr, GLA_FLOOR: tl.constexpr):
     """TREE-ROUTED inter: the NB-fused inter scan structure — one
     (batch, state-block, FEATURE-block) carries Sd[BK, BG*BV] across chunks, o_inter atomic-accumulated
-    into the shared [B,L,dv] buffer, value-OUTER over cdiv(dv,BV) — with the ONLY change being the read/
-    write gate source: the [BT,BG] rgc/wgc tiles are BUILT from h+Wr,Ww via `_build_rw_tile` instead of
-    loading precomputed gates. Same state scan, same SMEM bound (BK + value-tile BV), same autotune/reset_to_zero.
+    into the shared [B,L,dv] buffer, value-OUTER over cdiv(dv,BV) — with the read/write gate source being
+    the PRECOMPUTED per-level logits lr,lw via `_build_rw_tile_logits` (F2b: h·W is a cuBLAS GEMM in the
+    layer). Same state scan, same SMEM bound (BK + value-tile BV), same autotune/reset_to_zero.
     USE_G (GLA, #30 V1): the carried state decays by decvec=e^Λ each chunk, the read uses rt=rgc·e^a, the
-    write uses w_end=wgc·e^{Λ-a} (a = intra-chunk cumsum, Λ = chunk-total ld)."""
+    write uses w_end=wgc·e^{Λ-a} (a = intra-chunk cumsum, Λ = chunk-total ld); the decay logit h·Wg stays
+    in-kernel (`_build_alpha`)."""
     b = tl.program_id(0)
     sb = tl.program_id(1)
     d0 = tl.program_id(2)
-    _hd = b % H                                  # per-head router slice (BH fold is (B,H))
-    wr_ptr = wr_ptr + _hd * swr_head
-    ww_ptr = ww_ptr + _hd * sww_head
-    br_ptr = br_ptr + _hd * sbr_head
-    bw_ptr = bw_ptr + _hd * sbw_head
+    _hd = b % H                                  # per-head decay-weight slice (BH fold is (B,H))
     wg_ptr = wg_ptr + _hd * swg_head
     ND_V = (dv + BV - 1) // BV
     offs_t = tl.arange(0, BT)
@@ -483,12 +540,10 @@ def _rola_routed_fwd_inter(q_ptr, k_ptr, v_ptr, h_ptr, wr_ptr, ww_ptr, sel_ptr, 
             rmask = rows < L
             qc = tl.load(q_ptr + b*sq_b + rows[:, None]*sq_l + offs_d[None, :]*sq_d,
                          mask=rmask[:, None] & dmask[None, :], other=0.0)
-            rgc, wgc = _build_rw_tile(h_ptr, wr_ptr, ww_ptr, sel_ptr, offs_c, cmask,
-                                      b, rows, rmask, offs_bb, bmask, d_model,
-                                      sh_b, sh_l, sh_d, swr_lvl, swr_d, swr_b, sww_lvl, sww_d, sww_b,
-                                      ssel_lvl, ssel_b, ssel_c,
-                                  br_ptr, bw_ptr, sbr_lvl, sbr_b, sbw_lvl, sbw_b,
-                                  D, BT, BB, BG, BD, NDM, HAS_BIAS)
+            rgc, wgc = _build_rw_tile_logits(lr_ptr, lw_ptr, sel_ptr, offs_c, cmask,
+                                             b, rows, rmask, offs_bb, bmask,
+                                             slo_b, slo_l, slo_lvl, slo_bb, slo_b, slo_l, slo_lvl, slo_bb,
+                                             ssel_lvl, ssel_b, ssel_c, D, BT, BB, BG)
             if USE_G:
                 alpha = _build_alpha(h_ptr, wg_ptr, b, rows, rmask, d_model,
                                      sh_b, sh_l, sh_d, swg_d, BT, BD, NDM)
@@ -542,25 +597,24 @@ def _routed_fwd_tiled(q, k, v, h, Wr, Ww, D, b, sel, chunk, BG, BK=64, b_r=None,
           else q.new_zeros(Wr.shape[0], d_model))   # USE_G=False: Wg unread (no decay); pass a [H,d_model] stub
     swg = (Wg.stride(0), Wg.stride(1))               # (swg_head, swg_d) — head/d_model strides
     H = Wr.shape[0]
-    br, bw, has_bias = _routing_bias(b_r, b_w, H, D, b, q.device, dtype=q.dtype)
-    sbias = _bias_strides(br, bw, has_bias)
-    head = _router_head_strides(Wr, Ww, br, bw, has_bias)   # (H, swr_head, sww_head, sbr_head, sbw_head)
+    # F2b: the per-level routing logits (h·Wr+b_r, h·Ww+b_w) as a cuBLAS GEMM — the kernel only softmaxes
+    # + gathers. The bias is folded in here (softmax-input), so the kernel never sees Wr/Ww/bias.
+    lr, lw = _router_logits(h, Wr, Ww, b_r, b_w, H)
+    slo = (lw.stride(0), lw.stride(1), lw.stride(2), lw.stride(3))   # [BH,L,D,b] strides (lr==lw layout)
     out_intra = torch.zeros(B, L, BV, device=q.device, dtype=torch.float32)
     out_inter = torch.zeros(B, L, BV, device=q.device, dtype=torch.float32)
     so_a = (out_intra.stride(0), out_intra.stride(1), out_intra.stride(2))
     so_e = (out_inter.stride(0), 0, out_inter.stride(1), out_inter.stride(2))
     base = (q.stride(0), q.stride(1), q.stride(2), v.stride(0), v.stride(1), v.stride(2))
-    route = (h.stride(0), h.stride(1), h.stride(2),
-             Wr.stride(1), Wr.stride(2), Wr.stride(3), Ww.stride(1), Ww.stride(2), Ww.stride(3),
-             sel.stride(0), sel.stride(1), sel.stride(2))
-    _rola_routed_fwd_intra[(B, NCH)](q, k, v, h, Wr, Ww, sel, Wg, out_intra, br, bw, L, dqk, dv, nc, d_model,
-                                     *head, *base, *route, *swg, *so_a, *sbias,
+    route = (h.stride(0), h.stride(1), h.stride(2), *slo, sel.stride(0), sel.stride(1), sel.stride(2))
+    _rola_routed_fwd_intra[(B, NCH)](q, k, v, h, lr, lw, sel, Wg, out_intra, L, dqk, dv, nc, d_model,
+                                     H, swg[0], *base, *route, swg[1], *so_a,
                                      D=D, bb_=b, BB=BB, BT=chunk, BK=BK, BV=BV, BG=BG, BD=BD,
-                                     ND=ND, NB=NB, NDM=NDM, HAS_BIAS=has_bias, USE_G=use_g, GLA_FLOOR=_GLA_FLOOR)
-    _rola_routed_fwd_inter[(B, NB, ND)](q, k, v, h, Wr, Ww, sel, Wg, out_inter, br, bw, L, dqk, dv, nc, d_model,
-                                        *head, *base, *route, *swg, *so_e, *sbias,
+                                     ND=ND, NB=NB, NDM=NDM, USE_G=use_g, GLA_FLOOR=_GLA_FLOOR)
+    _rola_routed_fwd_inter[(B, NB, ND)](q, k, v, h, lr, lw, sel, Wg, out_inter, L, dqk, dv, nc, d_model,
+                                        H, swg[0], *base, *route, swg[1], *so_e,
                                         D=D, bb_=b, BB=BB, BT=chunk, BK=BK, BG=BG, BD=BD,
-                                        NCH=NCH, NDM=NDM, HAS_BIAS=has_bias, USE_G=use_g, GLA_FLOOR=_GLA_FLOOR)
+                                        NCH=NCH, NDM=NDM, USE_G=use_g, GLA_FLOOR=_GLA_FLOOR)
     return out_intra[..., :dv] + out_inter[..., :dv]
 
 
