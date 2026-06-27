@@ -26,6 +26,7 @@ import triton.language as tl
 
 from fla_rola.ops.rola.routed_bwd_kernels import (  # production tree-routed backward kernels (the in-kernel router-grad fold)
     _build_alpha,  # in-kernel per-state log-decay helpers (#45): alpha=sigmoid(h·Wg), ld=clamp(log(1-w(1-alpha)))
+    _decay_factors,  # re-anchored GLA decay factors (ea TRUE; ea_g/ena_g anchored intra-gram pair — fp32-overflow kill)
     _ld_from_w,
 )
 from fla_rola.ops.rola.routed_bwd_kernels import (
@@ -50,8 +51,9 @@ from fla_rola.utils import (
 
 # SMEM fitting follows the canonical FLA idiom: the chunk size BT is a fixed per-device constant
 # (a `check_shared_mem` gate — the one structural knob the autotuner can't own, since the host-side
-# Sb/dSa allocations + launch grid are sized from it before any kernel compiles, and GLA needs BT<=32
-# for its fp32 decay floor), while the INNER blocks (num_warps / num_stages / BD) are autotune knobs
+# Sb/dSa allocations + launch grid are sized from it before any kernel compiles; GLA's forward BT is 64
+# too now — the re-anchored decay relaxed the old BT<=32 fp32-overflow cap), while the INNER blocks
+# (num_warps / num_stages / BD) are autotune knobs
 # that Triton prunes via OutOfResources. The denominator-split (numerator-only readout, BV=next_pow2
 # (dv)) halved the per-program footprint, so the ada-class BT (64 RLA-fwd / 32 GLA+bwd) now fits down
 # to RTX 30xx (measured); sm75 (T4, 64KB) drops to BT=16.
@@ -71,7 +73,12 @@ _AT_CFGS = [triton.Config({}, num_warps=w, num_stages=s) for w in _WARPS for s i
 # nc); correctness is unaffected — the kernel still specializes on its real constexprs.
 _SCAN_KEY = ['dqk', 'dv', 'USE_G']
 _CHUNK_FWD = 64 if _BIG_SMEM else 16     # RLA forward
-_CHUNK = 32 if _BIG_SMEM else 16         # GLA forward + all backwards (GLA fp32 decay floor caps BT<=32)
+# GLA forward BT. Was 32: the chunked-decay gram exp(a)·exp(-a) had e^{-a}=e^{|Λ|} overflowing fp32 once
+# BT·|ld| > ~88, so GLA was capped at half of RLA's 64. `_decay_factors` re-anchors the gram to the
+# per-state midpoint (both factors ≤ e^{span/2}) → the safe span DOUBLES (88→176), so BT=64 fits at the
+# unchanged -2.5 floor (64·2.5=160<176). Now matches _CHUNK_FWD. (The backwards stay SMEM-capped to ≤16 by
+# the BK·BC·chunk heuristic — independent of this; the chunked readout is chunk-size invariant.)
+_CHUNK = 64 if _BIG_SMEM else 16
 _KAPPA_BWD_CHUNK = 16                     # fused kappa backward (single mega-kernel, heavy fp32 SMEM)
 
 # --- Backward feature tiling: BD as an autotune knob ----------------------------------------------
@@ -172,6 +179,33 @@ def _kappa_bv_tile(dqk, dv, bc=16, bk_cap=64):
         "untested — re-validate test_kappa_routed_* bit-faithfulness, then relax this assert."
     )
     return bv
+
+
+_ROUTER_BD_BUDGET = 8192   # elements (32KB fp32) for the in-kernel router's [BD, BB] weight tile (one
+#                            tile live at a time — the kappa kernels run num_stages=1, no double-buffer)
+_ROUTER_BD_MAX = 256       # absolute BD cap (bounds the hc[BT,BD] tile + keeps the NDM-unroll IR small)
+
+
+def _router_bd_ndm(d_model, b):
+    """BD (the d_model tile width of the IN-KERNEL router build — `_build_rw_tile`/`_build_factors`/
+    `_build_alpha`, all of which loop `for dm in range(NDM)`) RIGHT-SIZED to the LARGEST pow2 whose
+    [BD, BB] router-weight tile fits a safe SRAM fraction, with NDM=cdiv(d_model, BD) tiling the rest.
+    For small d_model this returns BD=next_pow2(d_model), NDM=1 — byte-identical to the un-tiled build.
+
+    F5: with the old BD=next_pow2(d_model) the whole router weight was ONE block (NDM=1), so flat
+    nc=64/256 at d_model=1024 (BD=1024) OOM'd. Capping BD by a FIXED byte budget keeps the tile in SRAM;
+    crucially we pick the LARGEST BD that fits (small NDM) — NOT the smallest — so the constexpr `for dm in
+    range(NDM)` unroll stays short (fast compile + good ILP). For the common small-b routings (BB=16) BD
+    lands at the 256 cap (NDM=4 at d_model=1024); only true flat routing (BB=nc large) drives NDM up,
+    because [BD,BB] is intrinsically wide there. All builders NDM-loop, so the cap only splits the d_model
+    reduction into NDM blocks (output unchanged to fp tolerance)."""
+    BB = max(16, triton.next_power_of_2(b))
+    bd_full = max(16, triton.next_power_of_2(d_model))
+    bd_cap = triton.next_power_of_2(max(1, _ROUTER_BD_BUDGET // BB))
+    while bd_cap > 16 and bd_cap * BB > _ROUTER_BD_BUDGET:
+        bd_cap //= 2          # round DOWN to the largest pow2 keeping [BD,BB] within budget (floor 16)
+    BD = max(16, min(bd_full, bd_cap, _ROUTER_BD_MAX))
+    return BD, triton.cdiv(d_model, BD)
 
 
 def _prune_bv(configs, named_args, **kwargs):
@@ -385,13 +419,16 @@ def _rola_routed_fwd_intra(q_ptr, k_ptr, v_ptr, h_ptr, wr_ptr, ww_ptr, sel_ptr, 
         if USE_G:
             ldc = _ld_from_w(wgc, alpha, cmask, GLA_FLOOR)
             a = tl.cumsum(ldc, axis=0)
-            rgc = rgc * tl.exp(a)
-            wgc = wgc * tl.exp(-a)
+            _ea, ea_g, ena_g = _decay_factors(a)        # ANCHORED intra-gram pair (no e^{-a} overflow)
+            rgc = rgc * ea_g
+            wgc = wgc * ena_g
         R += tl.dot(rgc.to(tl.float32), tl.trans(wgc))
     vc = tl.load(v_ptr + b*sv_b + rows[:, None]*sv_l + offs_v[None, :]*sv_d,
                  mask=rmask[:, None] & (offs_v[None, :] < dv), other=0.0)
     causal = (offs_t[:, None] >= offs_t[None, :]) & rmask[:, None] & rmask[None, :]
-    A = G * R * causal
+    # R's causal entries are finite; its (masked-out) anti-causal triangle holds +inf (e^{a_i-a_j}, i<j,
+    # fp32-overflows for large BT). `tl.where` SELECTS the zero there → never inf·0=NaN; identical for finite R.
+    A = G * tl.where(causal, R, 0.0)
     o = tl.dot(A.to(vc.dtype), vc)
     tl.store(outa_ptr + b*soa_b + rows[:, None]*soa_l + offs_v[None, :]*soa_v,
              o, mask=rmask[:, None] & (offs_v[None, :] < dv))
@@ -747,9 +784,10 @@ def _rola_rla_routed_bwd(q, k, v, h, Wr, Ww, do, D, b, chunk, BG, b_r=None, b_w=
     sbias = _bias_strides(br, bw, has_bias)
     head = _router_head_strides(Wr, Ww, br, bw, has_bias)   # (H, swr_head, sww_head, sbr_head, sbw_head)
     # The fold kernels run fp32 operands (precision floor of the deep-Hadamard jacobian); fp32 doubles
-    # per-program SMEM vs the proto's bf16 regime, so the backward chunk is capped at _CHUNK (32) — the
-    # GLA/all-backwards device constant — independent of the forward chunk (each is just a tiling of the
-    # SAME sequence; the chunked readout is chunk-size invariant). Avoids the BT=64-fp32 SMEM wall.
+    # per-program SMEM vs the proto's bf16 regime, so the backward chunk is capped at _CHUNK, then
+    # re-capped to _KAPPA_BWD_CHUNK (16) just below when BK·BC·chunk is large (the large-dqk fp32-tile
+    # SMEM wall) — independent of the forward chunk (each is just a tiling of the SAME sequence; the
+    # chunked readout is chunk-size invariant).
     chunk = min(chunk, _CHUNK)
     # The inter [BT,BC*BK] read/write tiles scale with BT; at large dqk (small BK, many ND) the fp32
     # tiles + 3D elementwise temporaries exceed the cap at BT=32, so cap BT further when BC*BK is large
@@ -884,8 +922,8 @@ class _RoLARoutedFn(torch.autograd.Function):
     @input_guard
     @autocast_custom_fwd
     def forward(ctx, q, k, v, h, Wr, Ww, D, b, chunk, BG, b_r, b_w, Wg=None):
-        # GLA (USE_G) caps the FORWARD chunk at _CHUNK (32) — the fp32 decay floor + SMEM wall (the BT=64
-        # decayed-gram fp32 tiles overflow the ada-class 99KB SMEM); RLA keeps the full _CHUNK_FWD (64).
+        # GLA (USE_G) caps the FORWARD chunk at _CHUNK (now 64, == _CHUNK_FWD): the re-anchored decay
+        # (`_decay_factors`) keeps the gram fp32-finite at BT=64 (was the e^{-a} overflow that forced BT≤32).
         cap = _CHUNK if Wg is not None else _CHUNK_FWD
         chunk = cap if chunk is None else min(chunk, cap)
         nc = b ** D
@@ -976,7 +1014,7 @@ def rola_gla_routed_triton(q, k, v, h, Wr, Ww, Wg, D, b, chunk=None, BG=16, b_r=
 
 
 @triton.jit
-def _kappa_d_tile(q_ptr, sden_ptr, Gc, w_tile, ea, ena, cols, cmask,
+def _kappa_d_tile(q_ptr, sden_ptr, Gc, w_tile, ea, ea_g, ena_g, cols, cmask,
                   pid_b, rows, rmask, dqk, sq_b, sq_l, sq_d, ssd_b, ssd_k,
                   BT: tl.constexpr, BK: tl.constexpr, BC: tl.constexpr, ND: tl.constexpr,
                   USE_G: tl.constexpr):
@@ -985,8 +1023,13 @@ def _kappa_d_tile(q_ptr, sden_ptr, Gc, w_tile, ea, ena, cols, cmask,
     passed in (value-free, reused). BV-free; recomputed identically in each numerator value-block pass.
     USE_G (GLA): the DECAYED den d_i^c = e^{a_ic}·(Σ_{j≤i}(qi·kj) w_j^c e^{-a_jc} + qi·Sden_carry^c) —
     EXACTLY `naive_rola_gla_perstate_den` (intra w decayed by e^{-a}, the carried Sden is the pre-decay
-    chunk-start state, the whole sum scaled by e^a). ea/ena = e^{a},e^{-a} [BT,BC]; raw w_tile decayed here."""
-    wt = (w_tile * ena) if USE_G else w_tile
+    chunk-start state, the whole sum scaled by e^a).
+    RE-ANCHORING (fp32-overflow kill): the intra gram exp(a_i)·exp(-a_j) is computed as
+    exp(a_i-a_ref)·exp(a_ref-a_j) (a_ref = per-state midpoint of a) — identical product, both factors
+    bounded (no e^{-a}=e^{|Λ|} blow-up for any BT). So the INTRA term uses the anchored pair (ea_g·ena_g)
+    while the INTER (q·Sden, against the absolutely-decayed carry) keeps the TRUE ea=e^a (≤1, no overflow).
+    ea = e^a [BT,BC] (true, inter); ea_g = e^{a-a_ref}, ena_g = e^{a_ref-a} [BT,BC] (anchored, intra)."""
+    wt = (w_tile * ena_g) if USE_G else w_tile
     d_inter = tl.zeros([BT, BC], dtype=tl.float32)
     for d0 in range(ND):
         offs_k = d0 * BK + tl.arange(0, BK)
@@ -999,7 +1042,8 @@ def _kappa_d_tile(q_ptr, sden_ptr, Gc, w_tile, ea, ena, cols, cmask,
         sden2 = tl.reshape(sden, [BC, BK])
         d_inter += tl.dot(qc, tl.trans(sden2).to(qc.dtype))                         # [BT,BC]
     d_intra = tl.dot(Gc.to(wt.dtype), wt)
-    d = (d_intra + d_inter) * ea if USE_G else (d_intra + d_inter)
+    # intra scaled by the anchored ea_g (cancels ena_g's a_ref → e^{a_i-a_j}); inter by the true e^a.
+    d = (d_intra * ea_g + d_inter * ea) if USE_G else (d_intra + d_inter)
     return tl.where(cmask[None, :], d, 0.0)
 
 
@@ -1034,6 +1078,7 @@ def _kappa_fwd_chunk(h_ptr, q_ptr, k_ptr, v_ptr, wr_ptr, ww_ptr, sel_ptr, kap_pt
                      D: tl.constexpr, b: tl.constexpr, BB: tl.constexpr,
                      BT: tl.constexpr, BK: tl.constexpr, BV: tl.constexpr, BD: tl.constexpr,
                      BC: tl.constexpr, NCBLK: tl.constexpr, ND: tl.constexpr, NDM: tl.constexpr,
+                     NDV: tl.constexpr, NDVP: tl.constexpr,
                      HAS_BIAS: tl.constexpr, USE_G: tl.constexpr, GLA_FLOOR: tl.constexpr):
     """Fused global/kappa/per_state chunk: builds r,w,d,r_tilde transiently per nc-block, accumulates num +
     den, carries Sval[k,v] AND Sden[k] across chunks. One program per batch. Mirrors the proto chunk
@@ -1044,7 +1089,8 @@ def _kappa_fwd_chunk(h_ptr, q_ptr, k_ptr, v_ptr, wr_ptr, ww_ptr, sel_ptr, kap_pt
     the per-state den d carries decay via `_kappa_d_tile`. The kap rescale wraps the UNDECAYED r (its d is
     already decayed); the den reduction o_den=Σ_c r̃^c d^c uses that UNDECAYED r̃ (e^a is readout-only)."""
     pid_b = tl.program_id(0)
-    ND_V = (dv + BV - 1) // BV       # value-blocks (BV is the value TILE; ND_V==1 ⇒ the un-tiled kernel)
+    ND_V: tl.constexpr = NDV         # value-blocks (BV is the value TILE; ND_V==1 ⇒ the un-tiled kernel) —
+    #                                  a constexpr (F2a) so the cb-outer value accumulators can be unrolled.
     offs_t = tl.arange(0, BT)
     offs_bb = tl.arange(0, BB)
     offs_c = tl.arange(0, BC)
@@ -1088,56 +1134,71 @@ def _kappa_fwd_chunk(h_ptr, q_ptr, k_ptr, v_ptr, wr_ptr, ww_ptr, sel_ptr, kap_pt
         if USE_G:
             ldc = _ld_from_w(w_tile, alpha, cmask, GLA_FLOOR)
             a = tl.cumsum(ldc, axis=0)
-            ea = tl.exp(a)
-            ena = tl.exp(-a)
+            ea, ea_g, ena_g = _decay_factors(a)
         else:
             ea = w_tile * 0.0 + 1.0
-            ena = ea
-        d_tile = _kappa_d_tile(q_ptr, sden_ptr, Gc, w_tile, ea, ena, cols, cmask,
+            ea_g = ea
+            ena_g = ea
+        d_tile = _kappa_d_tile(q_ptr, sden_ptr, Gc, w_tile, ea, ea_g, ena_g, cols, cmask,
                                pid_b, rows, rmask, dqk, sq_b, sq_l, sq_d, ssd_b, ssd_k,
                                BT, BK, BC, ND, USE_G)
         rt_tile = _kappa_rescale(r_tile, d_tile, kap, cmask, GLOBAL, PER_STATE, EPS)
         o_den += tl.sum(rt_tile * d_tile, axis=1)
     # ---- Pass 2 (value-tiled): numerator num = intra (A·v) + inter (Σ_c r̃^c q·Sval^c), AND the Sval
-    # state write — all value-tiled over ND_V blocks so the [BC*BK,BV] state slice stays bounded by BK·BV.
-    for vb in range(ND_V):
-        offs_v = vb * BV + tl.arange(0, BV)
-        vmask = offs_v < dv
-        vc = tl.load(v_ptr + pid_b*sv_b + rows[:, None]*sv_l + offs_v[None, :]*sv_d,
-                     mask=rmask[:, None] & vmask[None, :], other=0.0)
-        o_num = tl.zeros([BT, BV], dtype=tl.float32)
-        for cb in range(NCBLK):
-            cols = cb * BC + offs_c
-            cmask = cols < nc
-            r_tile, w_tile = _build_rw_tile(h_ptr, wr_ptr, ww_ptr, sel_ptr, cols, cmask,
-                                            pid_b, rows, rmask, offs_bb, bmask, d_model,
-                                            sh_b, sh_l, sh_d, swr_lvl, swr_d, swr_b, sww_lvl, sww_d, sww_b,
-                                            ssel_lvl, ssel_b, ssel_c,
-                                            br_ptr, bw_ptr, sbr_lvl, sbr_b, sbw_lvl, sbw_b,
-                                            D, BT, BB, BC, BD, NDM, HAS_BIAS)
-            if USE_G:
-                ldc = _ld_from_w(w_tile, alpha, cmask, GLA_FLOOR)
-                a = tl.cumsum(ldc, axis=0)
-                Lam = tl.sum(tl.where(offs_t[:, None] == (BT - 1), a, 0.0), axis=0)   # [BC] chunk-total
-                ea = tl.exp(a)
-                ena = tl.exp(-a)
-                wt = w_tile * ena                          # intra gram write w·e^{-a}
-                w_end = w_tile * tl.exp(Lam[None, :] - a)   # state write w·e^{Λ-a}
-                dec_c = tl.exp(Lam)                         # [BC] per-c carry e^Λ
-            else:
-                ea = w_tile * 0.0 + 1.0
-                ena = ea
-                wt = w_tile
-                w_end = w_tile
-            d_tile = _kappa_d_tile(q_ptr, sden_ptr, Gc, w_tile, ea, ena, cols, cmask,
-                                   pid_b, rows, rmask, dqk, sq_b, sq_l, sq_d, ssd_b, ssd_k,
-                                   BT, BK, BC, ND, USE_G)
-            rt_tile = _kappa_rescale(r_tile, d_tile, kap, cmask, GLOBAL, PER_STATE, EPS)
-            rd_tile = (rt_tile * ea) if USE_G else rt_tile   # decayed read gate r̃·e^a (readout only)
-            # numerator intra: A = G⊙(r̃·wᵀ)⊙causal; o_num += A·v. (GLA: decayed rd·wtᵀ.)
-            Rg = tl.dot(rd_tile, tl.trans(wt))
-            A = G * Rg * causal
-            o_num += tl.dot(A.to(vc.dtype), vc)
+    # state write — value-tiled over ND_V blocks so the [BC*BK,BV] state slice stays bounded by BK·BV.
+    # F2a: state-block OUTER / value-block INNER (mirrors the backward's cb-outer/vb-inner structure). The
+    # router build + d/rescale/A — ALL value-FREE — are computed ONCE per state-block (cb) and reused across
+    # the value-blocks, instead of being rebuilt ×ND_V inside the vb loop. Each value-block keeps its OWN
+    # running num accumulator: a SINGLE [BT, ND_V, BV] tile (value-block on the middle axis) persisted across
+    # the unrolled cb loop. Each intra/inter term for value-block vb is added to slice vb via a masked
+    # `tl.where`, in the SAME per-token order as the old vb-outer fold (per vb: cb0-intra, cb0-inter…,
+    # cb1-intra, … — independent of vb's loop position) → byte-identical output. A fixed-shape 3D tile is
+    # used because Triton's jit rejects Python list/tuple/append containers of per-vb accumulators.
+    o_num = tl.zeros([BT, NDVP, BV], dtype=tl.float32)   # NDVP=next_pow2(ND_V) — Triton block dims pow2;
+    vbidx = tl.arange(0, NDVP)                            # the pad slices [ND_V,NDVP) stay 0, never stored.
+    for cb in range(NCBLK):
+        cols = cb * BC + offs_c
+        cmask = cols < nc
+        r_tile, w_tile = _build_rw_tile(h_ptr, wr_ptr, ww_ptr, sel_ptr, cols, cmask,
+                                        pid_b, rows, rmask, offs_bb, bmask, d_model,
+                                        sh_b, sh_l, sh_d, swr_lvl, swr_d, swr_b, sww_lvl, sww_d, sww_b,
+                                        ssel_lvl, ssel_b, ssel_c,
+                                        br_ptr, bw_ptr, sbr_lvl, sbr_b, sbw_lvl, sbw_b,
+                                        D, BT, BB, BC, BD, NDM, HAS_BIAS)
+        if USE_G:
+            ldc = _ld_from_w(w_tile, alpha, cmask, GLA_FLOOR)
+            a = tl.cumsum(ldc, axis=0)
+            Lam = tl.sum(tl.where(offs_t[:, None] == (BT - 1), a, 0.0), axis=0)   # [BC] chunk-total
+            ea, ea_g, ena_g = _decay_factors(a)
+            wt = w_tile * ena_g                        # intra gram write, ANCHORED (no e^{-a} overflow)
+            w_end = w_tile * tl.exp(Lam[None, :] - a)   # state write w·e^{Λ-a} (e^{Λ-a}≤1, already bounded)
+            dec_c = tl.exp(Lam)                         # [BC] per-c carry e^Λ (≤1, bounded)
+        else:
+            ea = w_tile * 0.0 + 1.0
+            ea_g = ea
+            ena_g = ea
+            wt = w_tile
+            w_end = w_tile
+        d_tile = _kappa_d_tile(q_ptr, sden_ptr, Gc, w_tile, ea, ea_g, ena_g, cols, cmask,
+                               pid_b, rows, rmask, dqk, sq_b, sq_l, sq_d, ssd_b, ssd_k,
+                               BT, BK, BC, ND, USE_G)
+        rt_tile = _kappa_rescale(r_tile, d_tile, kap, cmask, GLOBAL, PER_STATE, EPS)
+        rd_inter = (rt_tile * ea) if USE_G else rt_tile     # readout vs abs-decayed Sval carry: TRUE e^a (≤1)
+        rd_gram = (rt_tile * ea_g) if USE_G else rt_tile     # intra gram read: ANCHORED (pairs with wt's ena_g)
+        # numerator intra: A = G⊙(r̃·wᵀ)⊙causal; o_num += A·v. (GLA: decayed rd_gram·wtᵀ.) Value-free → once/cb.
+        # The decayed gram Rg has finite causal entries but +inf in its (masked-out) anti-causal triangle
+        # (e^{a_i-a_j}, i<j, overflows fp32 for large BT) → `tl.where(causal, Rg, 0)` SELECTS the zero (never
+        # forms inf·0=NaN); bit-identical to `Rg*causal` whenever Rg is finite.
+        Rg = tl.dot(rd_gram, tl.trans(wt))
+        A = G * tl.where(causal, Rg, 0.0)
+        for vb in range(ND_V):
+            offs_v = vb * BV + tl.arange(0, BV)
+            vmask = offs_v < dv
+            sel_vb = (vbidx[None, :, None] == vb)        # [1,ND_V,1] one-hot select of slice vb
+            vc = tl.load(v_ptr + pid_b*sv_b + rows[:, None]*sv_l + offs_v[None, :]*sv_d,
+                         mask=rmask[:, None] & vmask[None, :], other=0.0)
+            # intra: A·v added to o_num's value-block vb (each term added in the old fold order → bit-exact).
+            o_num += tl.where(sel_vb, tl.dot(A.to(vc.dtype), vc)[:, None, :], 0.0)
             # numerator inter Σ_c r̃^c (q·Sval^c) + the Sval write (Sval^c += Σ wᶜ k⊗v); both index dqk →
             # loop BK-blocks. rt_tile/w_tile [BT,BC] dqk-free, reused; the [BC*BK,BV] sval slice fits.
             for d0 in range(ND):
@@ -1151,8 +1212,8 @@ def _kappa_fwd_chunk(h_ptr, q_ptr, k_ptr, v_ptr, wr_ptr, ww_ptr, sel_ptr, kap_pt
                 ckmask = tl.reshape(cmask[:, None] & kmask[None, :], [BC * BK])
                 sflat = tl.load(sval_ptr + pid_b*ssv_b + ck[:, None]*ssv_k + offs_v[None, :]*ssv_v,
                                 mask=ckmask[:, None] & vmask[None, :], other=0.0)        # [BC*BK,BV]
-                rq = tl.reshape(rd_tile[:, :, None] * qc[:, None, :], [BT, BC * BK])
-                o_num += tl.dot(rq.to(sflat.dtype), sflat)
+                rq = tl.reshape(rd_inter[:, :, None] * qc[:, None, :], [BT, BC * BK])
+                o_num += tl.where(sel_vb, tl.dot(rq.to(sflat.dtype), sflat)[:, None, :], 0.0)
                 wk = tl.reshape(w_end[:, :, None] * kc[:, None, :], [BT, BC * BK])
                 if USE_G:
                     # per-(c,k) carry: broadcast dec_c[BC] over BK feature rows of each c → [BC*BK].
@@ -1162,8 +1223,12 @@ def _kappa_fwd_chunk(h_ptr, q_ptr, k_ptr, v_ptr, wr_ptr, ww_ptr, sel_ptr, kap_pt
                     snew = sflat + tl.dot(tl.trans(wk).to(vc.dtype), vc)
                 tl.store(sval_ptr + pid_b*ssv_b + ck[:, None]*ssv_k + offs_v[None, :]*ssv_v,
                          snew, mask=ckmask[:, None] & vmask[None, :])
-        tl.store(num_ptr + pid_b*snm_b + rows[:, None]*snm_l + offs_v[None, :]*snm_v,
-                 o_num, mask=rmask[:, None] & vmask[None, :])
+    # store the [BT, NDVP, BV] accumulator as the [BT, NDVP*BV] num row (column vb*BV+j ≡ slice [vb,j];
+    # NDVP*BV == BVO, the num buffer width). The pad columns (≥ ND_V*BV ≥ dv) are masked off by vfmask.
+    offs_vf = tl.arange(0, NDVP * BV)
+    vfmask = offs_vf < dv
+    tl.store(num_ptr + pid_b*snm_b + rows[:, None]*snm_l + offs_vf[None, :]*snm_v,
+             tl.reshape(o_num, [BT, NDVP * BV]), mask=rmask[:, None] & vfmask[None, :])
     # ---- Pass 3 (value-free): Sden state write (Sden^c += Σ wᶜ k). Done LAST so Pass 1/2's d-recompute
     # read the carried-in Sden. Loops BK-blocks; the [BC*BK] tiles are tiny.
     for cb in range(NCBLK):
@@ -1218,26 +1283,30 @@ def _kappa_routed_fwd(q, k, v, h, Wr, Ww, kap, D, b, sel, chunk, global_norm, pe
     BC = 16   # tl.dot needs the gram dim >=16; the nc tail is cmask'd (was max(16,min(nc,16)) ≡ 16)
     BK = _kappa_bk_cap(dqk, dv, _KAPPA_BWD_CHUNK, BC)    # feature-tile (loop ND) — bounds the [BT,BC*BK] tiles
     BV = _kappa_bv_tile(dqk, dv, BC)                     # value-tile (loop ND_V) so [BC*BK,BV] fits SRAM
-    BVO = max(16, triton.next_power_of_2(dv))            # num buffer width (full padded value dim)
-    BD = max(16, triton.next_power_of_2(d_model))
+    BD, NDM = _router_bd_ndm(d_model, b)                  # F5: cap BD so the [BD,BB] router tile fits SRAM
     BB = max(16, triton.next_power_of_2(b))
     # The [BT,BC*BK] rq/wk tiles scale with BT, so the heavy-tile fwd chunk is capped like the bwd (the
     # chunked scan is chunk-size invariant). Cheap dqk/dv keep the full fwd chunk (BC*BK*BT then fits).
     chunk = chunk if BK * BC * chunk * 4 <= 24 * 1024 else min(chunk, _KAPPA_BWD_CHUNK)
     NCBLK = triton.cdiv(nc, BC)
     ND = triton.cdiv(dqk, BK)
-    NDM = triton.cdiv(d_model, BD)
     NCH = triton.cdiv(L, chunk)
     Sval = torch.zeros(B, nc, dqk, dv, device=q.device, dtype=torch.float32)
     Sden = torch.zeros(B, nc, dqk, device=q.device, dtype=torch.float32)
-    num = torch.zeros(B, L, BVO, device=q.device, dtype=torch.float32)   # full padded width; BV tiles it
+    # F7: num at the TRUE dv (not the padded next_pow2(dv)) — the in-kernel store is already vfmask'd to
+    # `offs_vf < dv` (the [dv, NDVP*BV) pad lanes never touch memory), so the buffer needs only dv columns,
+    # exactly like dq/dk/dvv above. Saves the BVO−dv pad columns (the [B,L,*] alloc) every forward.
+    num = torch.zeros(B, L, dv, device=q.device, dtype=torch.float32)
     den = torch.zeros(B, L, device=q.device, dtype=torch.float32)
     # Snapshots = the per-chunk pre-state the BACKWARD recompute consumes — NOT the forward (which
     # discards them) and NOT inference (no backward). Allocating+writing them unconditionally was a
-    # [B,NCH,nc,dqk,dv] fp32 transient built for nothing on the forward/prefill path.
+    # [NCH,B,nc,dqk,dv] fp32 transient built for nothing on the forward/prefill path.
+    # F6: NCH is the LEADING axis so the backward's per-chunk slice `snap_*[c]` is an already-contiguous
+    # [B,nc,dqk,dv]/[B,nc,dqk] view (identical strides to the contiguous dSval/dSden the kernels assume) —
+    # dropping the per-chunk `.contiguous()` copy in `_kappa_routed_bwd` (output byte-identical).
     if need_snapshots:
-        snap_val = torch.zeros(B, NCH, nc, dqk, dv, device=q.device, dtype=torch.float32)
-        snap_den = torch.zeros(B, NCH, nc, dqk, device=q.device, dtype=torch.float32)
+        snap_val = torch.zeros(NCH, B, nc, dqk, dv, device=q.device, dtype=torch.float32)
+        snap_den = torch.zeros(NCH, B, nc, dqk, device=q.device, dtype=torch.float32)
     else:
         snap_val = snap_den = None
     H = Wr.shape[0]
@@ -1248,12 +1317,13 @@ def _kappa_routed_fwd(q, k, v, h, Wr, Ww, kap, D, b, sel, chunk, global_norm, pe
     Wg = (Wg.float().contiguous() if use_g else q.new_zeros(H, d_model))
     swg = (Wg.stride(0), Wg.stride(1))
     common = dict(GLOBAL=global_norm, PER_STATE=per_state, EPS=eps, D=D, b=b, BB=BB, BT=chunk,
-                  BK=BK, BV=BV, BD=BD, BC=BC, NCBLK=NCBLK, ND=ND, NDM=NDM, HAS_BIAS=has_bias,
-                  USE_G=use_g, GLA_FLOOR=_GLA_FLOOR, num_warps=4, num_stages=1)
+                  BK=BK, BV=BV, BD=BD, BC=BC, NCBLK=NCBLK, ND=ND, NDM=NDM, NDV=triton.cdiv(dv, BV),
+                  NDVP=triton.next_power_of_2(triton.cdiv(dv, BV)),
+                  HAS_BIAS=has_bias, USE_G=use_g, GLA_FLOOR=_GLA_FLOOR, num_warps=4, num_stages=1)
     for c in range(NCH):
         if need_snapshots:
-            snap_val[:, c].copy_(Sval)
-            snap_den[:, c].copy_(Sden)
+            snap_val[c].copy_(Sval)
+            snap_den[c].copy_(Sden)
         _kappa_fwd_chunk[(B,)](
             h, q, k, v, Wr, Ww, sel, kap, Wg, Sval, Sden, num, den, br, bw,
             L, d_model, dqk, dv, nc, c * chunk, *head,
@@ -1266,7 +1336,7 @@ def _kappa_routed_fwd(q, k, v, h, Wr, Ww, kap, D, b, sel, chunk, global_norm, pe
             num.stride(0), num.stride(1), num.stride(2), den.stride(0), den.stride(1),
             *sbias,
             **common)
-    return num[..., :dv], den, snap_val, snap_den
+    return num, den, snap_val, snap_den
 
 
 @triton.jit
@@ -1486,29 +1556,35 @@ def _kappa_bwd_read(h_ptr, q_ptr, k_ptr, v_ptr, wr_ptr, ww_ptr, sel_ptr, kap_ptr
         if USE_G:
             ldc = _ld_from_w(w_tile, alpha, cmask, GLA_FLOOR)
             a = tl.cumsum(ldc, axis=0)
-            ea = tl.exp(a)
-            ena = tl.exp(-a)
-            wt = w_tile * ena                  # intra gram / den-intra write w·e^{-a}
+            ea, ea_g, ena_g = _decay_factors(a)
+            wt = w_tile * ena_g                # intra gram / den-intra write, ANCHORED (no e^{-a} overflow)
         else:
             ea = w_tile * 0.0 + 1.0
-            ena = ea
+            ea_g = ea
+            ena_g = ea
             wt = w_tile
         # d_tile/rt_tile are value-FREE (from G,Sden,r) → compute once, reused for every value-block.
-        d_tile = _kappa_d_tile(q_ptr, sden_ptr, Gc, w_tile, ea, ena, cols, cmask,
+        d_tile = _kappa_d_tile(q_ptr, sden_ptr, Gc, w_tile, ea, ea_g, ena_g, cols, cmask,
                                pid_b, rows, rmask, dqk, sq_b, sq_l, sq_d, ssd_b, ssd_k,
                                BT, BK, BC, ND, USE_G)
         rt_tile = _kappa_rescale(r_tile, d_tile, kap, cmask, GLOBAL, PER_STATE, EPS)   # UNDECAYED r̃
-        rd_tile = (rt_tile * ea) if USE_G else rt_tile   # decayed read gate r̃·e^a (readout only)
-        # For RLA (ea≡1, wt≡w, rd≡r̃) the grad folds DIRECTLY into drt/dw with the SAME accumulation order
-        # as the base RLA kernel → byte-identical. For GLA the readout/gram grads collect on the DECAYED
-        # gates (drd/dwt) and the da-pieces (drd·rd, −dwt·wt, dd·d) accumulate into gda.
+        rd_inter = (rt_tile * ea) if USE_G else rt_tile    # readout vs abs-decayed Sval carry: TRUE e^a
+        rd_gram = (rt_tile * ea_g) if USE_G else rt_tile    # intra gram read: ANCHORED (pairs with wt's ena_g)
+        # For RLA (ea≡ea_g≡1, wt≡w, rd≡r̃) the grad folds DIRECTLY into drt/dw with the SAME accumulation
+        # order as the base RLA kernel → byte-identical. For GLA the readout/gram grads collect on the DECAYED
+        # gates and the da-pieces accumulate into gda. The anchored gram read (rd_gram) and the true inter
+        # read (rd_inter) carry SEPARATE grad accumulators (drd_g/drd_i); each cancels its a_ref against its
+        # dual (wt's ena_g for the gram, the Sval/Sden carry for the inter) so every fold is unchanged.
         drt = dden[:, None] * d_tile          # d(r_tilde) from den (UNDECAYED r̃ → no e^a)
         dd = dden[:, None] * rt_tile          # d(d) from den
-        drd = tl.zeros([BT, BC], dtype=tl.float32)   # GLA readout grad w.r.t. the DECAYED read gate rd
+        drd_g = tl.zeros([BT, BC], dtype=tl.float32)   # readout grad w.r.t. the ANCHORED gram read rd_gram
+        drd_i = tl.zeros([BT, BC], dtype=tl.float32)   # readout grad w.r.t. the TRUE inter read rd_inter
         # num intra: A=G*Rg*causal ; o_num += A v. dA=(dnum·vᵀ)⊙causal (value-contracted → sum over vb);
-        # dv=Aᵀ·dnum (per value-block → atomic). A/Rg/dG/dw are value-free; dnum,vc loaded per vb.
-        Rg = tl.dot(rd_tile, tl.trans(wt))
-        A = G * Rg * causal
+        # dv=Aᵀ·dnum (per value-block → atomic). A/Rg/dG/dw are value-free; dnum,vc loaded per vb. Rg's
+        # anti-causal triangle is +inf at large BT → mask via where (Rg_m) so neither A nor dG forms inf·0.
+        Rg = tl.dot(rd_gram, tl.trans(wt))
+        Rg_m = tl.where(causal > 0.0, Rg, 0.0)
+        A = G * Rg_m
         dA = tl.zeros([BT, BT], dtype=tl.float32)
         for vb in range(ND_V):
             offs_v = vb * BV + tl.arange(0, BV)
@@ -1523,10 +1599,10 @@ def _kappa_bwd_read(h_ptr, q_ptr, k_ptr, v_ptr, wr_ptr, ww_ptr, sel_ptr, kap_ptr
             dA += tl.dot(dnum, tl.trans(vc))
         dA = dA * causal
         dRg = dA * G                          # dRg_ij = dA_ij G_ij (causal already in dA)
-        dG += dA * Rg                          # dG_ij  += dA_ij Rg_ij (causal already in dA)
+        dG += dA * Rg_m                        # dG_ij += dA_ij Rg_ij — Rg_m (causal-masked) avoids 0·inf=NaN
         if USE_G:
-            drd += tl.dot(dRg.to(wt.dtype), wt)
-            dwt = tl.dot(tl.trans(dRg).to(rd_tile.dtype), rd_tile)
+            drd_g += tl.dot(dRg.to(wt.dtype), wt)
+            dwt = tl.dot(tl.trans(dRg).to(rd_gram.dtype), rd_gram)
         else:
             drt += tl.dot(dRg.to(w_tile.dtype), w_tile)
             dw = tl.dot(tl.trans(dRg).to(rt_tile.dtype), rt_tile)
@@ -1539,7 +1615,7 @@ def _kappa_bwd_read(h_ptr, q_ptr, k_ptr, v_ptr, wr_ptr, ww_ptr, sel_ptr, kap_ptr
                          mask=rmask[:, None] & kmask[None, :], other=0.0)
             ck = tl.reshape(cols[:, None] * dqk + offs_k[None, :], [BC * BK])
             ckmask = tl.reshape(cmask[:, None] & kmask[None, :], [BC * BK])
-            rq = tl.reshape(rd_tile[:, :, None] * qc[:, None, :], [BT, BC * BK])
+            rq = tl.reshape(rd_inter[:, :, None] * qc[:, None, :], [BT, BC * BK])
             M = tl.zeros([BT, BC * BK], dtype=tl.float32)
             for vb in range(ND_V):
                 offs_v = vb * BV + tl.arange(0, BV)
@@ -1556,28 +1632,31 @@ def _kappa_bwd_read(h_ptr, q_ptr, k_ptr, v_ptr, wr_ptr, ww_ptr, sel_ptr, kap_ptr
                          mask=ckmask[:, None] & vmask[None, :])
             Mr = tl.reshape(M, [BT, BC, BK])
             if USE_G:
-                drd += tl.sum(Mr * qc[:, None, :], axis=2)
+                drd_i += tl.sum(Mr * qc[:, None, :], axis=2)
             else:
                 drt += tl.sum(Mr * qc[:, None, :], axis=2)
-            dq_read = tl.sum(Mr * rd_tile[:, :, None], axis=1)   # [BT,BK]
+            dq_read = tl.sum(Mr * rd_inter[:, :, None], axis=1)   # [BT,BK]
             tl.atomic_add(dq_ptr + pid_b*sq_b + rows[:, None]*sq_l + offs_k[None, :]*sq_d,
                           dq_read, mask=rmask[:, None] & kmask[None, :])
-        # readout grad → UNDECAYED r̃ (×e^a) — GLA only (RLA folded drt directly above).
+        # readout grad → UNDECAYED r̃ — GLA only (RLA folded drt directly above). The gram part folds via
+        # the anchored ea_g, the inter part via the true e^a; each = the true e^a contribution to ∂L/∂r̃.
         if USE_G:
-            drt += drd * ea
+            drt += drd_g * ea_g + drd_i * ea
         # rescale bwd (drt now complete; drt is grad w.r.t. the UNDECAYED r̃).
         dr_resc, dd_resc, dkap_c = _kappa_rescale_bwd(drt, r_tile, d_tile, kap, cmask,
                                                       GLOBAL, PER_STATE, EPS)
         dd += dd_resc
         dkap_acc += dkap_c
-        # d bwd: d = e^a·(Gc·wt + q·Sden_j) [GLA] | (Gc·w + q·Sden_j) [RLA]. ds = dd·e^a (the inner-sum
-        # grad); the outer e^a contributes da_d=dd·d. dG/dw are dqk-free; dq + dSden contract dqk → loop d0.
-        ds = (dd * ea) if USE_G else dd
-        dG += tl.dot(ds.to(wt.dtype), tl.trans(wt)) * causal
+        # d bwd: d = (Gc·wt)·e^{a-ref} [intra] + (q·Sden_j)·e^a [inter] (GLA) | (Gc·w + q·Sden_j) [RLA]. The
+        # inner-sum grads split: ds_intra=dd·ea_g (the ANCHORED den-intra Gc·wt), ds_inter=dd·ea (the TRUE
+        # den-inter q·Sden); the outer-decay da-piece is dd·d (full d). dG/dw are dqk-free; dq + dSden → d0.
+        ds_intra = (dd * ea_g) if USE_G else dd
+        ds_inter = (dd * ea) if USE_G else dd
+        dG += tl.dot(ds_intra.to(wt.dtype), tl.trans(wt)) * causal
         if USE_G:
-            dwt += tl.dot(tl.trans(Gc).to(ds.dtype), ds)        # den intra → DECAYED wt
+            dwt += tl.dot(tl.trans(Gc).to(ds_intra.dtype), ds_intra)   # den intra → ANCHORED wt
         else:
-            dw += tl.dot(tl.trans(Gc).to(ds.dtype), ds)
+            dw += tl.dot(tl.trans(Gc).to(ds_intra.dtype), ds_intra)
         for d0 in range(ND):
             offs_k = d0 * BK + tl.arange(0, BK)
             kmask = offs_k < dqk
@@ -1587,17 +1666,18 @@ def _kappa_bwd_read(h_ptr, q_ptr, k_ptr, v_ptr, wr_ptr, ww_ptr, sel_ptr, kap_ptr
             ckmask = tl.reshape(cmask[:, None] & kmask[None, :], [BC * BK])
             sden = tl.load(sden_ptr + pid_b*ssd_b + ck*ssd_k, mask=ckmask, other=0.0)
             sden2 = tl.reshape(sden, [BC, BK])
-            dq_d = tl.dot(ds.to(sden2.dtype), sden2)             # [BT,BK]
+            dq_d = tl.dot(ds_inter.to(sden2.dtype), sden2)       # [BT,BK]
             tl.atomic_add(dq_ptr + pid_b*sq_b + rows[:, None]*sq_l + offs_k[None, :]*sq_d,
                           dq_d, mask=rmask[:, None] & kmask[None, :])
             dSden = tl.load(dsden_ptr + pid_b*ssd_b + ck*ssd_k, mask=ckmask, other=0.0)
-            dSden_read = tl.reshape(tl.dot(tl.trans(ds).to(qc.dtype), qc), [BC * BK])
+            dSden_read = tl.reshape(tl.dot(tl.trans(ds_inter).to(qc.dtype), qc), [BC * BK])
             tl.store(dsden_ptr + pid_b*ssd_b + ck*ssd_k, dSden + dSden_read, mask=ckmask)
-        # write-gate grad: GLA — dwt is the grad w.r.t. the DECAYED wt=w·e^{-a}; routing-factor grad
-        # dw=dwt·e^{-a}; da_wt=−dwt·wt; the den's outer-e^a da-piece is dd·d, the readout's is drd·rd.
+        # write-gate grad: GLA — dwt is the grad w.r.t. the ANCHORED wt=w·e^{a_ref-a}; routing-factor grad
+        # dw=dwt·ena_g; da_wt=−dwt·wt (the a_ref cancels → true); the den's outer-decay da-piece is dd·d,
+        # the readout's splits into drd_g·rd_gram (gram) + drd_i·rd_inter (inter).
         if USE_G:
-            dw = dwt * ena
-            da = drd * rd_tile - dwt * wt + dd * d_tile
+            dw = dwt * ena_g
+            da = drd_g * rd_gram + drd_i * rd_inter - dwt * wt + dd * d_tile
             tl.atomic_add(gda_ptr + pid_b*sga_b + rows[:, None]*sga_l + cols[None, :]*sga_c,
                           tl.where(cmask[None, :], da, 0.0), mask=rmask[:, None] & cmask[None, :])
         tl.store(gdr_ptr + pid_b*sgd_b + offs_t[:, None]*sgd_t + cols[None, :]*sgd_c,
@@ -1643,11 +1723,10 @@ def _kappa_routed_bwd(q, k, v, h, Wr, Ww, kap, snap_val, snap_den, dnum, dden,
     BC = 16   # tl.dot gram dim >=16; nc tail cmask'd (was max(16,min(nc,16)) ≡ 16)
     BK = _kappa_bk_cap(dqk, dv, chunk, BC)   # feature-tile (loop ND) — bounds the [BT,BC*BK] tiles
     BV = _kappa_bv_tile(dqk, dv, BC, BK)     # value-tile (loop ND_V) so the [BC*BK,BV] state slices fit
-    BD = max(16, triton.next_power_of_2(d_model))
+    BD, NDM = _router_bd_ndm(d_model, b)     # F5: cap BD so the [BD,BB] router tile fits SRAM (NDM-tiled)
     BB = max(16, triton.next_power_of_2(b))
     NCBLK = triton.cdiv(nc, BC)
     ND = triton.cdiv(dqk, BK)
-    NDM = triton.cdiv(d_model, BD)
     NCH = triton.cdiv(L, chunk)
     # dvv/dq/dk are written with v's / q's row strides (sv_l=v.stride(1)=dv, sq_l=q.stride(1)=dqk), so
     # they MUST be allocated at the TRUE dv/dqk width (NOT padded BV/BK) or the row layout corrupts for
@@ -1702,8 +1781,8 @@ def _kappa_routed_bwd(q, k, v, h, Wr, Ww, kap, snap_val, snap_den, dnum, dden,
     fold_common = dict(D=D, b=b, BB=BB, BT=chunk, BC=BC, BD=BD, NCBLK=NCBLK, NDM=NDM,
                        HAS_BIAS=has_bias, USE_G=use_g, GLA_FLOOR=_GLA_FLOOR, num_warps=4, num_stages=1)
     for c in reversed(range(NCH)):
-        Sval = snap_val[:, c].contiguous()
-        Sden = snap_den[:, c].contiguous()
+        Sval = snap_val[c]    # F6: NCH-leading layout → per-chunk slice is already contiguous (no copy)
+        Sden = snap_den[c]
         gdw.zero_()
         # K1: state-update bwd (reads adjoint of Sval_{j+1}/Sden_{j+1}; produces dk,dv + state half of dw +
         # the USE_G carry/w_end da-pieces, using the chunk-start snapshot Sval_j/Sden_j for the Λ-coupling).
@@ -1804,7 +1883,14 @@ class _RoLARoutedKappaFn(torch.autograd.Function):
         chunk = min(chunk, _KAPPA_BWD_CHUNK)
         brf = None if b_r is None else b_r.float()
         bwf = None if b_w is None else b_w.float()
-        q, k, v, h, Wr, Ww, kap = (x.float().contiguous() for x in (q, k, v, h, Wr, Ww, kap))
+        # F4: the ROUTER operands (h/Wr/Ww) stay in their input dtype (bf16). The router build is a softmax
+        # (bounded, NOT precision-critical), and the bwd router kernels load it + accumulate in fp32
+        # internally (the `.to(dtype)` casts in _build_factors/_fold_level). fp32-upcasting h/Wr/Ww here
+        # DOUBLED the [BD,BB] router tile → the bwd recompute-fwd OOM'd at d_model=1024 (Req 131072 > 101376).
+        # q/k/v/kap keep fp32 (the den/decay-sensitive content path). The recompute-fwd already runs the
+        # router in bf16 in the normal forward, so this just matches that.
+        q, k, v, kap = (x.float().contiguous() for x in (q, k, v, kap))
+        h, Wr, Ww = (x.contiguous() for x in (h, Wr, Ww))
         Wgf = Wg.float().contiguous() if use_g else None
         _num, _den, snap_val, snap_den = _kappa_routed_fwd(
             q, k, v, h, Wr, Ww, kap, D, b, sel, chunk, global_norm, per_state, eps,
@@ -1844,27 +1930,28 @@ def _kappa_routed_readout(qf, kf, vf, hf, Wr, Ww, kapf, D, b, chunk_size, global
     return num, den.unsqueeze(-1)
 
 
-# --- GLA per-token log-decay floor — a GENUINE fp32+SMEM limit, NOT a tuning artifact (#33) ---------
+# --- GLA per-token log-decay floor — a GENUINE fp32 limit, NOT a tuning artifact (#33) ---------------
 # The chunked GLA scan FACTORS the per-chunk decay as e^{a_i} (into the read gate) × e^{-a_j} (into the
 # write gate), a=cumsum(ld) over a chunk, so the routing gram is ONE tl.dot R=(r·e^a)@(w·e^{-a})ᵀ and
 # the state carry is w_end=w·e^{Λ-a}, decvec=e^Λ. The decay DIFFERENCE e^{a_i-a_j} on the causal
-# triangle is in (0,1], but each FACTOR e^{±a}, e^{Λ-a} is unbounded: with ld≥FLOOR over BT rows the
-# largest factor is e^{BT·|FLOOR|}. fp32 overflows at ln(FLT_MAX)=88.72, so the hard constraint is
-#     BT · |FLOOR| ≲ 88.72.
-# At BT=32: 32·2.5 = 80 (fp32-safe, measured gram maxerr 1.2e-7). At BT=64: 64·2.5 = 160 → e^160 = inf
-# (measured: factored gram goes NaN). The differenced form (e^{a_i-a_j}, FLA simple_gla) would be
-# BT-free but cannot be absorbed into the routed read/write matmul nor the cross-chunk state carry —
-# it is structural to the chunked GLA recurrence shared by every FLA gated op. SEPARATELY, the fused
-# kappa-routed BACKWARD mega-kernel (decayed gram + 3-pass-κ fp32 tiles co-resident) OOMs the 99KB
-# Ampere SMEM at BT=64 (measured Required 102400 > 101376) — a second, independent wall that pins
-# BT≤32 (bwd≤16) regardless of the floor. Both limits point at the SAME shipped operating point.
+# triangle is in (0,1], but each UN-anchored FACTOR e^{±a} is unbounded (e^{BT·|FLOOR|} over BT rows),
+# and fp32 overflows at ln(FLT_MAX)=88.72. `_decay_factors` RE-ANCHORS each factor to the per-state span
+# midpoint (both factors ≤ e^{span/2}), so the fp32-safe span DOUBLES — the constraint is now
+#     BT · |FLOOR| ≲ 2·88.72 ≈ 177.
+# At BT=64 (the shipped GLA forward _CHUNK, now == RLA's _CHUNK_FWD): 64·2.5 = 160 < 177 (~11% headroom,
+# measured finite). The differenced form e^{a_i-a_j} would be BT-free but can't be absorbed into the
+# routed read/write matmul nor the cross-chunk state carry — re-anchoring is the in-matmul-compatible
+# stabilization. SEPARATELY, the fused kappa-routed BACKWARD mega-kernel (decayed gram + 3-pass-κ fp32
+# tiles co-resident) is SMEM-bound, so its chunk is independently capped at _KAPPA_BWD_CHUNK=16 by the
+# BK·BC·chunk heuristic — a wall on the BACKWARD only, unaffected by the (now-relaxed) overflow limit.
 #
-# FLOOR=-2.5 ⇒ per-token retention ≥ e^{-2.5} = 8.2%/tok. The production layer's ld=log(alpha_chunk)
-# CAN dip below this (alpha→0, write_gate→1), so the floor is NOT a structural no-op: it would alter a
-# learned decay. Per the no-silent-rewrite rule we make the floor LOUD — `_floor_ld` RAISES on
-# out-of-range ld by default; opt into clamp-with-warning via ROLA_GLA_FLOOR_CLAMP=1 (e.g. training
-# that tolerates the truncation). All GLA decay sites route through `_floor_ld`.
-_GLA_FLOOR = -2.5   # per-token log-decay floor (retention ≥ 8.2%/tok); fp32-safe for BT≤32 (see above)
+# FLOOR=-2.5 ⇒ per-token retention ≥ e^{-2.5} = 8.2%/tok. KEPT (160<177 fits BT=64, but the headroom is
+# thin — full floor removal would need a tighter per-tile anchor). The production layer's ld=log
+# (alpha_chunk) CAN dip below this (alpha→0, write_gate→1), so the floor is NOT a structural no-op: it
+# would alter a learned decay. Per the no-silent-rewrite rule the floor is LOUD — `_floor_ld` RAISES on
+# out-of-range ld by default; opt into clamp-with-warning via ROLA_GLA_FLOOR_CLAMP=1. All GLA decay
+# sites route through `_floor_ld`.
+_GLA_FLOOR = -2.5   # per-token log-decay floor (retention ≥ 8.2%/tok); re-anchored span fits BT=64 (see above)
 _GLA_FLOOR_CLAMP = os.environ.get('ROLA_GLA_FLOOR_CLAMP', '0') not in ('0', '', 'false', 'False')
 _gla_floor_warned = False
 
@@ -1891,7 +1978,8 @@ def _floor_ld(ld):
             raise ValueError(
                 f"GLA log-decay ld below the fp32-safe floor _GLA_FLOOR={_GLA_FLOOR} "
                 f"(min ld={mn.item():.4f}). The chunked GLA decay is factored e^{{±a}} and overflows "
-                f"fp32 (ln FLT_MAX=88.72) once BT·|ld|≳88.72; BT≤32 needs |ld|≤2.77, so the kernel "
+                f"fp32 (ln FLT_MAX=88.72); the re-anchored factoring doubles the safe span to BT·|ld|≲177, "
+                f"and at the shipped BT=64 that needs |ld|≤2.77, so the kernel "
                 f"cannot represent this decay rate. Reduce the decay (raise alpha / lower the write "
                 f"gate), or set ROLA_GLA_FLOOR_CLAMP=1 to clamp ld to the floor (truncating the "
                 f"learned decay) instead of raising."
