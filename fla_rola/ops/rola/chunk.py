@@ -18,6 +18,7 @@
 # per-state pre-pass.
 
 import functools
+import math
 import os
 
 import torch
@@ -1270,14 +1271,31 @@ def _kappa_fwd_chunk(h_ptr, q_ptr, k_ptr, v_ptr, lr_ptr, lw_ptr, sel_ptr, kap_pt
     tl.store(den_ptr + pid_b*sdn_b + rows*sdn_l, o_den, mask=rmask)
 
 
+def _kappa_fit_chunk(dqk, dv, chunk, BC=16):
+    """The SMEM-derived kappa chunk — the single source of truth shared by the forward, the #55
+    checkpoint pass, and the backward reverse-scan. Idempotent: re-fitting an already-fitted chunk
+    returns it, so the bwd recompute lands on the SAME chunk → NCH / snapshot alignment is guaranteed
+    without threading the value through every call."""
+    bk = _kappa_bk_cap(dqk, dv, min(chunk, _CHUNK_FWD), BC)
+    return _fit_chunk(min(chunk, _CHUNK_FWD), _kappa_row_bytes(bk, BC))
+
+
+def _kappa_ckpt_window(NCH):
+    """#55 checkpoint window W = ⌈√NCH⌉ — shared by the forward (stores a checkpoint every W-th chunk)
+    and the backward (seeds segment `seg` from ckpt[seg] at chunk seg·W). √NCH checkpoints + a W-wide
+    segment recompute ≈ 2√NCH·state peak instead of the all-snapshot NCH·state (∝ L² when nc∝L)."""
+    return max(1, math.ceil(math.sqrt(NCH)))
+
+
 def _kappa_routed_fwd(q, k, v, h, lr, lw, kap, D, b, sel, chunk, global_norm, per_state, eps,
-                      H, Wg=None, need_snapshots=False):
+                      H, Wg=None, need_snapshots=False, state_in=None, c_lo=0, c_hi=None,
+                      save_checkpoints=False):
     """Fused global/kappa/per_state tree-routed forward. Returns (num[B,L,BV], den[B,L], snap_val, snap_den).
-    The per-chunk pre-state snapshots are ONLY built when need_snapshots=True (the BACKWARD's recompute):
-    the forward pass discards them (it saves the inputs, not the snapshots — the backward regenerates its
-    own), and inference has no backward at all. Building them on the forward/prefill path is a pure
-    [B,NCH,nc,dqk,dv] fp32 transient written for nothing — the prefill-memory blowup. Default False →
-    (..., None, None). Optional routing bias b_r/b_w ∈ [D,b] (softmax(h·W+b)). No [L,nc] gate/den/r̃ buffer.
+    #55 snapshot modes (at most one): need_snapshots=True stores the DENSE per-chunk pre-states for chunks
+    [c_lo,c_hi) (the backward's per-segment recompute); save_checkpoints=True stores only the SPARSE √NCH
+    boundary states (the differentiable forward, for the backward to seed segments from). Both default off →
+    (..., None, None) — inference / non-grad forward allocates no snapshot tensor (no prefill blowup).
+    Optional routing bias b_r/b_w ∈ [D,b] (softmax(h·W+b)). No [L,nc] gate/den/r̃ buffer.
     Optional per-head decay weight Wg:[H,d_model] (GLA, #45) → USE_G decayed scan, the per-state log-decay
     computed IN-KERNEL (clamped at _GLA_FLOOR, never a [L,nc] ld); Wg=None is RLA (USE_G=False)."""
     B, L, dqk = q.shape
@@ -1293,12 +1311,22 @@ def _kappa_routed_fwd(q, k, v, h, lr, lw, kap, D, b, sel, chunk, global_norm, pe
     # the largest pow2 BT whose dominant fp32 chunk-tile fits the device budget. On a 99KB card this lands
     # at the full 64 (the design-point win: 64 launches → 16); a smaller card steps down. Chunk-invariant
     # scan, so a bit-identical readout at any chunk. Idempotent (the Function already capped to the ceiling).
-    chunk = _fit_chunk(min(chunk, _CHUNK_FWD), _kappa_row_bytes(BK, BC))
+    chunk = _kappa_fit_chunk(dqk, dv, chunk, BC)
     NCBLK = triton.cdiv(nc, BC)
     ND = triton.cdiv(dqk, BK)
     NCH = triton.cdiv(L, chunk)
-    Sval = torch.zeros(B, nc, dqk, dv, device=q.device, dtype=torch.float32)
-    Sden = torch.zeros(B, nc, dqk, device=q.device, dtype=torch.float32)
+    if state_in is None:
+        Sval = torch.zeros(B, nc, dqk, dv, device=q.device, dtype=torch.float32)
+        Sden = torch.zeros(B, nc, dqk, device=q.device, dtype=torch.float32)
+    else:
+        # #55: seed from a segment checkpoint; clone so the caller's checkpoint is never mutated.
+        Sval = state_in[0].clone()
+        Sden = state_in[1].clone()
+    if c_hi is None:
+        c_hi = NCH
+    # #55: save_checkpoints (the differentiable forward) → store the sparse √NCH boundary states the
+    # backward seeds its segment recomputes from. Resolved to the shared window so fwd-store/bwd-index agree.
+    checkpoint_every = _kappa_ckpt_window(NCH) if save_checkpoints else None
     # F7: num at the TRUE dv (not the padded next_pow2(dv)) — the in-kernel store is already vfmask'd to
     # `offs_vf < dv` (the [dv, NDVP*BV) pad lanes never touch memory), so the buffer needs only dv columns,
     # exactly like dq/dk/dvv above. Saves the BVO−dv pad columns (the [B,L,*] alloc) every forward.
@@ -1310,9 +1338,17 @@ def _kappa_routed_fwd(q, k, v, h, lr, lw, kap, D, b, sel, chunk, global_norm, pe
     # F6: NCH is the LEADING axis so the backward's per-chunk slice `snap_*[c]` is an already-contiguous
     # [B,nc,dqk,dv]/[B,nc,dqk] view (identical strides to the contiguous dSval/dSden the kernels assume) —
     # dropping the per-chunk `.contiguous()` copy in `_kappa_routed_bwd` (output byte-identical).
+    # #55 sqrt-checkpointing: need_snapshots stores the DENSE per-chunk pre-states for chunks [c_lo,c_hi)
+    # (a segment recompute, O(segment·state)); checkpoint_every stores only every W-th state (the sparse
+    # Pass-1 boundary checkpoints the backward seeds segments from, O(√NCH·state)). At most one is set —
+    # never the old [NCH,...] all-snapshot peak (∝ L² when nc scales with L).
     if need_snapshots:
-        snap_val = torch.zeros(NCH, B, nc, dqk, dv, device=q.device, dtype=torch.float32)
-        snap_den = torch.zeros(NCH, B, nc, dqk, device=q.device, dtype=torch.float32)
+        snap_val = torch.zeros(c_hi - c_lo, B, nc, dqk, dv, device=q.device, dtype=torch.float32)
+        snap_den = torch.zeros(c_hi - c_lo, B, nc, dqk, device=q.device, dtype=torch.float32)
+    elif checkpoint_every is not None:
+        nseg = triton.cdiv(NCH, checkpoint_every)
+        snap_val = torch.zeros(nseg, B, nc, dqk, dv, device=q.device, dtype=torch.float32)
+        snap_den = torch.zeros(nseg, B, nc, dqk, device=q.device, dtype=torch.float32)
     else:
         snap_val = snap_den = None
     use_g = Wg is not None
@@ -1323,10 +1359,13 @@ def _kappa_routed_fwd(q, k, v, h, lr, lw, kap, D, b, sel, chunk, global_norm, pe
                   BK=BK, BV=BV, BD=BD, BC=BC, NCBLK=NCBLK, ND=ND, NDM=NDM, NDV=triton.cdiv(dv, BV),
                   NDVP=triton.next_power_of_2(triton.cdiv(dv, BV)),
                   USE_G=use_g, GLA_FLOOR=_GLA_FLOOR, num_warps=4, num_stages=1)
-    for c in range(NCH):
+    for c in range(c_lo, c_hi):
         if need_snapshots:
-            snap_val[c].copy_(Sval)
-            snap_den[c].copy_(Sden)
+            snap_val[c - c_lo].copy_(Sval)
+            snap_den[c - c_lo].copy_(Sden)
+        elif checkpoint_every is not None and c % checkpoint_every == 0:
+            snap_val[c // checkpoint_every].copy_(Sval)
+            snap_den[c // checkpoint_every].copy_(Sden)
         _kappa_fwd_chunk[(B,)](
             h, q, k, v, lr, lw, sel, kap, Wg, Sval, Sden, num, den,
             L, d_model, dqk, dv, nc, c * chunk, H,
@@ -1699,7 +1738,7 @@ def _kappa_bwd_read(h_ptr, q_ptr, k_ptr, v_ptr, lr_ptr, lw_ptr, sel_ptr, kap_ptr
     tl.atomic_add(dkap_ptr + pid_b*sk_b + rows*sk_l, dkap_acc, mask=rmask)
 
 
-def _kappa_routed_bwd(q, k, v, h, lr, lw, kap, snap_val, snap_den, dnum, dden,
+def _kappa_routed_bwd(q, k, v, h, lr, lw, kap, ckpt_val, ckpt_den, dnum, dden,
                       D, b, sel, chunk, global_norm, per_state, eps, H, Wg=None):
     """Reverse chunk-scan backward for the fused global/kappa/per_state path. Carries dSval,dSden
     adjoints; recomputes r,w,d,r_tilde transiently per chunk; folds the [BT,nc] gate-grads into
@@ -1719,6 +1758,10 @@ def _kappa_routed_bwd(q, k, v, h, lr, lw, kap, snap_val, snap_den, dnum, dden,
     dv = v.shape[-1]
     nc = b ** D
     BC = 16   # tl.dot gram dim >=16; nc tail cmask'd (was max(16,min(nc,16)) ≡ 16)
+    # #55: fit the chunk here (shared _kappa_fit_chunk, idempotent) — the Function passes the ctx ceiling
+    # and the checkpoint pass + segment recomputes below all drive THIS value, so NCH/snapshot alignment
+    # holds without threading the fitted chunk through every call.
+    chunk = _kappa_fit_chunk(dqk, dv, chunk, BC)
     BK = _kappa_bk_cap(dqk, dv, chunk, BC)   # feature-tile (loop ND) — bounds the [BT,BC*BK] tiles
     BV = _kappa_bv_tile(dqk, dv, BC, BK)     # value-tile (loop ND_V) so the [BC*BK,BV] state slices fit
     BD, NDM = _router_bd_ndm(d_model, b)     # F5: cap BD so the [BD,BB] router tile fits SRAM (NDM-tiled)
@@ -1768,9 +1811,28 @@ def _kappa_routed_bwd(q, k, v, h, lr, lw, kap, snap_val, snap_den, dnum, dden,
     read_common = dict(GLOBAL=global_norm, PER_STATE=per_state, EPS=eps, D=D, b=b, BB=BB, BT=chunk,
                        BK=BK, BV=BV, BD=BD, BC=BC, ND=ND, NDM=NDM,
                        USE_G=use_g, GLA_FLOOR=_GLA_FLOOR, num_warps=4, num_stages=1)
+    # #55 sqrt-checkpointing: the FORWARD saved only √NCH boundary checkpoints (ckpt_val/ckpt_den, passed
+    # in). Here we recompute each segment's W pre-state snapshots on demand from its checkpoint (Pass 2,
+    # below) — peak snapshot mem ~2√NCH·state instead of the old all-snapshot NCH·state (∝ L² when nc∝L), at
+    # NO extra forward pass (the forward already paid the scan; it just stashed √NCH states). The reverse-scan
+    # order is unchanged (global c=NCH-1..0), preserving carried adjoints and GLA decay. Segment recompute
+    # seeds fp32 state from the same fp32 forward checkpoints, so fp32 matches the all-snapshot path exactly;
+    # bf16 remains within normal rounding-scale tolerance. W matches the forward's via _kappa_ckpt_window.
+    W = _kappa_ckpt_window(NCH)
+    seg_lo = NCH   # chunk range [seg_lo, seg_hi) of the currently-loaded segment snapshots (lazy, reverse)
+    seg_val = seg_den = None
     for c in reversed(range(NCH)):
-        Sval = snap_val[c]    # F6: NCH-leading layout → per-chunk slice is already contiguous (no copy)
-        Sden = snap_den[c]
+        if c < seg_lo:
+            # crossed into the previous segment (reverse order): recompute its W pre-states from the
+            # checkpoint (Pass 2, dense O(W·state)), reused for that segment's W reverse-scan steps.
+            seg = c // W
+            seg_lo, seg_hi = seg * W, min(seg * W + W, NCH)
+            _sn, _sd, seg_val, seg_den, _sc = _kappa_routed_fwd(
+                q, k, v, h, lr, lw, kap, D, b, sel, chunk, global_norm, per_state, eps, H,
+                Wg=(Wg if use_g else None), need_snapshots=True,
+                state_in=(ckpt_val[seg], ckpt_den[seg]), c_lo=seg_lo, c_hi=seg_hi)
+        Sval = seg_val[c - seg_lo]    # per-chunk pre-state (recomputed), contiguous [B,nc,dqk,dv] slice
+        Sden = seg_den[c - seg_lo]
         gdw.zero_()
         # K1: state-update bwd (reads adjoint of Sval_{j+1}/Sden_{j+1}; produces dk,dv + state half of dw +
         # the USE_G carry/w_end da-pieces, using the chunk-start snapshot Sval_j/Sden_j for the Λ-coupling).
@@ -1834,10 +1896,16 @@ class _RoLARoutedKappaFn(torch.autograd.Function):
         sel = _build_sel(D, b, nc, q.device)
         q, k, v, h, lr, lw, kap = (x.contiguous() for x in (q, k, v, h, lr, lw, kap))
         Wgc = Wg.contiguous() if Wg is not None else None
-        num, den, _sv, _sd, _ck = _kappa_routed_fwd(q, k, v, h, lr, lw, kap, D, b, sel, chunk,
-                                                    global_norm, per_state, eps, H, Wg=Wgc)
+        # #55: when this call is differentiable (some input needs grad → backward WILL run), the forward
+        # stashes only the √NCH sparse boundary checkpoints (ckv/ckd) for the backward to seed segment
+        # recomputes from — so the backward needs NO extra forward pass, and inference (no grad) stores
+        # nothing. save_ckpt ⟺ backward-will-run, so the checkpoints exist exactly when the backward needs them.
+        save_ckpt = any(ctx.needs_input_grad)
+        num, den, ckv, ckd, _ck = _kappa_routed_fwd(q, k, v, h, lr, lw, kap, D, b, sel, chunk,
+                                                    global_norm, per_state, eps, H, Wg=Wgc,
+                                                    save_checkpoints=save_ckpt)
         # #45: the GLA decay's saved activation is the [H,d_model] Wg (NOT a [L,nc] ld) — the saved-act win.
-        ctx.save_for_backward(q, k, v, h, lr, lw, kap, Wgc)
+        ctx.save_for_backward(q, k, v, h, lr, lw, kap, Wgc, ckv, ckd)
         ctx.D, ctx.b, ctx.chunk, ctx.H = D, b, chunk, H
         ctx.global_norm, ctx.per_state, ctx.eps = global_norm, per_state, eps
         return num.to(q.dtype), den.to(q.dtype)
@@ -1846,7 +1914,7 @@ class _RoLARoutedKappaFn(torch.autograd.Function):
     @input_guard
     @autocast_custom_bwd
     def backward(ctx, dnum, dden):
-        q, k, v, h, lr, lw, kap, Wg = ctx.saved_tensors
+        q, k, v, h, lr, lw, kap, Wg, ckpt_val, ckpt_den = ctx.saved_tensors
         use_g = Wg is not None
         D, b, chunk, H = ctx.D, ctx.b, ctx.chunk, ctx.H
         global_norm, per_state, eps = ctx.global_norm, ctx.per_state, ctx.eps
@@ -1857,17 +1925,12 @@ class _RoLARoutedKappaFn(torch.autograd.Function):
         q, k, v, kap = (x.float().contiguous() for x in (q, k, v, kap))
         h, lr, lw = (x.contiguous() for x in (h, lr, lw))
         Wgf = Wg.float().contiguous() if use_g else None
-        # The recompute-forward SMEM-fits the chunk internally and RETURNS the value it used; the reverse-scan
-        # below drives that SAME chunk → NCH / per-chunk snapshot alignment is guaranteed (single source of
-        # truth, no separate _KAPPA_BWD_CHUNK and no re-fit-must-match coupling). The fused kappa backward is a
-        # single mega-kernel; its dominant fp32 tile is the SAME [BT, BC·BK] as the forward, so it fits the
-        # SAME budget — on a 99KB card the full 64 (the bwd read kernel measures 61KB < 99KB), graded down on
-        # smaller cards.
-        _num, _den, snap_val, snap_den, chunk = _kappa_routed_fwd(
-            q, k, v, h, lr, lw, kap, D, b, sel, chunk, global_norm, per_state, eps,
-            H, Wg=Wgf, need_snapshots=True)
+        # #55: _kappa_routed_bwd re-fits the chunk from the ctx ceiling via the shared _kappa_fit_chunk
+        # (idempotent → same chunk + NCH + window as the forward), then recomputes each segment's snapshots
+        # on demand from the forward-saved √NCH checkpoints (ckpt_val/ckpt_den) → ~2√NCH·state peak instead of
+        # the old [NCH,...] ∝ L², at NO extra forward pass. Reverse-scan order unchanged → grads bit-exact.
         grads = _kappa_routed_bwd(
-            q, k, v, h, lr, lw, kap, snap_val, snap_den, dnum.float(), dden.float(),
+            q, k, v, h, lr, lw, kap, ckpt_val, ckpt_den, dnum.float(), dden.float(),
             D, b, sel, chunk, global_norm, per_state, eps, H, Wg=Wgf)
         # _kappa_routed_bwd returns (dq,dk,dv,dh,dlr,dlw,dkap[,dWg]); dWg present iff use_g.
         dq, dk, dv, dh, dlr, dlw, dkap = grads[:7]
