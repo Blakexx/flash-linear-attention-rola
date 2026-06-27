@@ -561,8 +561,10 @@ class TestIntraConfigEquivalence:
         def foldf(t):
             return t.permute(0, 2, 1, 3).reshape(B * H, T, t.shape[-1]).float().contiguous()
         sel = C._build_sel(D, b, nc, device)
-        snap = C._routed_snapshots(foldf(q), foldf(k), foldf(v), foldf(h), Wr.float(), Ww.float(),
-                                   D, b, sel, chunk, BG=16)               # [B*H, NCH, nc, dqk, dv]
+        # F2b: snapshots now consume the PRECOMPUTED write logits lw:[BH,T,D,b] (the cuBLAS GEMM), not Wr/Ww.
+        _, lw = C._router_logits(foldf(h), Wr.float(), Ww.float(), None, None, H)
+        snap = C._routed_snapshots(foldf(q), foldf(k), foldf(v), foldf(h), lw,
+                                   D, b, sel, chunk, BG=16, H=H)          # [B*H, NCH, nc, dqk, dv]
         # analytic PRE-state at each chunk boundary, write-gate-only (BUILD_R is False ⇒ read never built).
         _, wf = _per_head_gates(foldf(h), Wr.float(), Ww.float(), D, b, H)    # [BH,T,nc]
         kf, vf = foldf(k), foldf(v)
