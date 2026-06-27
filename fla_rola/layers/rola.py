@@ -400,12 +400,16 @@ class RoLA(nn.Module):
             # CHUNK: in-kernel routing + decay. h is the residual stream broadcast per head ([B,L,H,hidden]);
             # the kernel folds the routing gram, the per-state den, the read-gate rescale AND (GLA) the
             # per-state log-decay IN-KERNEL — the [L,nc] gates + ld are NEVER materialized (the training
-            # saved-activation win).
+            # saved-activation win). F2b: the per-level routing logits wl/rl (already computed above for the
+            # z-loss) are passed straight to the kernel — the d_model-contraction h·W is a cuBLAS GEMM done
+            # ONCE in `_factor_logits` (not re-done in the kernel nor re-GEMM'd in `chunk_rola_routed`); the
+            # kernel only softmax+gathers, and dWrite_W/dRead_W/dx flow back through this einsum.
             h = x.unsqueeze(2).expand(B, L, H, self.hidden_size)
             out = chunk_rola_routed(
                 qf, kf, v, h, self.write_W if self.read_W is None else self.read_W, self.write_W,
                 D, b, norm=self.state_norm, kappa=kap, scale=1.0,
-                b_r=(self.write_b if self.read_W is None else self.read_b), b_w=self.write_b, Wg=Wg)
+                b_r=(self.write_b if self.read_W is None else self.read_b), b_w=self.write_b, Wg=Wg,
+                wl=wl, rl=rl)
             recurrent_state = None
             if use_cache:
                 # Prefill→decode handoff (inference only): the routed readout stays [L,nc]-free, but the

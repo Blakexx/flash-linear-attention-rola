@@ -874,26 +874,34 @@ class _RoLARoutedFn(torch.autograd.Function):
 
 
 @input_guard
-def rola_rla_routed_triton(q, k, v, h, Wr, Ww, D, b, chunk=None, BG=16, b_r=None, b_w=None):
+def rola_rla_routed_triton(q, k, v, h, Wr, Ww, D, b, chunk=None, BG=16, b_r=None, b_w=None,
+                           lr=None, lw=None, H=None):
     """Un-normalized TREE-ROUTED RLA readout via Triton — the shared-gram readout, DIFFERENTIABLE
     end-to-end (the [L,nc] gates and their grads are NEVER materialized). F2b: the per-level routing
     logits (h·Wr+b_r, h·Ww+b_w) are a cuBLAS GEMM (`_router_logits`, autograd-tracked) and the kernel only
     softmax+gathers them; dWr/dWw/dh/db flow through the GEMM-backward. Wr,Ww ∈ [H,D,d_model,b] per-head,
-    optional per-head bias b_r/b_w ∈ [H,D,b].
+    optional per-head bias b_r/b_w ∈ [H,D,b]. lr,lw:[BH,L,D,b] may be passed precomputed (the layer's
+    z-loss logits — dedup) instead of (Wr,Ww,b_r,b_w).
 
     q,k:[BH,L,K]  v:[BH,L,V]  h:[BH,L,d_model]  Wr,Ww:[H,D,d_model,b].  Returns [BH,L,V] at BV=next_pow2(V)."""
-    lr, lw = _router_logits(h, Wr, Ww, b_r, b_w, Wr.shape[0])
-    return _RoLARoutedFn.apply(q, k, v, h, lr, lw, D, b, chunk, BG, Wr.shape[0], None)
+    if lr is None:
+        H = Wr.shape[0]
+        lr, lw = _router_logits(h, Wr, Ww, b_r, b_w, H)
+    return _RoLARoutedFn.apply(q, k, v, h, lr, lw, D, b, chunk, BG, H, None)
 
 
 @input_guard
-def rola_gla_routed_triton(q, k, v, h, Wr, Ww, Wg, D, b, chunk=None, BG=16, b_r=None, b_w=None):
+def rola_gla_routed_triton(q, k, v, h, Wr, Ww, Wg, D, b, chunk=None, BG=16, b_r=None, b_w=None,
+                           lr=None, lw=None, H=None):
     """Un-normalized TREE-ROUTED GLA readout via Triton — `rola_rla_routed_triton` + a per-head decay
     WEIGHT Wg:[H,d_model] (GLA), DIFFERENTIABLE end-to-end ([L,nc] gates, the per-state log-decay ld, AND
     their grads NEVER materialized — ld is computed IN-KERNEL from Wg + the write gate, #45). The routing
-    gram uses the DECAYED gates (rt=r·eᵃ, w_end=w·e^{Λ−a}); Wg=None is the RLA path."""
-    lr, lw = _router_logits(h, Wr, Ww, b_r, b_w, Wr.shape[0])
-    return _RoLARoutedFn.apply(q, k, v, h, lr, lw, D, b, chunk, BG, Wr.shape[0], Wg)
+    gram uses the DECAYED gates (rt=r·eᵃ, w_end=w·e^{Λ−a}); Wg=None is the RLA path. lr,lw may be passed
+    precomputed (the layer dedup)."""
+    if lr is None:
+        H = Wr.shape[0]
+        lr, lw = _router_logits(h, Wr, Ww, b_r, b_w, H)
+    return _RoLARoutedFn.apply(q, k, v, h, lr, lw, D, b, chunk, BG, H, Wg)
 
 
 # ============================================================================
@@ -1756,16 +1764,19 @@ class _RoLARoutedKappaFn(torch.autograd.Function):
 
 
 def _kappa_routed_readout(qf, kf, vf, hf, Wr, Ww, kapf, D, b, chunk_size, global_norm, per_state, eps,
-                          b_r=None, b_w=None, Wg=None):
+                          b_r=None, b_w=None, Wg=None, lr=None, lw=None, H=None):
     """Fused global/kappa/per_state tree-routed readout returning (num[BH,L,V], den[BH,L,1]),
     differentiable. kapf:[BH,L,1]. F2b: the per-level routing logits (h·Wr+b_r, h·Ww+b_w) are a cuBLAS
     GEMM (`_router_logits`, autograd-tracked) and the kernel only softmax+gathers them; dWr/dWw/dh/db flow
-    through the GEMM-backward. Optional per-head decay weight Wg:[H,d_model] (GLA, ld computed IN-KERNEL);
-    Wg=None is the RLA path. CUDA only (the eager fallback stays in the public entry)."""
+    through the GEMM-backward. lr,lw:[BH,L,D,b] may be passed precomputed (the layer dedup). Optional
+    per-head decay weight Wg:[H,d_model] (GLA, ld computed IN-KERNEL); Wg=None is the RLA path."""
     kap = kapf.reshape(qf.shape[0], qf.shape[1]).contiguous()    # [BH,L]
-    lr, lw = _router_logits(hf, Wr, Ww, b_r, b_w, Wr.shape[0])
+    if lr is None:
+        H = Wr.shape[0]
+        lr, lw = _router_logits(hf, Wr, Ww, b_r, b_w, H)
     num, den = _RoLARoutedKappaFn.apply(qf, kf, vf, hf, lr, lw, kap, D, b, chunk_size,
-                                        global_norm, per_state, eps, Wr.shape[0], Wg)
+                                        global_norm, per_state, eps,
+                                        H if H is not None else Wr.shape[0], Wg)
     return num, den.unsqueeze(-1)
 
 
@@ -2142,16 +2153,18 @@ def _ld_from_Wg_torch(hf, wf, Wg, H):
     return ld.clamp(min=_GLA_FLOOR)
 
 
-def _rola_routed_readout(qf, kf, vf, hf, Wr, Ww, D, b, chunk_size, b_r=None, b_w=None, Wg=None):
+def _rola_routed_readout(qf, kf, vf, hf, Wr, Ww, D, b, chunk_size, b_r=None, b_w=None, Wg=None,
+                         lr=None, lw=None, H=None):
     """Folded tree-routed numerator-only readout. CUDA → in-kernel routed Triton kernels (gates AND the
     GLA decay ld never materialized); else → eager core on explicit gates (CPU reference path). Optional
     bias b_r/b_w. Optional per-head decay weight Wg:[H,d_model] (GLA) → the decayed routed readout; Wg=None
-    is RLA."""
+    is RLA. lr,lw:[BH,L,D,b] may be passed precomputed (the layer dedup)."""
     if qf.is_cuda:
         if Wg is not None:
             return rola_gla_routed_triton(qf, kf, vf, hf, Wr, Ww, Wg, D, b, chunk=chunk_size,
-                                          b_r=b_r, b_w=b_w)
-        return rola_rla_routed_triton(qf, kf, vf, hf, Wr, Ww, D, b, chunk=chunk_size, b_r=b_r, b_w=b_w)
+                                          b_r=b_r, b_w=b_w, lr=lr, lw=lw, H=H)
+        return rola_rla_routed_triton(qf, kf, vf, hf, Wr, Ww, D, b, chunk=chunk_size, b_r=b_r, b_w=b_w,
+                                      lr=lr, lw=lw, H=H)
     r, w = _tree_gates_torch(hf, Wr, Ww, D, b, Wr.shape[0], b_r=b_r, b_w=b_w)
     ld = _ld_from_Wg_torch(hf, w, Wg, Wr.shape[0]) if Wg is not None else None
     return _rola_chunk_core(qf, kf, vf, w, r, ld, chunk_size)
@@ -2159,7 +2172,7 @@ def _rola_routed_readout(qf, kf, vf, hf, Wr, Ww, D, b, chunk_size, b_r=None, b_w
 
 @input_guard
 def chunk_rola_routed(q, k, v, h, Wr, Ww, D, b, norm='kappa', kappa=None, scale=None, eps=1e-5,
-                      b_r=None, b_w=None, Wg=None):
+                      b_r=None, b_w=None, Wg=None, wl=None, rl=None):
     """TREE-ROUTED RoLA (in-kernel routing) readout with built-in normalization. DIFFERENTIABLE
     end-to-end. ALL norms (incl. the production 'kappa'/'per_state') are fully fused — the [L,nc]
     gates, the per-state den d, the rescaled read gate r̃, AND (GLA) the per-state log-decay ld are
@@ -2219,9 +2232,19 @@ def chunk_rola_routed(q, k, v, h, Wr, Ww, D, b, norm='kappa', kappa=None, scale=
     # over the BH batch) — the kernel indexes head = fold-row % H, exactly like Wr/Ww. #45.
     Wgf = Wg.float() if Wg is not None else None
 
+    # F2b dedup: if the LAYER already computed the per-level routing logits (for the z-loss), it passes
+    # wl/rl ∈ [B,T,H,D,b] (write/read) — fold to [BH,T,D,b] and route them straight to the kernel (the
+    # routing GEMM is then done ONCE, in the layer, not re-done here via `_router_logits`). chunk_rola_routed
+    # arg order is (read=Wr, write=Ww) so lr(read)=rl, lw(write)=wl. None ⇒ the readouts GEMM from Wr/Ww.
+
+    def fold5(t):   # [B,T,H,D,b] -> [B*H,T,D,b]
+        return t.permute(0, 2, 1, 3, 4).reshape(B * H, T, t.shape[-2], t.shape[-1]).to(compute_dtype)
+    lr = fold5(rl) if rl is not None else None
+    lw = fold5(wl) if wl is not None else None
+
     if norm == 'raw':
         return unfold(_rola_routed_readout(qf, kf, vf, hf, Wr, Ww, D, b, chunk_size,
-                                           b_r=b_r, b_w=b_w, Wg=Wgf)).to(v.dtype)
+                                           b_r=b_r, b_w=b_w, Wg=Wgf, lr=lr, lw=lw, H=H)).to(v.dtype)
 
     # 'kappa'/'per_state': the production read-gate rescale r̃ = r·(d+ε)^{−κ} | r/(d+ε), where the
     # per-state den d_i^c = Σ_{j≤i} (φq_i·φk_j) w_j^c. The FUSED path (`_kappa_routed_readout`) computes
@@ -2236,7 +2259,7 @@ def chunk_rola_routed(q, k, v, h, Wr, Ww, D, b, norm='kappa', kappa=None, scale=
         num, den = _kappa_routed_readout(qf, kf, vf, hf, Wr, Ww, kapf.to(compute_dtype), D, b,
                                          chunk_size, global_norm=(norm == 'global'),
                                          per_state=(norm == 'per_state'), eps=eps,
-                                         b_r=b_r, b_w=b_w, Wg=Wgf)
+                                         b_r=b_r, b_w=b_w, Wg=Wgf, lr=lr, lw=lw, H=H)
         return unfold(num.float() / (den.float() + eps)).to(v.dtype)
 
     # CPU reference path (qf not on CUDA) for all normalized norms: the per-state den pre-pass on
