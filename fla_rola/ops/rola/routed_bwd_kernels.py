@@ -324,6 +324,10 @@ def _bwd_inter_read_kernel(
     BC: tl.constexpr, NCBLK: tl.constexpr, ND: tl.constexpr, NDM: tl.constexpr,
     USE_G: tl.constexpr = False, GLA_FLOOR: tl.constexpr = -2.5,
 ):
+    # #58 grid (B·H, NCBLK): ONE program owns ONE nc-state-block cb=program_id(1) (was an in-program serial
+    # `for cb` loop) — the occupancy widen (16→256 blocks). No cross-cb accumulator: dq is token-indexed
+    # atomic, ds/gdr are cb-local (own-cols) stores, gda is cb-local-cols atomic → the fan-out needs no
+    # recombine.
     # F2b: read factors rebuilt from logits (`_build_factors`); the read-gate grad is stored to gdr (the
     # `_fold_kernel` later folds gdr → dlogit). USE_G (GLA, #30): the inter readout uses the DECAYED read
     # gate rt=r·eᵃ (a=intra-chunk cumsum of ld). dq/dS_read flow through rt; the read routing-factor grad
@@ -341,63 +345,63 @@ def _bwd_inter_read_kernel(
     if USE_G:                                   # per-head decay gate alpha[BT], once (in-kernel ld, #45)
         alpha = _build_alpha(h_ptr, wg_ptr, pid_b, rows, rmask, d_model,
                              sh_b, sh_l, sh_d, swg_d, BT, BD, NDM)
-    for cb in range(NCBLK):
-        cols = cb * BC + offs_c
-        cmask = cols < nc
-        r_tile, w_tile, _frs, _fws, _sels = _build_factors(
-                                        lr_ptr, lw_ptr, sel_ptr, cols, cmask,
-                                        pid_b, rows, rmask, offs_bb, bmask,
-                                        slo_b, slo_l, slo_lvl, slo_bb, ssel_lvl, ssel_b, ssel_c,
-                                        D, BT, BB, BC)
-        if USE_G:
-            ldc = _ld_from_w(w_tile, alpha, cmask, GLA_FLOOR)
-            a = tl.cumsum(ldc, axis=0)
-            ea = tl.exp(a)
-            rt_tile = r_tile * ea            # decayed read gate (used in the readout/dS_read/dq)
-        else:
-            rt_tile = r_tile
-        # dr[BT,BC] sums over dqk → accumulate across BK-feature-blocks; dq[BT,BK] is per-block (offs_k).
-        # M=do·s_flatᵀ is value-contracted → sum over vb; the dS_read store is per (BK,value)-block. The
-        # [BC*BK,BV] s_flat slice stays bounded by BK·BV; rq[BT,BC*BK] is value-free, reused across vb.
-        dr_inter = tl.zeros([BT, BC], dtype=tl.float32)   # grad w.r.t. rt (USE_G) | r (RLA)
-        for d0 in range(ND):
-            offs_k = d0 * BK + tl.arange(0, BK)
-            kmask = offs_k < dqk
-            qc = tl.load(q_ptr + pid_b * sq_b + rows[:, None] * sq_l + offs_k[None, :] * sq_d,
-                         mask=rmask[:, None] & kmask[None, :], other=0.0)
-            ckv = tl.reshape(cols[:, None] * dqk + offs_k[None, :], [BC * BK])
-            ckmask = tl.reshape(cmask[:, None] & kmask[None, :], [BC * BK])
-            rq = tl.reshape(rt_tile[:, :, None] * qc[:, None, :], [BT, BC * BK])
-            M = tl.zeros([BT, BC * BK], dtype=tl.float32)
-            for vb in range(ND_V):
-                offs_v = vb * BV + tl.arange(0, BV)
-                vmask = offs_v < dv
-                doc = tl.load(do_ptr + pid_b * so_b + rows[:, None] * so_l + offs_v[None, :] * so_v,
-                              mask=rmask[:, None] & vmask[None, :], other=0.0)
-                s_flat = tl.load(s_ptr + pid_b * ss_b + ckv[:, None] * ss_k + offs_v[None, :] * ss_v,
-                                 mask=ckmask[:, None] & vmask[None, :], other=0.0)
-                M += tl.dot(doc, tl.trans(s_flat).to(doc.dtype))  # [BT, BC*BK]
-                # dS_read[c,k,v] = sum_t rt[t,c] q[t,k] do[t,v]; accumulate into ds (adjoint of S_j).
-                dS_read = tl.dot(tl.trans(rq).to(doc.dtype), doc)  # [BC*BK, BV]
-                dS_in = tl.load(ds_ptr + pid_b * ss_b + ckv[:, None] * ss_k + offs_v[None, :] * ss_v,
-                                mask=ckmask[:, None] & vmask[None, :], other=0.0)
-                tl.store(ds_ptr + pid_b * ss_b + ckv[:, None] * ss_k + offs_v[None, :] * ss_v,
-                         dS_in + dS_read, mask=ckmask[:, None] & vmask[None, :])
-            Mr = tl.reshape(M, [BT, BC, BK])
-            dr_inter += tl.sum(Mr * qc[:, None, :], axis=2)
-            dq_acc = tl.sum(Mr * rt_tile[:, :, None], axis=1)
-            tl.atomic_add(dq_ptr + pid_b * sq_b + rows[:, None] * sq_l + offs_k[None, :] * sq_d,
-                          dq_acc, mask=rmask[:, None] & kmask[None, :])
-        if USE_G:
-            # dr_inter is the grad w.r.t. rt; routing-factor grad = drt·eᵃ, da-piece dart_inter = drt·rt.
-            dr_tile = tl.where(cmask[None, :], dr_inter * ea, 0.0)
-            da = tl.where(cmask[None, :], dr_inter * rt_tile, 0.0)
-            tl.atomic_add(gda_ptr + pid_b * sga_b + rows[:, None] * sga_l + cols[None, :] * sga_c,
-                          da, mask=rmask[:, None] & cmask[None, :])
-        else:
-            dr_tile = tl.where(cmask[None, :], dr_inter, 0.0)
-        tl.store(gdr_ptr + pid_b * sg_b + offs_t[:, None] * sg_t + cols[None, :] * sg_c,
-                 dr_tile, mask=rmask[:, None] & cmask[None, :])
+    cb = tl.program_id(1)
+    cols = cb * BC + offs_c
+    cmask = cols < nc
+    r_tile, w_tile, _frs, _fws, _sels = _build_factors(
+                                    lr_ptr, lw_ptr, sel_ptr, cols, cmask,
+                                    pid_b, rows, rmask, offs_bb, bmask,
+                                    slo_b, slo_l, slo_lvl, slo_bb, ssel_lvl, ssel_b, ssel_c,
+                                    D, BT, BB, BC)
+    if USE_G:
+        ldc = _ld_from_w(w_tile, alpha, cmask, GLA_FLOOR)
+        a = tl.cumsum(ldc, axis=0)
+        ea = tl.exp(a)
+        rt_tile = r_tile * ea            # decayed read gate (used in the readout/dS_read/dq)
+    else:
+        rt_tile = r_tile
+    # dr[BT,BC] sums over dqk → accumulate across BK-feature-blocks; dq[BT,BK] is per-block (offs_k).
+    # M=do·s_flatᵀ is value-contracted → sum over vb; the dS_read store is per (BK,value)-block. The
+    # [BC*BK,BV] s_flat slice stays bounded by BK·BV; rq[BT,BC*BK] is value-free, reused across vb.
+    dr_inter = tl.zeros([BT, BC], dtype=tl.float32)   # grad w.r.t. rt (USE_G) | r (RLA)
+    for d0 in range(ND):
+        offs_k = d0 * BK + tl.arange(0, BK)
+        kmask = offs_k < dqk
+        qc = tl.load(q_ptr + pid_b * sq_b + rows[:, None] * sq_l + offs_k[None, :] * sq_d,
+                     mask=rmask[:, None] & kmask[None, :], other=0.0)
+        ckv = tl.reshape(cols[:, None] * dqk + offs_k[None, :], [BC * BK])
+        ckmask = tl.reshape(cmask[:, None] & kmask[None, :], [BC * BK])
+        rq = tl.reshape(rt_tile[:, :, None] * qc[:, None, :], [BT, BC * BK])
+        M = tl.zeros([BT, BC * BK], dtype=tl.float32)
+        for vb in range(ND_V):
+            offs_v = vb * BV + tl.arange(0, BV)
+            vmask = offs_v < dv
+            doc = tl.load(do_ptr + pid_b * so_b + rows[:, None] * so_l + offs_v[None, :] * so_v,
+                          mask=rmask[:, None] & vmask[None, :], other=0.0)
+            s_flat = tl.load(s_ptr + pid_b * ss_b + ckv[:, None] * ss_k + offs_v[None, :] * ss_v,
+                             mask=ckmask[:, None] & vmask[None, :], other=0.0)
+            M += tl.dot(doc, tl.trans(s_flat).to(doc.dtype))  # [BT, BC*BK]
+            # dS_read[c,k,v] = sum_t rt[t,c] q[t,k] do[t,v]; accumulate into ds (adjoint of S_j).
+            dS_read = tl.dot(tl.trans(rq).to(doc.dtype), doc)  # [BC*BK, BV]
+            dS_in = tl.load(ds_ptr + pid_b * ss_b + ckv[:, None] * ss_k + offs_v[None, :] * ss_v,
+                            mask=ckmask[:, None] & vmask[None, :], other=0.0)
+            tl.store(ds_ptr + pid_b * ss_b + ckv[:, None] * ss_k + offs_v[None, :] * ss_v,
+                     dS_in + dS_read, mask=ckmask[:, None] & vmask[None, :])
+        Mr = tl.reshape(M, [BT, BC, BK])
+        dr_inter += tl.sum(Mr * qc[:, None, :], axis=2)
+        dq_acc = tl.sum(Mr * rt_tile[:, :, None], axis=1)
+        tl.atomic_add(dq_ptr + pid_b * sq_b + rows[:, None] * sq_l + offs_k[None, :] * sq_d,
+                      dq_acc, mask=rmask[:, None] & kmask[None, :])
+    if USE_G:
+        # dr_inter is the grad w.r.t. rt; routing-factor grad = drt·eᵃ, da-piece dart_inter = drt·rt.
+        dr_tile = tl.where(cmask[None, :], dr_inter * ea, 0.0)
+        da = tl.where(cmask[None, :], dr_inter * rt_tile, 0.0)
+        tl.atomic_add(gda_ptr + pid_b * sga_b + rows[:, None] * sga_l + cols[None, :] * sga_c,
+                      da, mask=rmask[:, None] & cmask[None, :])
+    else:
+        dr_tile = tl.where(cmask[None, :], dr_inter, 0.0)
+    tl.store(gdr_ptr + pid_b * sg_b + offs_t[:, None] * sg_t + cols[None, :] * sg_c,
+             dr_tile, mask=rmask[:, None] & cmask[None, :])
 
 
 # ============ INTER state-update backward (dw, dk, dv; uses ds = adjoint of S_{j+1}) ============
@@ -416,6 +420,9 @@ def _bwd_inter_state_kernel(
     BC: tl.constexpr, NCBLK: tl.constexpr, ND: tl.constexpr, NDM: tl.constexpr,
     USE_G: tl.constexpr = False, GLA_FLOOR: tl.constexpr = -2.5,
 ):
+    # #58 grid (B·H, NCBLK): ONE program owns ONE nc-state-block cb=program_id(1) (was an in-program serial
+    # `for cb` loop) — the occupancy widen (16→256 blocks). No cross-cb accumulator: dk/dv are token-indexed
+    # atomic, gdw is a cb-local (own-cols) store, gda is cb-local-cols atomic → the fan-out needs no recombine.
     # F2b: write factors rebuilt from logits (`_build_factors`); the write-gate grad is stored to gdw (the
     # `_fold_kernel` later folds gdw → dlogit). USE_G (GLA, #30): the state write uses the DECAYED write
     # gate w_end=w·e^{Λ−a} (Λ=chunk-total ld); dk/dv flow through w_end; the write routing-factor grad +=
@@ -435,69 +442,69 @@ def _bwd_inter_state_kernel(
     if USE_G:                                   # per-head decay gate alpha[BT], once (in-kernel ld, #45)
         alpha = _build_alpha(h_ptr, wg_ptr, pid_b, rows, rmask, d_model,
                              sh_b, sh_l, sh_d, swg_d, BT, BD, NDM)
-    for cb in range(NCBLK):
-        cols = cb * BC + offs_c
-        cmask = cols < nc
-        r_tile, w_tile, _frs, _fws, _sels = _build_factors(
-                                        lr_ptr, lw_ptr, sel_ptr, cols, cmask,
-                                        pid_b, rows, rmask, offs_bb, bmask,
-                                        slo_b, slo_l, slo_lvl, slo_bb, ssel_lvl, ssel_b, ssel_c,
-                                        D, BT, BB, BC)
-        if USE_G:
-            ldc = _ld_from_w(w_tile, alpha, cmask, GLA_FLOOR)
-            a = tl.cumsum(ldc, axis=0)
-            Lam = tl.sum(tl.where(offs_t[:, None] == (BT - 1), a, 0.0), axis=0)   # [BC] chunk-total
-            wend_tile = w_tile * tl.exp(Lam[None, :] - a)     # decayed write gate
-        else:
-            wend_tile = w_tile
-        # dw[BT,BC] sums over dqk → accumulate across BK-feature-blocks; dk[BT,BK] per-block (offs_k); dv
-        # [BT,BV] per value-block (offs_v, atomic). N=v·dSᵀ value-contracted → sum over vb; the [BC*BK,BV]
-        # dS slice stays bounded by BK·BV. w_tile[BT,BC] / wk[BT,BC*BK] are value-free, reused across vb.
-        dw_inter = tl.zeros([BT, BC], dtype=tl.float32)   # grad w.r.t. w_end (USE_G) | w (RLA)
-        ZdZ = tl.zeros([BC], dtype=tl.float32)            # Σ_{k,v}(S_j ∘ ds_in), per state-column
-        for d0 in range(ND):
-            offs_k = d0 * BK + tl.arange(0, BK)
-            kmask = offs_k < dqk
-            kc = tl.load(k_ptr + pid_b * sq_b + rows[:, None] * sq_l + offs_k[None, :] * sq_d,
-                         mask=rmask[:, None] & kmask[None, :], other=0.0)
-            ckv = tl.reshape(cols[:, None] * dqk + offs_k[None, :], [BC * BK])
-            ckmask = tl.reshape(cmask[:, None] & kmask[None, :], [BC * BK])
-            wk = tl.reshape(wend_tile[:, :, None] * kc[:, None, :], [BT, BC * BK])
-            N = tl.zeros([BT, BC * BK], dtype=tl.float32)
-            for vb in range(ND_V):
-                offs_v = vb * BV + tl.arange(0, BV)
-                vmask = offs_v < dv
-                vc = tl.load(v_ptr + pid_b * sv_b + rows[:, None] * sv_l + offs_v[None, :] * sv_d,
-                             mask=rmask[:, None] & vmask[None, :], other=0.0)
-                dS_in = tl.load(ds_ptr + pid_b * ss_b + ckv[:, None] * ss_k + offs_v[None, :] * ss_v,
-                                mask=ckmask[:, None] & vmask[None, :], other=0.0)
-                N += tl.dot(vc, tl.trans(dS_in).to(vc.dtype))  # [BT, BC*BK]
-                dv_vb = tl.dot(wk.to(dS_in.dtype), dS_in)
-                tl.atomic_add(dv_ptr + pid_b * sv_b + rows[:, None] * sv_l + offs_v[None, :] * sv_d,
-                              dv_vb, mask=rmask[:, None] & vmask[None, :])
-                if USE_G:
-                    # ZdZ_c += Σ_{k,v}(S_j[c,k,v] · ds_in[c,k,v]) — the e^Λ state-carry Λ-grad.
-                    sj = tl.load(sj_ptr + pid_b * ss_b + ckv[:, None] * ss_k + offs_v[None, :] * ss_v,
-                                 mask=ckmask[:, None] & vmask[None, :], other=0.0)
-                    sd = tl.where(ckmask[:, None] & vmask[None, :], sj * dS_in, 0.0)
-                    ZdZ += tl.sum(tl.reshape(tl.sum(sd, axis=1), [BC, BK]), axis=1)
-            Nr = tl.reshape(N, [BT, BC, BK])
-            dw_inter += tl.sum(Nr * kc[:, None, :], axis=2)
-            dk_acc = tl.sum(Nr * wend_tile[:, :, None], axis=1)
-            tl.atomic_add(dk_ptr + pid_b * sq_b + rows[:, None] * sq_l + offs_k[None, :] * sq_d,
-                          dk_acc, mask=rmask[:, None] & kmask[None, :])
-        if USE_G:
-            # dw_inter is the grad w.r.t. w_end; routing-factor grad = dw_end·e^{Λ−a}; da_wend = −dw_end·w_end.
-            dw_tile = tl.where(cmask[None, :], dw_inter * tl.exp(Lam[None, :] - a), 0.0)
-            da_wend = tl.where(cmask[None, :], -dw_inter * wend_tile, 0.0)
-            dlam = tl.exp(Lam) * ZdZ - tl.sum(da_wend, axis=0)                 # [BC]
-            da = da_wend + tl.where(offs_t[:, None] == (BT - 1), dlam[None, :], 0.0)
-            tl.atomic_add(gda_ptr + pid_b * sga_b + rows[:, None] * sga_l + cols[None, :] * sga_c,
-                          tl.where(cmask[None, :], da, 0.0), mask=rmask[:, None] & cmask[None, :])
-        else:
-            dw_tile = tl.where(cmask[None, :], dw_inter, 0.0)
-        tl.store(gdw_ptr + pid_b * sg_b + offs_t[:, None] * sg_t + cols[None, :] * sg_c,
-                 dw_tile, mask=rmask[:, None] & cmask[None, :])
+    cb = tl.program_id(1)
+    cols = cb * BC + offs_c
+    cmask = cols < nc
+    r_tile, w_tile, _frs, _fws, _sels = _build_factors(
+                                    lr_ptr, lw_ptr, sel_ptr, cols, cmask,
+                                    pid_b, rows, rmask, offs_bb, bmask,
+                                    slo_b, slo_l, slo_lvl, slo_bb, ssel_lvl, ssel_b, ssel_c,
+                                    D, BT, BB, BC)
+    if USE_G:
+        ldc = _ld_from_w(w_tile, alpha, cmask, GLA_FLOOR)
+        a = tl.cumsum(ldc, axis=0)
+        Lam = tl.sum(tl.where(offs_t[:, None] == (BT - 1), a, 0.0), axis=0)   # [BC] chunk-total
+        wend_tile = w_tile * tl.exp(Lam[None, :] - a)     # decayed write gate
+    else:
+        wend_tile = w_tile
+    # dw[BT,BC] sums over dqk → accumulate across BK-feature-blocks; dk[BT,BK] per-block (offs_k); dv
+    # [BT,BV] per value-block (offs_v, atomic). N=v·dSᵀ value-contracted → sum over vb; the [BC*BK,BV]
+    # dS slice stays bounded by BK·BV. w_tile[BT,BC] / wk[BT,BC*BK] are value-free, reused across vb.
+    dw_inter = tl.zeros([BT, BC], dtype=tl.float32)   # grad w.r.t. w_end (USE_G) | w (RLA)
+    ZdZ = tl.zeros([BC], dtype=tl.float32)            # Σ_{k,v}(S_j ∘ ds_in), per state-column
+    for d0 in range(ND):
+        offs_k = d0 * BK + tl.arange(0, BK)
+        kmask = offs_k < dqk
+        kc = tl.load(k_ptr + pid_b * sq_b + rows[:, None] * sq_l + offs_k[None, :] * sq_d,
+                     mask=rmask[:, None] & kmask[None, :], other=0.0)
+        ckv = tl.reshape(cols[:, None] * dqk + offs_k[None, :], [BC * BK])
+        ckmask = tl.reshape(cmask[:, None] & kmask[None, :], [BC * BK])
+        wk = tl.reshape(wend_tile[:, :, None] * kc[:, None, :], [BT, BC * BK])
+        N = tl.zeros([BT, BC * BK], dtype=tl.float32)
+        for vb in range(ND_V):
+            offs_v = vb * BV + tl.arange(0, BV)
+            vmask = offs_v < dv
+            vc = tl.load(v_ptr + pid_b * sv_b + rows[:, None] * sv_l + offs_v[None, :] * sv_d,
+                         mask=rmask[:, None] & vmask[None, :], other=0.0)
+            dS_in = tl.load(ds_ptr + pid_b * ss_b + ckv[:, None] * ss_k + offs_v[None, :] * ss_v,
+                            mask=ckmask[:, None] & vmask[None, :], other=0.0)
+            N += tl.dot(vc, tl.trans(dS_in).to(vc.dtype))  # [BT, BC*BK]
+            dv_vb = tl.dot(wk.to(dS_in.dtype), dS_in)
+            tl.atomic_add(dv_ptr + pid_b * sv_b + rows[:, None] * sv_l + offs_v[None, :] * sv_d,
+                          dv_vb, mask=rmask[:, None] & vmask[None, :])
+            if USE_G:
+                # ZdZ_c += Σ_{k,v}(S_j[c,k,v] · ds_in[c,k,v]) — the e^Λ state-carry Λ-grad.
+                sj = tl.load(sj_ptr + pid_b * ss_b + ckv[:, None] * ss_k + offs_v[None, :] * ss_v,
+                             mask=ckmask[:, None] & vmask[None, :], other=0.0)
+                sd = tl.where(ckmask[:, None] & vmask[None, :], sj * dS_in, 0.0)
+                ZdZ += tl.sum(tl.reshape(tl.sum(sd, axis=1), [BC, BK]), axis=1)
+        Nr = tl.reshape(N, [BT, BC, BK])
+        dw_inter += tl.sum(Nr * kc[:, None, :], axis=2)
+        dk_acc = tl.sum(Nr * wend_tile[:, :, None], axis=1)
+        tl.atomic_add(dk_ptr + pid_b * sq_b + rows[:, None] * sq_l + offs_k[None, :] * sq_d,
+                      dk_acc, mask=rmask[:, None] & kmask[None, :])
+    if USE_G:
+        # dw_inter is the grad w.r.t. w_end; routing-factor grad = dw_end·e^{Λ−a}; da_wend = −dw_end·w_end.
+        dw_tile = tl.where(cmask[None, :], dw_inter * tl.exp(Lam[None, :] - a), 0.0)
+        da_wend = tl.where(cmask[None, :], -dw_inter * wend_tile, 0.0)
+        dlam = tl.exp(Lam) * ZdZ - tl.sum(da_wend, axis=0)                 # [BC]
+        da = da_wend + tl.where(offs_t[:, None] == (BT - 1), dlam[None, :], 0.0)
+        tl.atomic_add(gda_ptr + pid_b * sga_b + rows[:, None] * sga_l + cols[None, :] * sga_c,
+                      tl.where(cmask[None, :], da, 0.0), mask=rmask[:, None] & cmask[None, :])
+    else:
+        dw_tile = tl.where(cmask[None, :], dw_inter, 0.0)
+    tl.store(gdw_ptr + pid_b * sg_b + offs_t[:, None] * sg_t + cols[None, :] * sg_c,
+             dw_tile, mask=rmask[:, None] & cmask[None, :])
 
 
 # ============ FOLD kernel: gate-grad tiles [BT,nc] -> dWr,dWw,dh (router-grad fold) ============
@@ -515,6 +522,11 @@ def _fold_kernel(
     NCBLK: tl.constexpr, NDM: tl.constexpr,
     USE_G: tl.constexpr = False, GLA_FLOOR: tl.constexpr = -2.5,
 ):
+    # #58 grid (B·H, NCBLK): ONE program owns ONE nc-state-block cb=program_id(1) (was an in-program serial
+    # `for cb` loop) — the occupancy widen (16→256 blocks). `_fold_level` atomic-adds dlr/dlw (cb-local cols
+    # but the per-(token,level,branch) slot already sums across nc → already atomic, now more concurrent
+    # adders). USE_G: the per-head decay-logit reduction dz[BT] is now a PER-PROGRAM PARTIAL — each program
+    # folds its own dz into dWg/dh via the SAME post-pass `tl.atomic_add` (the recombine is the atomic).
     # F2b: folds the transient [BT,nc] gate-grads (gdr/gdw) into the per-level dlogit buffers dlr/dlw via
     # `_build_factors`(logits) + `_fold_level`(dlogits); the dWr/dWw/dh router contraction is a cuBLAS
     # GEMM-backward in torch. USE_G (GLA, #45): the per-state log-decay ld is computed in-kernel from Wg +
@@ -536,32 +548,32 @@ def _fold_kernel(
         alpha = _build_alpha(h_ptr, wg_ptr, pid_b, rows, rmask, d_model,
                              sh_b, sh_l, sh_d, swg_d, BT, BD, NDM)
         dz = tl.zeros([BT], dtype=tl.float32)    # Σ_c ∂L/∂z, accumulated over ALL nc-blocks
-    for cb in range(NCBLK):
-        cols = cb * BC + offs_c
-        cmask = cols < nc
-        r_tile, w_tile, frs, fws, sels = _build_factors(
-                                        lr_ptr, lw_ptr, sel_ptr, cols, cmask,
-                                        pid_b, rows, rmask, offs_bb, bmask,
-                                        slo_b, slo_l, slo_lvl, slo_bb, ssel_lvl, ssel_b, ssel_c,
-                                        D, BT, BB, BC)
-        dr_tile = tl.load(gdr_ptr + pid_b * sg_b + offs_t[:, None] * sg_t + cols[None, :] * sg_c,
-                          mask=rmask[:, None] & cmask[None, :], other=0.0)
-        dw_tile = tl.load(gdw_ptr + pid_b * sg_b + offs_t[:, None] * sg_t + cols[None, :] * sg_c,
-                          mask=rmask[:, None] & cmask[None, :], other=0.0)
-        if USE_G:
-            # split the assembled ∂L/∂ld for this block into ∂L/∂w (→ dw_tile) and ∂L/∂z (→ dz).
-            dld_tile = tl.load(dld_ptr + pid_b * sg_b + offs_t[:, None] * sg_t + cols[None, :] * sg_c,
-                               mask=rmask[:, None] & cmask[None, :], other=0.0)
-            one_minus_a = 1.0 - alpha[:, None]
-            m = 1.0 - w_tile * one_minus_a
-            active = (m > 1e-8) & (tl.log(tl.maximum(m, 1e-8)) >= GLA_FLOOR)
-            dld = tl.where(cmask[None, :] & active, dld_tile, 0.0)
-            dw_tile += dld * (-one_minus_a / m)                       # ∂ld/∂w = -(1-alpha)/m
-            dz += tl.sum(dld * (w_tile / m), axis=1) * (alpha * (1.0 - alpha))  # ∂ld/∂alpha · ∂alpha/∂z
-        for lvl in tl.static_range(D):
-            _fold_level(dr_tile, dw_tile, r_tile, w_tile, frs[lvl], fws[lvl], sels[lvl],
-                        dlr_ptr, dlw_ptr, pid_b, rows, rmask, offs_bb, bmask,
-                        slo_b, slo_l, slo_lvl, slo_bb, lvl, BT, BB)
+    cb = tl.program_id(1)
+    cols = cb * BC + offs_c
+    cmask = cols < nc
+    r_tile, w_tile, frs, fws, sels = _build_factors(
+                                    lr_ptr, lw_ptr, sel_ptr, cols, cmask,
+                                    pid_b, rows, rmask, offs_bb, bmask,
+                                    slo_b, slo_l, slo_lvl, slo_bb, ssel_lvl, ssel_b, ssel_c,
+                                    D, BT, BB, BC)
+    dr_tile = tl.load(gdr_ptr + pid_b * sg_b + offs_t[:, None] * sg_t + cols[None, :] * sg_c,
+                      mask=rmask[:, None] & cmask[None, :], other=0.0)
+    dw_tile = tl.load(gdw_ptr + pid_b * sg_b + offs_t[:, None] * sg_t + cols[None, :] * sg_c,
+                      mask=rmask[:, None] & cmask[None, :], other=0.0)
+    if USE_G:
+        # split the assembled ∂L/∂ld for this block into ∂L/∂w (→ dw_tile) and ∂L/∂z (→ dz).
+        dld_tile = tl.load(dld_ptr + pid_b * sg_b + offs_t[:, None] * sg_t + cols[None, :] * sg_c,
+                           mask=rmask[:, None] & cmask[None, :], other=0.0)
+        one_minus_a = 1.0 - alpha[:, None]
+        m = 1.0 - w_tile * one_minus_a
+        active = (m > 1e-8) & (tl.log(tl.maximum(m, 1e-8)) >= GLA_FLOOR)
+        dld = tl.where(cmask[None, :] & active, dld_tile, 0.0)
+        dw_tile += dld * (-one_minus_a / m)                       # ∂ld/∂w = -(1-alpha)/m
+        dz += tl.sum(dld * (w_tile / m), axis=1) * (alpha * (1.0 - alpha))  # ∂ld/∂alpha · ∂alpha/∂z
+    for lvl in tl.static_range(D):
+        _fold_level(dr_tile, dw_tile, r_tile, w_tile, frs[lvl], fws[lvl], sels[lvl],
+                    dlr_ptr, dlw_ptr, pid_b, rows, rmask, offs_bb, bmask,
+                    slo_b, slo_l, slo_lvl, slo_bb, lvl, BT, BB)
     if USE_G:
         # fold dz (the per-head decay-logit grad) into dWg[head,d] += Σ_t h·dz and dh[t,d] += dz·Wg[head,d].
         for dm in range(NDM):

@@ -880,7 +880,7 @@ def _rola_rla_routed_bwd(q, k, v, h, lr, lw, do, D, b, chunk, BG, H, Wg=None):
     for c in reversed(range(NCH)):
         Sj = snap[:, c].contiguous()
         # state-bwd reads dS = adjoint S_{j+1} (pre-decvec) → dk,dv,gdw + (USE_G) the carry/w_end da-pieces.
-        _routed_bwd_inter_state[(B,)](
+        _routed_bwd_inter_state[(B, NCBLK)](
             h, k, v, lr, lw, sel, Wg, Sj, dS, dk, dvv, gdw, gda,
             L, d_model, dqk, dv, nc, c * chunk, H,
             h.stride(0), h.stride(1), h.stride(2), q.stride(0), q.stride(1), q.stride(2),
@@ -897,7 +897,7 @@ def _rola_rla_routed_bwd(q, k, v, h, lr, lw, do, D, b, chunk, BG, H, Wg=None):
             ld_c = _ld_chunk(h[:, r0:r1], lw[:, r0:r1], Wg, D, b, H)   # [B,len,nc]
             Lam_c = ld_c.sum(dim=1)                                    # [B,nc] chunk-total per state
             dS = dS * torch.exp(Lam_c)[:, :, None, None]
-        _routed_bwd_inter_read[(B,)](
+        _routed_bwd_inter_read[(B, NCBLK)](
             h, q, lr, lw, sel, Wg, Sj, dS, do, dq, gdr, gda,
             L, d_model, dqk, dv, nc, c * chunk, H,
             h.stride(0), h.stride(1), h.stride(2), q.stride(0), q.stride(1), q.stride(2),
@@ -914,7 +914,7 @@ def _rola_rla_routed_bwd(q, k, v, h, lr, lw, do, D, b, chunk, BG, H, Wg=None):
             tot = g_sl.sum(dim=1, keepdim=True)
             dld_chunk.zero_()
             dld_chunk[:, :r1 - r0] = tot - g_sl.cumsum(dim=1) + g_sl
-        _routed_bwd_fold[(B,)](
+        _routed_bwd_fold[(B, NCBLK)](
             h, lr, lw, sel, gdr, gdw, dh, dlr, dlw,
             Wg, dWg, dld_chunk,
             L, d_model, nc, c * chunk, H,
@@ -1385,7 +1385,11 @@ def _kappa_bwd_state(h_ptr, k_ptr, v_ptr, lr_ptr, lw_ptr, sel_ptr, wg_ptr, sval_
                      BT: tl.constexpr, BK: tl.constexpr, BV: tl.constexpr, BD: tl.constexpr,
                      BC: tl.constexpr, NCBLK: tl.constexpr, ND: tl.constexpr, NDM: tl.constexpr,
                      USE_G: tl.constexpr, GLA_FLOOR: tl.constexpr):
-    """State-update backward (split #1, SMEM-bound by the dSval tile). F2b: write factors rebuilt from
+    """State-update backward (split #1, SMEM-bound by the dSval tile). Grid (B·H, NCBLK): ONE program owns
+    ONE nc-state-block cb=program_id(1) (was an in-program serial `for cb` loop) — the #58 occupancy widen
+    (16→256 blocks). The nc-state-blocks are INDEPENDENT here: dk/dv are token-indexed `tl.atomic_add`
+    (safe, now more concurrent adders), gda is cb-local-cols atomic, gdw is a cb-local (own-cols) store — no
+    cross-cb accumulator, so the fan-out needs no recombine. F2b: write factors rebuilt from
     logits; the state half of dw stored to gdw. Uses the INCOMING adjoint (= Sval_{j+1}, Sden_{j+1}) to
     backprop the two writes Sval^c += Σ wᶜ k⊗v and Sden^c += Σ wᶜ k. Produces dk,dv (atomic). No [L,nc].
     USE_G (GLA): both writes use w_end=w·e^{Λ-a}; dk/dv flow through w_end; the write routing-factor grad
@@ -1405,78 +1409,78 @@ def _kappa_bwd_state(h_ptr, k_ptr, v_ptr, lr_ptr, lw_ptr, sel_ptr, wg_ptr, sval_
     if USE_G:                                   # per-head decay gate alpha[BT], once (in-kernel ld, #45)
         alpha = _build_alpha(h_ptr, wg_ptr, pid_b, rows, rmask, d_model,
                              sh_b, sh_l, sh_d, swg_d, BT, BD, NDM)
-    for cb in range(NCBLK):
-        cols = cb * BC + offs_c
-        cmask = cols < nc
-        _r, w_tile = _build_rw_tile_logits(lr_ptr, lw_ptr, sel_ptr, cols, cmask,
-                                           pid_b, rows, rmask, offs_bb, bmask,
-                                           slo_b, slo_l, slo_lvl, slo_bb, slo_b, slo_l, slo_lvl, slo_bb,
-                                           ssel_lvl, ssel_b, ssel_c, D, BT, BB, BC, BUILD_R=False)
-        if USE_G:
-            ldc = _ld_from_w(w_tile, alpha, cmask, GLA_FLOOR)
-            a = tl.cumsum(ldc, axis=0)
-            Lam = tl.sum(tl.where(offs_t[:, None] == (BT - 1), a, 0.0), axis=0)   # [BC] chunk-total
-            wend = w_tile * tl.exp(Lam[None, :] - a)     # decayed write gate (both writes)
-        else:
-            wend = w_tile
-        # dw[BT,BC] sums over dqk → accumulate across BK-feature-blocks. dk[BT,BK] is per-feature-block
-        # (offs_k), stored per d0. dv[BT,BV] is per value-block (offs_v), atomic-added per (d0,vb). The
-        # value-contracted Nval=v·dSvalᵀ is summed over value-blocks; the [BC*BK,BV] dSval slice stays
-        # bounded by BK·BV<=64·BV. wend[BT,BC] / wk[BT,BC*BK] are value-free, reused across vb.
-        dw = tl.zeros([BT, BC], dtype=tl.float32)        # grad w.r.t. w_end (USE_G) | w (RLA)
-        ZdZ = tl.zeros([BC], dtype=tl.float32)           # Σ_{k,v}(S_j∘ds_in) over BOTH carries (USE_G)
-        for d0 in range(ND):
-            offs_k = d0 * BK + tl.arange(0, BK)
-            kmask = offs_k < dqk
-            kc = tl.load(k_ptr + pid_b*sq_b + rows[:, None]*sq_l + offs_k[None, :]*sq_d,
-                         mask=rmask[:, None] & kmask[None, :], other=0.0)
-            ck = tl.reshape(cols[:, None] * dqk + offs_k[None, :], [BC * BK])
-            ckmask = tl.reshape(cmask[:, None] & kmask[None, :], [BC * BK])
-            wk = tl.reshape(wend[:, :, None] * kc[:, None, :], [BT, BC * BK])
-            Nval = tl.zeros([BT, BC * BK], dtype=tl.float32)   # v·dSvalᵀ, value-contracted → sum over vb
-            for vb in range(ND_V):
-                offs_v = vb * BV + tl.arange(0, BV)
-                vmask = offs_v < dv
-                vc = tl.load(v_ptr + pid_b*sv_b + rows[:, None]*sv_l + offs_v[None, :]*sv_d,
-                             mask=rmask[:, None] & vmask[None, :], other=0.0)
-                dSval = tl.load(dsval_ptr + pid_b*ssv_b + ck[:, None]*ssv_k + offs_v[None, :]*ssv_v,
-                                mask=ckmask[:, None] & vmask[None, :], other=0.0)
-                Nval += tl.dot(vc, tl.trans(dSval).to(vc.dtype))   # [BT, BC*BK]
-                dv_vb = tl.dot(wk.to(dSval.dtype), dSval)          # [BT,BV] for this value-block
-                tl.atomic_add(dv_ptr + pid_b*sv_b + rows[:, None]*sv_l + offs_v[None, :]*sv_d,
-                              dv_vb, mask=rmask[:, None] & vmask[None, :])
-                if USE_G:
-                    # Sval carry Λ-grad: Σ(Sval_j ∘ dSval_in), accumulated into ZdZ.
-                    sj = tl.load(sval_ptr + pid_b*ssv_b + ck[:, None]*ssv_k + offs_v[None, :]*ssv_v,
-                                 mask=ckmask[:, None] & vmask[None, :], other=0.0)
-                    sd = tl.where(ckmask[:, None] & vmask[None, :], sj * dSval, 0.0)
-                    ZdZ += tl.sum(tl.reshape(tl.sum(sd, axis=1), [BC, BK]), axis=1)
-            Nvr = tl.reshape(Nval, [BT, BC, BK])
-            dw += tl.sum(Nvr * kc[:, None, :], axis=2)
-            dk_acc = tl.sum(Nvr * wend[:, :, None], axis=1)
-            dSden = tl.load(dsden_ptr + pid_b*ssd_b + ck*ssd_k, mask=ckmask, other=0.0)
-            dSden2 = tl.reshape(dSden, [BC, BK])
-            dw += tl.where(cmask[None, :], tl.sum(dSden2[None, :, :] * kc[:, None, :], axis=2), 0.0)
-            dk_acc += tl.dot(wend.to(dSden2.dtype), dSden2)
+    cb = tl.program_id(1)
+    cols = cb * BC + offs_c
+    cmask = cols < nc
+    _r, w_tile = _build_rw_tile_logits(lr_ptr, lw_ptr, sel_ptr, cols, cmask,
+                                       pid_b, rows, rmask, offs_bb, bmask,
+                                       slo_b, slo_l, slo_lvl, slo_bb, slo_b, slo_l, slo_lvl, slo_bb,
+                                       ssel_lvl, ssel_b, ssel_c, D, BT, BB, BC, BUILD_R=False)
+    if USE_G:
+        ldc = _ld_from_w(w_tile, alpha, cmask, GLA_FLOOR)
+        a = tl.cumsum(ldc, axis=0)
+        Lam = tl.sum(tl.where(offs_t[:, None] == (BT - 1), a, 0.0), axis=0)   # [BC] chunk-total
+        wend = w_tile * tl.exp(Lam[None, :] - a)     # decayed write gate (both writes)
+    else:
+        wend = w_tile
+    # dw[BT,BC] sums over dqk → accumulate across BK-feature-blocks. dk[BT,BK] is per-feature-block
+    # (offs_k), stored per d0. dv[BT,BV] is per value-block (offs_v), atomic-added per (d0,vb). The
+    # value-contracted Nval=v·dSvalᵀ is summed over value-blocks; the [BC*BK,BV] dSval slice stays
+    # bounded by BK·BV<=64·BV. wend[BT,BC] / wk[BT,BC*BK] are value-free, reused across vb.
+    dw = tl.zeros([BT, BC], dtype=tl.float32)        # grad w.r.t. w_end (USE_G) | w (RLA)
+    ZdZ = tl.zeros([BC], dtype=tl.float32)           # Σ_{k,v}(S_j∘ds_in) over BOTH carries (USE_G)
+    for d0 in range(ND):
+        offs_k = d0 * BK + tl.arange(0, BK)
+        kmask = offs_k < dqk
+        kc = tl.load(k_ptr + pid_b*sq_b + rows[:, None]*sq_l + offs_k[None, :]*sq_d,
+                     mask=rmask[:, None] & kmask[None, :], other=0.0)
+        ck = tl.reshape(cols[:, None] * dqk + offs_k[None, :], [BC * BK])
+        ckmask = tl.reshape(cmask[:, None] & kmask[None, :], [BC * BK])
+        wk = tl.reshape(wend[:, :, None] * kc[:, None, :], [BT, BC * BK])
+        Nval = tl.zeros([BT, BC * BK], dtype=tl.float32)   # v·dSvalᵀ, value-contracted → sum over vb
+        for vb in range(ND_V):
+            offs_v = vb * BV + tl.arange(0, BV)
+            vmask = offs_v < dv
+            vc = tl.load(v_ptr + pid_b*sv_b + rows[:, None]*sv_l + offs_v[None, :]*sv_d,
+                         mask=rmask[:, None] & vmask[None, :], other=0.0)
+            dSval = tl.load(dsval_ptr + pid_b*ssv_b + ck[:, None]*ssv_k + offs_v[None, :]*ssv_v,
+                            mask=ckmask[:, None] & vmask[None, :], other=0.0)
+            Nval += tl.dot(vc, tl.trans(dSval).to(vc.dtype))   # [BT, BC*BK]
+            dv_vb = tl.dot(wk.to(dSval.dtype), dSval)          # [BT,BV] for this value-block
+            tl.atomic_add(dv_ptr + pid_b*sv_b + rows[:, None]*sv_l + offs_v[None, :]*sv_d,
+                          dv_vb, mask=rmask[:, None] & vmask[None, :])
             if USE_G:
-                # Sden carry Λ-grad: Σ_k(Sden_j ∘ dSden_in), accumulated into ZdZ.
-                sjd = tl.load(sden_ptr + pid_b*ssd_b + ck*ssd_k, mask=ckmask, other=0.0)
-                sdd = tl.where(ckmask, sjd * dSden, 0.0)
-                ZdZ += tl.sum(tl.reshape(sdd, [BC, BK]), axis=1)
-            tl.atomic_add(dk_ptr + pid_b*sq_b + rows[:, None]*sq_l + offs_k[None, :]*sq_d,
-                          dk_acc, mask=rmask[:, None] & kmask[None, :])
+                # Sval carry Λ-grad: Σ(Sval_j ∘ dSval_in), accumulated into ZdZ.
+                sj = tl.load(sval_ptr + pid_b*ssv_b + ck[:, None]*ssv_k + offs_v[None, :]*ssv_v,
+                             mask=ckmask[:, None] & vmask[None, :], other=0.0)
+                sd = tl.where(ckmask[:, None] & vmask[None, :], sj * dSval, 0.0)
+                ZdZ += tl.sum(tl.reshape(tl.sum(sd, axis=1), [BC, BK]), axis=1)
+        Nvr = tl.reshape(Nval, [BT, BC, BK])
+        dw += tl.sum(Nvr * kc[:, None, :], axis=2)
+        dk_acc = tl.sum(Nvr * wend[:, :, None], axis=1)
+        dSden = tl.load(dsden_ptr + pid_b*ssd_b + ck*ssd_k, mask=ckmask, other=0.0)
+        dSden2 = tl.reshape(dSden, [BC, BK])
+        dw += tl.where(cmask[None, :], tl.sum(dSden2[None, :, :] * kc[:, None, :], axis=2), 0.0)
+        dk_acc += tl.dot(wend.to(dSden2.dtype), dSden2)
         if USE_G:
-            # dw is grad w.r.t. w_end → routing-factor grad dw_end·e^{Λ-a}; da_wend=−dw·w_end; dlam on last row.
-            dw_tile = tl.where(cmask[None, :], dw * tl.exp(Lam[None, :] - a), 0.0)
-            da_wend = tl.where(cmask[None, :], -dw * wend, 0.0)
-            dlam = tl.exp(Lam) * ZdZ - tl.sum(da_wend, axis=0)                 # [BC]
-            da = da_wend + tl.where(offs_t[:, None] == (BT - 1), dlam[None, :], 0.0)
-            tl.atomic_add(gda_ptr + pid_b*sga_b + rows[:, None]*sga_l + cols[None, :]*sga_c,
-                          tl.where(cmask[None, :], da, 0.0), mask=rmask[:, None] & cmask[None, :])
-        else:
-            dw_tile = dw
-        tl.store(gdw_ptr + pid_b*sgd_b + offs_t[:, None]*sgd_t + cols[None, :]*sgd_c,
-                 dw_tile, mask=rmask[:, None] & cmask[None, :])
+            # Sden carry Λ-grad: Σ_k(Sden_j ∘ dSden_in), accumulated into ZdZ.
+            sjd = tl.load(sden_ptr + pid_b*ssd_b + ck*ssd_k, mask=ckmask, other=0.0)
+            sdd = tl.where(ckmask, sjd * dSden, 0.0)
+            ZdZ += tl.sum(tl.reshape(sdd, [BC, BK]), axis=1)
+        tl.atomic_add(dk_ptr + pid_b*sq_b + rows[:, None]*sq_l + offs_k[None, :]*sq_d,
+                      dk_acc, mask=rmask[:, None] & kmask[None, :])
+    if USE_G:
+        # dw is grad w.r.t. w_end → routing-factor grad dw_end·e^{Λ-a}; da_wend=−dw·w_end; dlam on last row.
+        dw_tile = tl.where(cmask[None, :], dw * tl.exp(Lam[None, :] - a), 0.0)
+        da_wend = tl.where(cmask[None, :], -dw * wend, 0.0)
+        dlam = tl.exp(Lam) * ZdZ - tl.sum(da_wend, axis=0)                 # [BC]
+        da = da_wend + tl.where(offs_t[:, None] == (BT - 1), dlam[None, :], 0.0)
+        tl.atomic_add(gda_ptr + pid_b*sga_b + rows[:, None]*sga_l + cols[None, :]*sga_c,
+                      tl.where(cmask[None, :], da, 0.0), mask=rmask[:, None] & cmask[None, :])
+    else:
+        dw_tile = dw
+    tl.store(gdw_ptr + pid_b*sgd_b + offs_t[:, None]*sgd_t + cols[None, :]*sgd_c,
+             dw_tile, mask=rmask[:, None] & cmask[None, :])
 
 
 @triton.jit
@@ -1494,7 +1498,13 @@ def _kappa_bwd_read(h_ptr, q_ptr, k_ptr, v_ptr, lr_ptr, lw_ptr, sel_ptr, kap_ptr
                     BT: tl.constexpr, BK: tl.constexpr, BV: tl.constexpr, BD: tl.constexpr,
                     BC: tl.constexpr, NCBLK: tl.constexpr, ND: tl.constexpr, NDM: tl.constexpr,
                     USE_G: tl.constexpr, GLA_FLOOR: tl.constexpr):
-    """Readout/den/d backward (split #2, SMEM-bound by the sval snapshot tile). Recomputes r,w,d,r_tilde
+    """Readout/den/d backward (split #2, SMEM-bound by the sval snapshot tile). Grid (B·H, NCBLK): ONE
+    program owns ONE nc-state-block cb=program_id(1) (was an in-program serial `for cb` loop) — the #58
+    occupancy widen (16→256 blocks). Per-block writes are cb-local (dsval/dsden own-cols stores, gdr own-cols
+    store) or token-indexed atomic (dq,dv) or cb-local-cols atomic (gda,gdw). The two cross-cb reductions —
+    the content-gram adjoint dG[BT,BT] and dkap[BT] — are now PER-PROGRAM PARTIALS: each program contracts
+    its own dG→dq/dk and emits its dkap via the SAME post-pass `tl.atomic_add` (the recombine is the atomic,
+    linear in dG/dkap so the split is exact to the fp atomic-reorder floor). Recomputes r,w,d,r_tilde
     transiently, backprops den + intra num + inter-readout + the per-state-den d, producing dr,dq,dv-intra,
     dkappa, the read+intra+d half of dw (atomic-added into gdw), and the readout contribution to the
     carried dSval/dSden adjoints. dG -> dq,dk. The [L,nc] gates / d / r_tilde are never materialized.
@@ -1534,144 +1544,144 @@ def _kappa_bwd_read(h_ptr, q_ptr, k_ptr, v_ptr, lr_ptr, lw_ptr, sel_ptr, kap_ptr
     # dv (over BV) are atomic-added per d0/vb-block at each producing site (their HBM offset uses offs_k/v).
     dkap_acc = tl.zeros([BT], dtype=tl.float32)
     dG = tl.zeros([BT, BT], dtype=tl.float32)
-    for cb in range(NCBLK):
-        cols = cb * BC + offs_c
-        cmask = cols < nc
-        r_tile, w_tile = _build_rw_tile_logits(lr_ptr, lw_ptr, sel_ptr, cols, cmask,
-                                               pid_b, rows, rmask, offs_bb, bmask,
-                                               slo_b, slo_l, slo_lvl, slo_bb, slo_b, slo_l, slo_lvl, slo_bb,
-                                               ssel_lvl, ssel_b, ssel_c, D, BT, BB, BC)
-        if USE_G:
-            ldc = _ld_from_w(w_tile, alpha, cmask, GLA_FLOOR)
-            a = tl.cumsum(ldc, axis=0)
-            ea, ea_g, ena_g = _decay_factors(a)
-            wt = w_tile * ena_g                # intra gram / den-intra write, ANCHORED (no e^{-a} overflow)
-        else:
-            ea = w_tile * 0.0 + 1.0
-            ea_g = ea
-            ena_g = ea
-            wt = w_tile
-        # d_tile/rt_tile are value-FREE (from G,Sden,r) → compute once, reused for every value-block.
-        d_tile = _kappa_d_tile(q_ptr, sden_ptr, Gc, w_tile, ea, ea_g, ena_g, cols, cmask,
-                               pid_b, rows, rmask, dqk, sq_b, sq_l, sq_d, ssd_b, ssd_k,
-                               BT, BK, BC, ND, USE_G)
-        rt_tile = _kappa_rescale(r_tile, d_tile, kap, cmask, GLOBAL, PER_STATE, EPS)   # UNDECAYED r̃
-        rd_inter = (rt_tile * ea) if USE_G else rt_tile    # readout vs abs-decayed Sval carry: TRUE e^a
-        rd_gram = (rt_tile * ea_g) if USE_G else rt_tile    # intra gram read: ANCHORED (pairs with wt's ena_g)
-        # For RLA (ea≡ea_g≡1, wt≡w, rd≡r̃) the grad folds DIRECTLY into drt/dw with the SAME accumulation
-        # order as the base RLA kernel → byte-identical. For GLA the readout/gram grads collect on the DECAYED
-        # gates and the da-pieces accumulate into gda. The anchored gram read (rd_gram) and the true inter
-        # read (rd_inter) carry SEPARATE grad accumulators (drd_g/drd_i); each cancels its a_ref against its
-        # dual (wt's ena_g for the gram, the Sval/Sden carry for the inter) so every fold is unchanged.
-        drt = dden[:, None] * d_tile          # d(r_tilde) from den (UNDECAYED r̃ → no e^a)
-        dd = dden[:, None] * rt_tile          # d(d) from den
-        drd_g = tl.zeros([BT, BC], dtype=tl.float32)   # readout grad w.r.t. the ANCHORED gram read rd_gram
-        drd_i = tl.zeros([BT, BC], dtype=tl.float32)   # readout grad w.r.t. the TRUE inter read rd_inter
-        # num intra: A=G*Rg*causal ; o_num += A v. dA=(dnum·vᵀ)⊙causal (value-contracted → sum over vb);
-        # dv=Aᵀ·dnum (per value-block → atomic). A/Rg/dG/dw are value-free; dnum,vc loaded per vb. Rg's
-        # anti-causal triangle is +inf at large BT → mask via where (Rg_m) so neither A nor dG forms inf·0.
-        Rg = tl.dot(rd_gram, tl.trans(wt))
-        Rg_m = tl.where(causal > 0.0, Rg, 0.0)
-        A = G * Rg_m
-        dA = tl.zeros([BT, BT], dtype=tl.float32)
+    cb = tl.program_id(1)
+    cols = cb * BC + offs_c
+    cmask = cols < nc
+    r_tile, w_tile = _build_rw_tile_logits(lr_ptr, lw_ptr, sel_ptr, cols, cmask,
+                                           pid_b, rows, rmask, offs_bb, bmask,
+                                           slo_b, slo_l, slo_lvl, slo_bb, slo_b, slo_l, slo_lvl, slo_bb,
+                                           ssel_lvl, ssel_b, ssel_c, D, BT, BB, BC)
+    if USE_G:
+        ldc = _ld_from_w(w_tile, alpha, cmask, GLA_FLOOR)
+        a = tl.cumsum(ldc, axis=0)
+        ea, ea_g, ena_g = _decay_factors(a)
+        wt = w_tile * ena_g                # intra gram / den-intra write, ANCHORED (no e^{-a} overflow)
+    else:
+        ea = w_tile * 0.0 + 1.0
+        ea_g = ea
+        ena_g = ea
+        wt = w_tile
+    # d_tile/rt_tile are value-FREE (from G,Sden,r) → compute once, reused for every value-block.
+    d_tile = _kappa_d_tile(q_ptr, sden_ptr, Gc, w_tile, ea, ea_g, ena_g, cols, cmask,
+                           pid_b, rows, rmask, dqk, sq_b, sq_l, sq_d, ssd_b, ssd_k,
+                           BT, BK, BC, ND, USE_G)
+    rt_tile = _kappa_rescale(r_tile, d_tile, kap, cmask, GLOBAL, PER_STATE, EPS)   # UNDECAYED r̃
+    rd_inter = (rt_tile * ea) if USE_G else rt_tile    # readout vs abs-decayed Sval carry: TRUE e^a
+    rd_gram = (rt_tile * ea_g) if USE_G else rt_tile    # intra gram read: ANCHORED (pairs with wt's ena_g)
+    # For RLA (ea≡ea_g≡1, wt≡w, rd≡r̃) the grad folds DIRECTLY into drt/dw with the SAME accumulation
+    # order as the base RLA kernel → byte-identical. For GLA the readout/gram grads collect on the DECAYED
+    # gates and the da-pieces accumulate into gda. The anchored gram read (rd_gram) and the true inter
+    # read (rd_inter) carry SEPARATE grad accumulators (drd_g/drd_i); each cancels its a_ref against its
+    # dual (wt's ena_g for the gram, the Sval/Sden carry for the inter) so every fold is unchanged.
+    drt = dden[:, None] * d_tile          # d(r_tilde) from den (UNDECAYED r̃ → no e^a)
+    dd = dden[:, None] * rt_tile          # d(d) from den
+    drd_g = tl.zeros([BT, BC], dtype=tl.float32)   # readout grad w.r.t. the ANCHORED gram read rd_gram
+    drd_i = tl.zeros([BT, BC], dtype=tl.float32)   # readout grad w.r.t. the TRUE inter read rd_inter
+    # num intra: A=G*Rg*causal ; o_num += A v. dA=(dnum·vᵀ)⊙causal (value-contracted → sum over vb);
+    # dv=Aᵀ·dnum (per value-block → atomic). A/Rg/dG/dw are value-free; dnum,vc loaded per vb. Rg's
+    # anti-causal triangle is +inf at large BT → mask via where (Rg_m) so neither A nor dG forms inf·0.
+    Rg = tl.dot(rd_gram, tl.trans(wt))
+    Rg_m = tl.where(causal > 0.0, Rg, 0.0)
+    A = G * Rg_m
+    dA = tl.zeros([BT, BT], dtype=tl.float32)
+    for vb in range(ND_V):
+        offs_v = vb * BV + tl.arange(0, BV)
+        vmask = offs_v < dv
+        vc = tl.load(v_ptr + pid_b*sv_b + rows[:, None]*sv_l + offs_v[None, :]*sv_d,
+                     mask=rmask[:, None] & vmask[None, :], other=0.0)
+        dnum = tl.load(dnum_ptr + pid_b*sdo_b + rows[:, None]*sdo_l + offs_v[None, :]*sdo_v,
+                       mask=rmask[:, None] & vmask[None, :], other=0.0)
+        dv_vb = tl.dot(tl.trans(A).to(dnum.dtype), dnum)   # dv[j,v]=sum_i A[i,j] dnum[i,v]
+        tl.atomic_add(dv_ptr + pid_b*sv_b + rows[:, None]*sv_l + offs_v[None, :]*sv_d,
+                      dv_vb, mask=rmask[:, None] & vmask[None, :])
+        dA += tl.dot(dnum, tl.trans(vc))
+    dA = dA * causal
+    dRg = dA * G                          # dRg_ij = dA_ij G_ij (causal already in dA)
+    dG += dA * Rg_m                        # dG_ij += dA_ij Rg_ij — Rg_m (causal-masked) avoids 0·inf=NaN
+    if USE_G:
+        drd_g += tl.dot(dRg.to(wt.dtype), wt)
+        dwt = tl.dot(tl.trans(dRg).to(rd_gram.dtype), rd_gram)
+    else:
+        drt += tl.dot(dRg.to(w_tile.dtype), w_tile)
+        dw = tl.dot(tl.trans(dRg).to(rt_tile.dtype), rt_tile)
+    # num inter readout: o_num += sum_c rd^c (q.Sval_j^c). M=dnum·svalᵀ is value-contracted (sum over
+    # vb); dq + the dSval-store are per-(BK,value)-block; the read grad's inter part sums over d0.
+    for d0 in range(ND):
+        offs_k = d0 * BK + tl.arange(0, BK)
+        kmask = offs_k < dqk
+        qc = tl.load(q_ptr + pid_b*sq_b + rows[:, None]*sq_l + offs_k[None, :]*sq_d,
+                     mask=rmask[:, None] & kmask[None, :], other=0.0)
+        ck = tl.reshape(cols[:, None] * dqk + offs_k[None, :], [BC * BK])
+        ckmask = tl.reshape(cmask[:, None] & kmask[None, :], [BC * BK])
+        rq = tl.reshape(rd_inter[:, :, None] * qc[:, None, :], [BT, BC * BK])
+        M = tl.zeros([BT, BC * BK], dtype=tl.float32)
         for vb in range(ND_V):
             offs_v = vb * BV + tl.arange(0, BV)
             vmask = offs_v < dv
-            vc = tl.load(v_ptr + pid_b*sv_b + rows[:, None]*sv_l + offs_v[None, :]*sv_d,
-                         mask=rmask[:, None] & vmask[None, :], other=0.0)
             dnum = tl.load(dnum_ptr + pid_b*sdo_b + rows[:, None]*sdo_l + offs_v[None, :]*sdo_v,
                            mask=rmask[:, None] & vmask[None, :], other=0.0)
-            dv_vb = tl.dot(tl.trans(A).to(dnum.dtype), dnum)   # dv[j,v]=sum_i A[i,j] dnum[i,v]
-            tl.atomic_add(dv_ptr + pid_b*sv_b + rows[:, None]*sv_l + offs_v[None, :]*sv_d,
-                          dv_vb, mask=rmask[:, None] & vmask[None, :])
-            dA += tl.dot(dnum, tl.trans(vc))
-        dA = dA * causal
-        dRg = dA * G                          # dRg_ij = dA_ij G_ij (causal already in dA)
-        dG += dA * Rg_m                        # dG_ij += dA_ij Rg_ij — Rg_m (causal-masked) avoids 0·inf=NaN
+            sval = tl.load(sval_ptr + pid_b*ssv_b + ck[:, None]*ssv_k + offs_v[None, :]*ssv_v,
+                           mask=ckmask[:, None] & vmask[None, :], other=0.0)         # [BC*BK,BV]
+            M += tl.dot(dnum, tl.trans(sval).to(dnum.dtype))   # [BT, BC*BK]
+            dSval = tl.load(dsval_ptr + pid_b*ssv_b + ck[:, None]*ssv_k + offs_v[None, :]*ssv_v,
+                            mask=ckmask[:, None] & vmask[None, :], other=0.0)
+            tl.store(dsval_ptr + pid_b*ssv_b + ck[:, None]*ssv_k + offs_v[None, :]*ssv_v,
+                     dSval + tl.dot(tl.trans(rq).to(dnum.dtype), dnum),
+                     mask=ckmask[:, None] & vmask[None, :])
+        Mr = tl.reshape(M, [BT, BC, BK])
         if USE_G:
-            drd_g += tl.dot(dRg.to(wt.dtype), wt)
-            dwt = tl.dot(tl.trans(dRg).to(rd_gram.dtype), rd_gram)
+            drd_i += tl.sum(Mr * qc[:, None, :], axis=2)
         else:
-            drt += tl.dot(dRg.to(w_tile.dtype), w_tile)
-            dw = tl.dot(tl.trans(dRg).to(rt_tile.dtype), rt_tile)
-        # num inter readout: o_num += sum_c rd^c (q.Sval_j^c). M=dnum·svalᵀ is value-contracted (sum over
-        # vb); dq + the dSval-store are per-(BK,value)-block; the read grad's inter part sums over d0.
-        for d0 in range(ND):
-            offs_k = d0 * BK + tl.arange(0, BK)
-            kmask = offs_k < dqk
-            qc = tl.load(q_ptr + pid_b*sq_b + rows[:, None]*sq_l + offs_k[None, :]*sq_d,
-                         mask=rmask[:, None] & kmask[None, :], other=0.0)
-            ck = tl.reshape(cols[:, None] * dqk + offs_k[None, :], [BC * BK])
-            ckmask = tl.reshape(cmask[:, None] & kmask[None, :], [BC * BK])
-            rq = tl.reshape(rd_inter[:, :, None] * qc[:, None, :], [BT, BC * BK])
-            M = tl.zeros([BT, BC * BK], dtype=tl.float32)
-            for vb in range(ND_V):
-                offs_v = vb * BV + tl.arange(0, BV)
-                vmask = offs_v < dv
-                dnum = tl.load(dnum_ptr + pid_b*sdo_b + rows[:, None]*sdo_l + offs_v[None, :]*sdo_v,
-                               mask=rmask[:, None] & vmask[None, :], other=0.0)
-                sval = tl.load(sval_ptr + pid_b*ssv_b + ck[:, None]*ssv_k + offs_v[None, :]*ssv_v,
-                               mask=ckmask[:, None] & vmask[None, :], other=0.0)         # [BC*BK,BV]
-                M += tl.dot(dnum, tl.trans(sval).to(dnum.dtype))   # [BT, BC*BK]
-                dSval = tl.load(dsval_ptr + pid_b*ssv_b + ck[:, None]*ssv_k + offs_v[None, :]*ssv_v,
-                                mask=ckmask[:, None] & vmask[None, :], other=0.0)
-                tl.store(dsval_ptr + pid_b*ssv_b + ck[:, None]*ssv_k + offs_v[None, :]*ssv_v,
-                         dSval + tl.dot(tl.trans(rq).to(dnum.dtype), dnum),
-                         mask=ckmask[:, None] & vmask[None, :])
-            Mr = tl.reshape(M, [BT, BC, BK])
-            if USE_G:
-                drd_i += tl.sum(Mr * qc[:, None, :], axis=2)
-            else:
-                drt += tl.sum(Mr * qc[:, None, :], axis=2)
-            dq_read = tl.sum(Mr * rd_inter[:, :, None], axis=1)   # [BT,BK]
-            tl.atomic_add(dq_ptr + pid_b*sq_b + rows[:, None]*sq_l + offs_k[None, :]*sq_d,
-                          dq_read, mask=rmask[:, None] & kmask[None, :])
-        # readout grad → UNDECAYED r̃ — GLA only (RLA folded drt directly above). The gram part folds via
-        # the anchored ea_g, the inter part via the true e^a; each = the true e^a contribution to ∂L/∂r̃.
-        if USE_G:
-            drt += drd_g * ea_g + drd_i * ea
-        # rescale bwd (drt now complete; drt is grad w.r.t. the UNDECAYED r̃).
-        dr_resc, dd_resc, dkap_c = _kappa_rescale_bwd(drt, r_tile, d_tile, kap, cmask,
-                                                      GLOBAL, PER_STATE, EPS)
-        dd += dd_resc
-        dkap_acc += dkap_c
-        # d bwd: d = (Gc·wt)·e^{a-ref} [intra] + (q·Sden_j)·e^a [inter] (GLA) | (Gc·w + q·Sden_j) [RLA]. The
-        # inner-sum grads split: ds_intra=dd·ea_g (the ANCHORED den-intra Gc·wt), ds_inter=dd·ea (the TRUE
-        # den-inter q·Sden); the outer-decay da-piece is dd·d (full d). dG/dw are dqk-free; dq + dSden → d0.
-        ds_intra = (dd * ea_g) if USE_G else dd
-        ds_inter = (dd * ea) if USE_G else dd
-        dG += tl.dot(ds_intra.to(wt.dtype), tl.trans(wt)) * causal
-        if USE_G:
-            dwt += tl.dot(tl.trans(Gc).to(ds_intra.dtype), ds_intra)   # den intra → ANCHORED wt
-        else:
-            dw += tl.dot(tl.trans(Gc).to(ds_intra.dtype), ds_intra)
-        for d0 in range(ND):
-            offs_k = d0 * BK + tl.arange(0, BK)
-            kmask = offs_k < dqk
-            qc = tl.load(q_ptr + pid_b*sq_b + rows[:, None]*sq_l + offs_k[None, :]*sq_d,
-                         mask=rmask[:, None] & kmask[None, :], other=0.0)
-            ck = tl.reshape(cols[:, None] * dqk + offs_k[None, :], [BC * BK])
-            ckmask = tl.reshape(cmask[:, None] & kmask[None, :], [BC * BK])
-            sden = tl.load(sden_ptr + pid_b*ssd_b + ck*ssd_k, mask=ckmask, other=0.0)
-            sden2 = tl.reshape(sden, [BC, BK])
-            dq_d = tl.dot(ds_inter.to(sden2.dtype), sden2)       # [BT,BK]
-            tl.atomic_add(dq_ptr + pid_b*sq_b + rows[:, None]*sq_l + offs_k[None, :]*sq_d,
-                          dq_d, mask=rmask[:, None] & kmask[None, :])
-            dSden = tl.load(dsden_ptr + pid_b*ssd_b + ck*ssd_k, mask=ckmask, other=0.0)
-            dSden_read = tl.reshape(tl.dot(tl.trans(ds_inter).to(qc.dtype), qc), [BC * BK])
-            tl.store(dsden_ptr + pid_b*ssd_b + ck*ssd_k, dSden + dSden_read, mask=ckmask)
-        # write-gate grad: GLA — dwt is the grad w.r.t. the ANCHORED wt=w·e^{a_ref-a}; routing-factor grad
-        # dw=dwt·ena_g; da_wt=−dwt·wt (the a_ref cancels → true); the den's outer-decay da-piece is dd·d,
-        # the readout's splits into drd_g·rd_gram (gram) + drd_i·rd_inter (inter).
-        if USE_G:
-            dw = dwt * ena_g
-            da = drd_g * rd_gram + drd_i * rd_inter - dwt * wt + dd * d_tile
-            tl.atomic_add(gda_ptr + pid_b*sga_b + rows[:, None]*sga_l + cols[None, :]*sga_c,
-                          tl.where(cmask[None, :], da, 0.0), mask=rmask[:, None] & cmask[None, :])
-        tl.store(gdr_ptr + pid_b*sgd_b + offs_t[:, None]*sgd_t + cols[None, :]*sgd_c,
-                 dr_resc, mask=rmask[:, None] & cmask[None, :])
-        tl.atomic_add(gdw_ptr + pid_b*sgd_b + offs_t[:, None]*sgd_t + cols[None, :]*sgd_c,
-                      dw, mask=rmask[:, None] & cmask[None, :])
+            drt += tl.sum(Mr * qc[:, None, :], axis=2)
+        dq_read = tl.sum(Mr * rd_inter[:, :, None], axis=1)   # [BT,BK]
+        tl.atomic_add(dq_ptr + pid_b*sq_b + rows[:, None]*sq_l + offs_k[None, :]*sq_d,
+                      dq_read, mask=rmask[:, None] & kmask[None, :])
+    # readout grad → UNDECAYED r̃ — GLA only (RLA folded drt directly above). The gram part folds via
+    # the anchored ea_g, the inter part via the true e^a; each = the true e^a contribution to ∂L/∂r̃.
+    if USE_G:
+        drt += drd_g * ea_g + drd_i * ea
+    # rescale bwd (drt now complete; drt is grad w.r.t. the UNDECAYED r̃).
+    dr_resc, dd_resc, dkap_c = _kappa_rescale_bwd(drt, r_tile, d_tile, kap, cmask,
+                                                  GLOBAL, PER_STATE, EPS)
+    dd += dd_resc
+    dkap_acc += dkap_c
+    # d bwd: d = (Gc·wt)·e^{a-ref} [intra] + (q·Sden_j)·e^a [inter] (GLA) | (Gc·w + q·Sden_j) [RLA]. The
+    # inner-sum grads split: ds_intra=dd·ea_g (the ANCHORED den-intra Gc·wt), ds_inter=dd·ea (the TRUE
+    # den-inter q·Sden); the outer-decay da-piece is dd·d (full d). dG/dw are dqk-free; dq + dSden → d0.
+    ds_intra = (dd * ea_g) if USE_G else dd
+    ds_inter = (dd * ea) if USE_G else dd
+    dG += tl.dot(ds_intra.to(wt.dtype), tl.trans(wt)) * causal
+    if USE_G:
+        dwt += tl.dot(tl.trans(Gc).to(ds_intra.dtype), ds_intra)   # den intra → ANCHORED wt
+    else:
+        dw += tl.dot(tl.trans(Gc).to(ds_intra.dtype), ds_intra)
+    for d0 in range(ND):
+        offs_k = d0 * BK + tl.arange(0, BK)
+        kmask = offs_k < dqk
+        qc = tl.load(q_ptr + pid_b*sq_b + rows[:, None]*sq_l + offs_k[None, :]*sq_d,
+                     mask=rmask[:, None] & kmask[None, :], other=0.0)
+        ck = tl.reshape(cols[:, None] * dqk + offs_k[None, :], [BC * BK])
+        ckmask = tl.reshape(cmask[:, None] & kmask[None, :], [BC * BK])
+        sden = tl.load(sden_ptr + pid_b*ssd_b + ck*ssd_k, mask=ckmask, other=0.0)
+        sden2 = tl.reshape(sden, [BC, BK])
+        dq_d = tl.dot(ds_inter.to(sden2.dtype), sden2)       # [BT,BK]
+        tl.atomic_add(dq_ptr + pid_b*sq_b + rows[:, None]*sq_l + offs_k[None, :]*sq_d,
+                      dq_d, mask=rmask[:, None] & kmask[None, :])
+        dSden = tl.load(dsden_ptr + pid_b*ssd_b + ck*ssd_k, mask=ckmask, other=0.0)
+        dSden_read = tl.reshape(tl.dot(tl.trans(ds_inter).to(qc.dtype), qc), [BC * BK])
+        tl.store(dsden_ptr + pid_b*ssd_b + ck*ssd_k, dSden + dSden_read, mask=ckmask)
+    # write-gate grad: GLA — dwt is the grad w.r.t. the ANCHORED wt=w·e^{a_ref-a}; routing-factor grad
+    # dw=dwt·ena_g; da_wt=−dwt·wt (the a_ref cancels → true); the den's outer-decay da-piece is dd·d,
+    # the readout's splits into drd_g·rd_gram (gram) + drd_i·rd_inter (inter).
+    if USE_G:
+        dw = dwt * ena_g
+        da = drd_g * rd_gram + drd_i * rd_inter - dwt * wt + dd * d_tile
+        tl.atomic_add(gda_ptr + pid_b*sga_b + rows[:, None]*sga_l + cols[None, :]*sga_c,
+                      tl.where(cmask[None, :], da, 0.0), mask=rmask[:, None] & cmask[None, :])
+    tl.store(gdr_ptr + pid_b*sgd_b + offs_t[:, None]*sgd_t + cols[None, :]*sgd_c,
+             dr_resc, mask=rmask[:, None] & cmask[None, :])
+    tl.atomic_add(gdw_ptr + pid_b*sgd_b + offs_t[:, None]*sgd_t + cols[None, :]*sgd_c,
+                  dw, mask=rmask[:, None] & cmask[None, :])
     # dG -> dq,dk: contract over BT (dG is [BT,BT]) producing [BT,BK] per feature-block → loop d0.
     for d0 in range(ND):
         offs_k = d0 * BK + tl.arange(0, BK)
@@ -1764,7 +1774,7 @@ def _kappa_routed_bwd(q, k, v, h, lr, lw, kap, snap_val, snap_den, dnum, dden,
         gdw.zero_()
         # K1: state-update bwd (reads adjoint of Sval_{j+1}/Sden_{j+1}; produces dk,dv + state half of dw +
         # the USE_G carry/w_end da-pieces, using the chunk-start snapshot Sval_j/Sden_j for the Λ-coupling).
-        _kappa_bwd_state[(B,)](
+        _kappa_bwd_state[(B, NCBLK)](
             h, k, v, lr, lw, sel, Wg, Sval, Sden, dSval, dSden, dk, dvv, gdw, gda,
             L, d_model, dqk, dv, nc, c * chunk, H,
             *sH, *sB, *sV, *slo, *sSel, swg[0], swg[1], *sSV, *sSD, *sGD, *sga, **state_common)
@@ -1777,7 +1787,7 @@ def _kappa_routed_bwd(q, k, v, h, lr, lw, kap, snap_val, snap_den, dnum, dden,
             dSval = dSval * torch.exp(Lam_c)[:, :, None, None]
             dSden = dSden * torch.exp(Lam_c)[:, :, None]
         # K2: readout/den/d bwd (adds dw, produces dr,dq,dv-intra,dkappa; folds dSval/dSden adjoints).
-        _kappa_bwd_read[(B,)](
+        _kappa_bwd_read[(B, NCBLK)](
             h, q, k, v, lr, lw, sel, kap, Wg, Sval, Sden, dnum, dden,
             dSval, dSden, dq, dk, dvv, dkap, gdr, gdw, gda,
             L, d_model, dqk, dv, nc, c * chunk, H,
@@ -1793,7 +1803,7 @@ def _kappa_routed_bwd(q, k, v, h, lr, lw, kap, snap_val, snap_den, dnum, dden,
             dld_chunk[:, :r1 - r0] = tot - g_sl.cumsum(dim=1) + g_sl
         # fold the transient gate-grads -> dlr,dlw (+ decay's dh,dWg); the dWr/dWw/dh router contraction is
         # the cuBLAS GEMM-backward in torch. USE_G also splits dld_chunk → dWg + decay dh + decay write-grad.
-        _routed_bwd_fold[(B,)](
+        _routed_bwd_fold[(B, NCBLK)](
             h, lr, lw, sel, gdr, gdw, dh, dlr, dlw,
             Wg, dWg, dld_chunk,
             L, d_model, nc, c * chunk, H, *sH, *slo, *sSel,
