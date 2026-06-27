@@ -72,7 +72,12 @@ _AT_CFGS = [triton.Config({}, num_warps=w, num_stages=s) for w in _WARPS for s i
 # nc); correctness is unaffected — the kernel still specializes on its real constexprs.
 _SCAN_KEY = ['dqk', 'dv', 'USE_G']
 _CHUNK_FWD = 64 if _BIG_SMEM else 16     # RLA forward
-_CHUNK = 32 if _BIG_SMEM else 16         # GLA forward + all backwards (GLA fp32 decay floor caps BT<=32)
+# GLA forward BT. Was 32: the chunked-decay gram exp(a)·exp(-a) had e^{-a}=e^{|Λ|} overflowing fp32 once
+# BT·|ld| > ~88, so GLA was capped at half of RLA's 64. `_decay_factors` re-anchors the gram to the
+# per-state midpoint (both factors ≤ e^{span/2}) → the safe span DOUBLES (88→176), so BT=64 fits at the
+# unchanged -2.5 floor (64·2.5=160<176). Now matches _CHUNK_FWD. (The backwards stay SMEM-capped to ≤16 by
+# the BK·BC·chunk heuristic — independent of this; the chunked readout is chunk-size invariant.)
+_CHUNK = 64 if _BIG_SMEM else 16
 _KAPPA_BWD_CHUNK = 16                     # fused kappa backward (single mega-kernel, heavy fp32 SMEM)
 
 # --- Backward feature tiling: BD as an autotune knob ----------------------------------------------
@@ -915,8 +920,8 @@ class _RoLARoutedFn(torch.autograd.Function):
     @input_guard
     @autocast_custom_fwd
     def forward(ctx, q, k, v, h, Wr, Ww, D, b, chunk, BG, b_r, b_w, Wg=None):
-        # GLA (USE_G) caps the FORWARD chunk at _CHUNK (32) — the fp32 decay floor + SMEM wall (the BT=64
-        # decayed-gram fp32 tiles overflow the ada-class 99KB SMEM); RLA keeps the full _CHUNK_FWD (64).
+        # GLA (USE_G) caps the FORWARD chunk at _CHUNK (now 64, == _CHUNK_FWD): the re-anchored decay
+        # (`_decay_factors`) keeps the gram fp32-finite at BT=64 (was the e^{-a} overflow that forced BT≤32).
         cap = _CHUNK if Wg is not None else _CHUNK_FWD
         chunk = cap if chunk is None else min(chunk, cap)
         nc = b ** D
