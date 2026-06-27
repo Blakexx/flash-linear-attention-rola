@@ -429,11 +429,12 @@ class TestIntraConfigEquivalence:
         """The CHUNK SIZE is a config branch: re-chunking is a pure reduction-order reassociation, so the
         forward AND every grad are INVARIANT to it. Drive `chunk_rola_routed`'s internal _routed_fwd_tiled
         / kappa-fwd / snapshot scans at NCH=1 (single chunk, the whole sequence) vs multi-chunk (the
-        inter-chunk decvec/Λ/state-carry path NCH=1 leaves dead) by monkeypatching _CHUNK_FWD/_CHUNK, and
-        assert the readout + grads match fp-tight. A bug in the inter-chunk carry (the GLA decay between
-        chunks, the state hand-off) shows up as NCH=1 ≠ NCH>1. T=32 so NCH=1 holds at the card's chunk cap
-        (the backward _CHUNK is SMEM-capped at 32 on a 99KB card — a chunk=64 backward OOMs, so the genuine
-        single-chunk test runs at T=32: chunk32→NCH=1 vs chunk16→NCH=2)."""
+        inter-chunk decvec/Λ/state-carry path NCH=1 leaves dead) by monkeypatching the _CHUNK_FWD/_CHUNK
+        chunk-size CEILINGS (the SMEM derive `_fit_chunk` then caps under them; at T=32 the dominant tile
+        fits so the ceiling IS the chunk), and assert the readout + grads match fp-tight. A bug in the
+        inter-chunk carry (the GLA decay between chunks, the state hand-off) shows up as NCH=1 ≠ NCH>1.
+        T=32 so the single-chunk arm runs at chunk32→NCH=1 vs the multi-chunk arm chunk16→NCH=2 (forward
+        AND backward both key off these ceilings — there is no separate backward chunk constant)."""
         if device != 'cuda':
             pytest.skip('RoLA Triton kernels require CUDA')
         D, b, T = 1, 8, 32
@@ -443,8 +444,8 @@ class TestIntraConfigEquivalence:
                               generator=torch.Generator(device=device).manual_seed(9)) * 0.4
 
         def run(chunk_fwd, chunk_bwd):
-            saved = (C._CHUNK_FWD, C._CHUNK, C._KAPPA_BWD_CHUNK)
-            C._CHUNK_FWD, C._CHUNK, C._KAPPA_BWD_CHUNK = chunk_fwd, chunk_bwd, chunk_bwd
+            saved = (C._CHUNK_FWD, C._CHUNK)
+            C._CHUNK_FWD, C._CHUNK = chunk_fwd, chunk_bwd
             try:
                 q, k, v, h, Wr, Ww = self._mk(T=T, seed=0, grad=True)
                 Wg = Wg_seed.clone().requires_grad_() if gla else None
@@ -454,7 +455,7 @@ class TestIntraConfigEquivalence:
                 grads = torch.autograd.grad((o * go).sum(), sel)
                 return o.detach(), grads
             finally:
-                C._CHUNK_FWD, C._CHUNK, C._KAPPA_BWD_CHUNK = saved
+                C._CHUNK_FWD, C._CHUNK = saved
         # single-chunk (chunk=32 → NCH=1: T<=chunk) vs multi-chunk (chunk=16 → NCH=2: the inter-chunk path).
         o1, g1 = run(32, 32)
         o2, g2 = run(16, 16)

@@ -17,6 +17,7 @@
 # (width dv, BV=next_pow2(dv)); there is no ones-column augmentation — the denominator is a separate
 # per-state pre-pass.
 
+import functools
 import os
 
 import torch
@@ -42,22 +43,48 @@ from fla_rola.ops.rola.routed_bwd_kernels import (
     _fold_kernel as _routed_bwd_fold,
 )
 from fla_rola.utils import (
+    Backend,
     autocast_custom_bwd,
     autocast_custom_fwd,
     autotune_cache_kwargs,
-    check_shared_mem,
+    get_all_max_shared_mem,
     input_guard,
 )
 
-# SMEM fitting follows the canonical FLA idiom: the chunk size BT is a fixed per-device constant
-# (a `check_shared_mem` gate — the one structural knob the autotuner can't own, since the host-side
-# Sb/dSa allocations + launch grid are sized from it before any kernel compiles; GLA's forward BT is 64
-# too now — the re-anchored decay relaxed the old BT<=32 fp32-overflow cap), while the INNER blocks
-# (num_warps / num_stages / BD) are autotune knobs
-# that Triton prunes via OutOfResources. The denominator-split (numerator-only readout, BV=next_pow2
-# (dv)) halved the per-program footprint, so the ada-class BT (64 RLA-fwd / 32 GLA+bwd) now fits down
-# to RTX 30xx (measured); sm75 (T4, 64KB) drops to BT=16.
-_BIG_SMEM = check_shared_mem('ada')
+# SMEM fitting (the one structural knob the autotuner can't own — the host-side Sb/dSa allocations + the
+# launch grid are sized from BT BEFORE any kernel compiles) is DERIVED from the device's REAL max dynamic
+# shared memory, NOT a magic byte constant. `get_all_max_shared_mem()` returns the per-device hard ceiling
+# Triton enforces (OutOfResources above it): 101376 on sm86/sm89 (RTX 30xx/Ada), 166912 on A100, 232448 on
+# H100. `_smem_budget()` keeps `_SMEM_SAFETY` of the SMALLEST device (size to the tightest GPU so no GPU
+# OOMs) as the usable budget; every chunk/tile cap below sizes its analytic fp32-tile footprint to fit it.
+# This REPLACES the old binary `check_shared_mem('ada')` gate (chunk = 64 if ada else 16): the derive is
+# GRADED — a 99KB card lands on the full chunk, a 64KB card steps it down, uniformly via one formula (no
+# per-dqk branch). The INNER blocks (num_warps / num_stages / BD) stay autotune knobs Triton prunes via
+# OutOfResources.
+#
+# num_stages is NOT a budget divisor: these kappa chunk/grad kernels all run num_stages=1, so the per-tile
+# footprint IS the peak (a software pipeline at stages>=2 LOWERS peak via buffer reuse, so a stages=1
+# budget is the CONSERVATIVE bound — never an under-count). The analytic footprints below were calibrated
+# against Triton's reported `.metadata.shared`: at the design point (dqk16,dv64,nc256,tree) the fwd chunk
+# kernel measures 43KB and the bwd read kernel 61KB at chunk=64 (both < 99KB), and the footprint is
+# dqk-INVARIANT (the kernels loop dqk in BK-blocks), so the derived chunk holds across the full dqk sweep.
+_SMEM_SAFETY = 0.8           # fraction of the real device SMEM the host-side tile model is allowed to use
+#                              (headroom for static/driver SMEM + the tl.dot operand staging the model omits)
+
+
+@functools.cache
+def _device_smem():
+    """Real per-SM max DYNAMIC shared-memory bytes of the active CUDA device(s) — the hard ceiling Triton
+    enforces. Takes the SMALLEST across visible devices (size to the tightest GPU). Falls back to the
+    ADA class (101376) off-GPU (CPU/meta) so the host-side tile sizing stays deterministic."""
+    vals = [v for v in get_all_max_shared_mem() if isinstance(v, int) and v > 0]
+    return min(vals) if vals else Backend.ADA.value
+
+
+def _smem_budget():
+    return int(_device_smem() * _SMEM_SAFETY)
+
+
 _WARPS = (2, 4, 8)
 _STAGES = (1, 2, 3)
 _AT_CFGS = [triton.Config({}, num_warps=w, num_stages=s) for w in _WARPS for s in _STAGES]
@@ -72,14 +99,57 @@ _AT_CFGS = [triton.Config({}, num_warps=w, num_stages=s) for w in _WARPS for s i
 # needless full re-tune at every states-per-head in the scaling sweep. Perf-only (config REUSE across
 # nc); correctness is unaffected — the kernel still specializes on its real constexprs.
 _SCAN_KEY = ['dqk', 'dv', 'USE_G']
-_CHUNK_FWD = 64 if _BIG_SMEM else 16     # RLA forward
-# GLA forward BT. Was 32: the chunked-decay gram exp(a)·exp(-a) had e^{-a}=e^{|Λ|} overflowing fp32 once
-# BT·|ld| > ~88, so GLA was capped at half of RLA's 64. `_decay_factors` re-anchors the gram to the
-# per-state midpoint (both factors ≤ e^{span/2}) → the safe span DOUBLES (88→176), so BT=64 fits at the
-# unchanged -2.5 floor (64·2.5=160<176). Now matches _CHUNK_FWD. (The backwards stay SMEM-capped to ≤16 by
-# the BK·BC·chunk heuristic — independent of this; the chunked readout is chunk-size invariant.)
-_CHUNK = 64 if _BIG_SMEM else 16
-_KAPPA_BWD_CHUNK = 16                     # fused kappa backward (single mega-kernel, heavy fp32 SMEM)
+# `_CHUNK`/`_CHUNK_FWD` are the chunk-size CEILING — the largest BT the SMEM derive may pick. 64 is the
+# GLA fp32-overflow ceiling (the chunked-decay gram e^a·e^{-a}; `_decay_factors` re-anchors each factor to
+# the per-state midpoint, doubling the fp32-safe span to BT·|FLOOR|≲177, so 64·2.5=160<177 fits — the
+# binding NUMERICAL limit, not a SMEM one). RLA (`_CHUNK_FWD`) has no such overflow limit; it is held to the
+# same 64 because the SMEM derive (`_fit_chunk`) caps there anyway on a 99KB card and the chunked readout is
+# chunk-size invariant. The ACTUAL per-device chunk is `_fit_chunk(ceiling, BK, BC)` (≤ ceiling), graded by
+# `_smem_budget()` — there is no longer a separate `_KAPPA_BWD_CHUNK`: forward AND backward fit the SAME
+# dominant [BT, BC·BK] fp32 chunk-tile against the SAME budget, so the cap is one uniform formula.
+_CHUNK_FWD = 64                          # RLA chunk ceiling (SMEM-bound; the derive caps under it)
+_CHUNK = 64                              # GLA chunk ceiling (fp32-overflow bound: 64·2.5=160 < 177)
+_DTYPE_BYTES = 4                         # the kappa chunk/grad kernels stage their dominant tiles in fp32
+# The state-slice region ([BC·BK, BV]) is the densest co-resident set in the fused kappa kernels: a READ
+# copy + a WRITE copy of the slice plus the tl.dot operand staging — ~4 live fp32 tiles. The chunk-tile
+# region ([BT, BC·BK]) has ONE dominant live copy (its model UPPER-BOUNDS the measured peak — 64KB model
+# vs 43/61KB real at chunk=64). These structural co-residence counts (read from the kernel source, NOT
+# tuned numbers) divide the device budget per region. On a 99KB card: chunk-tile budget 81KB → chunk 64;
+# state-slice budget ~20KB → BK=BV=16 (the tested envelope; the >16 paths stay assert-guarded, see below).
+_STATE_SLICE_COPIES = 4
+_ROUTER_BD_COPIES = 2                     # router decay build: [BD,BB] weight tile + hc[BT,BD] hidden tile
+
+
+def _fit_chunk(want, row_bytes):
+    """Largest power-of-2 chunk in [16, want] whose dominant fp32 tiles (which scale linearly with BT) fit
+    the device SMEM budget. This sizes BT — the host-side knob the autotuner can't own (it sets the
+    Sval/snapshot allocations + the launch grid before any kernel compiles). `row_bytes` is the kernel's
+    peak SMEM PER chunk-row: the summed width (bytes) of its co-resident fp32 tiles that scale with BT,
+    read from the kernel source and calibrated against Triton's `.metadata.shared`. Floors at 16 (tl.dot
+    gram dim ≥ 16). A bigger tile (large BK_full at frontier dqk) ⇒ a bigger row_bytes ⇒ a smaller chunk —
+    the derive NATURALLY steps the chunk down at large dqk and up at small dqk, one formula, no per-dqk
+    branch. The looped kappa kernels keep BK=16 (BT-only growth) → full chunk; the un-looped RLA-raw
+    backward intra kernel uses BK_full → its row_bytes scales with dqk → it steps down (the fit-critical
+    path: at dqk=128 chunk=64 needs 112KB > 99KB, so it derives down to a fitting chunk)."""
+    budget = _smem_budget()
+    chunk = max(16, want)
+    while chunk > 16 and row_bytes * chunk > budget:
+        chunk //= 2
+    return chunk
+
+
+# Per-chunk-row fp32 SMEM footprints (bytes) of the BT-scaling kernels, calibrated to `.metadata.shared`:
+#   * looped kappa fwd/bwd: the dominant [BT, BC·BK] read/write tile (BK=16 looped, BC=16) → BC·BK·4. The
+#     kappa kernels also carry a fixed base (router build + [BT,BT] grams) but it is far under budget at
+#     every BT≤64 on a 99KB card (measured fwd 43KB / bwd-read 61KB), so the BT-linear term sizing is safe.
+#   * un-looped RLA-raw backward `_routed_bwd_intra`: 3 fp32 [BT, BK_full] tiles (q, k, dq/dk accumulator)
+#     + 2 fp32 [BT, BVO] tiles (v, do/dv) co-resident → (3·BK_full + 2·BVO)·4. EXACT vs the measured peak
+#     (chunk·(12·BK_full + 8·BVO): dqk16/dv64 704·BT, dqk128/dv64 2048·BT — verified across the sweep).
+def _kappa_row_bytes(BK, BC=16):
+    return BC * BK * _DTYPE_BYTES
+
+def _intra_row_bytes(BK_full, BVO):
+    return (3 * BK_full + 2 * BVO) * _DTYPE_BYTES
 
 # --- Backward feature tiling: BD as an autotune knob ----------------------------------------------
 # The backward grad kernels load a [BD, BG*BV] slice of the Kronecker state per feature-block into
@@ -142,16 +212,21 @@ def _bv_cap(dv):
 # Both loops are pure reduction-order / output-block reassociations → bit-faithful. (`_kappa_bk_cap`
 # keeps the value-free backward — which has no BV loop — fitting by capping BK against max(BV,BT).)
 #
-# CURRENT-BUDGET INVARIANT: at the 24KB budget below BOTH helpers ALWAYS return 16 for every shape
-# the kernels are tested on (dqk,dv,chunk all ≤128 — verified). The BK=32/BV=32 branches are therefore
-# UNTESTED. If you raise the budget (or the tested-shape envelope grows), the cap can return 32 and
-# silently activate those untested tile paths — re-validate the fused kappa fwd/bwd bit-faithfulness
-# (test_kappa_routed_*) BEFORE trusting BK/BV>16. The asserts in the two helpers make a >16 result LOUD.
+# The state-slice budget is DERIVED: `_smem_budget() // _STATE_SLICE_COPIES` — the device's real SMEM share
+# for ONE [BC·BK, BV] fp32 tile, given _STATE_SLICE_COPIES (~4) live co-resident in these kernels (read +
+# write copies + tl.dot operand staging). On a 99KB card this is ~20KB ≈ the old hand-tuned 24KB constant.
+#
+# CURRENT-BUDGET INVARIANT: at this derived budget BOTH helpers ALWAYS return 16 for every shape the
+# kernels are tested on (dqk,dv,chunk all ≤512 — verified across the full sweep on a 99KB card). The
+# BK=32/BV=32 branches are therefore UNTESTED. On a LARGER-SMEM device (A100 166KB → budget ~33KB,
+# H100 232KB → ~46KB) the cap CAN return 32 — which (by design) trips the asserts below, forcing the
+# re-validation of the untested tile path BEFORE it silently activates. Re-validate the fused kappa
+# fwd/bwd bit-faithfulness (test_kappa_routed_*), then relax the assert. The asserts make a >16 result LOUD.
 def _kappa_bk_cap(dqk, dv, chunk, bc=16):
     bv = _bv_cap(dv)
     want = min(64, max(16, triton.next_power_of_2(dqk)))
-    budget = 24 * 1024                       # bytes for ONE [BC*BK, max(BV,BT)] fp32 tile (several live +
-    span = bc * max(bv, chunk) * 4           # the fp32 backward operands + pipelining, within the ~100KB cap)
+    budget = _smem_budget() // _STATE_SLICE_COPIES   # device SMEM share for ONE [BC*BK,max(BV,BT)] fp32 tile
+    span = bc * max(bv, chunk) * 4
     bk = want
     while bk > 16 and bk * span > budget:
         bk //= 2
@@ -168,7 +243,7 @@ def _kappa_bv_tile(dqk, dv, bc=16, bk_cap=64):
     [16, next_pow2(dv)] keeping BC·BK·BV·4 under budget so the read + write copies of the slice both fit."""
     bk = min(bk_cap, max(16, triton.next_power_of_2(dqk)))
     want = max(16, triton.next_power_of_2(dv))
-    budget = 24 * 1024                       # one [BC*BK, BV] fp32 tile; the read+write pair + rq/wk fit
+    budget = _smem_budget() // _STATE_SLICE_COPIES   # device SMEM share for ONE [BC*BK,BV] fp32 tile
     span = bc * bk * 4
     bv = want
     while bv > 16 and bv * span > budget:
@@ -181,9 +256,22 @@ def _kappa_bv_tile(dqk, dv, bc=16, bk_cap=64):
     return bv
 
 
-_ROUTER_BD_BUDGET = 8192   # elements (32KB fp32) for the in-kernel router's [BD, BB] weight tile (one
-#                            tile live at a time — the kappa kernels run num_stages=1, no double-buffer)
-_ROUTER_BD_MAX = 256       # absolute BD cap (bounds the hc[BT,BD] tile + keeps the NDM-unroll IR small)
+def _largest_pow2_leq(x):
+    return 1 << (max(1, int(x)).bit_length() - 1)
+
+
+def _router_bd_budget():
+    """fp32 ELEMENTS for the in-kernel router decay build's [BD, BB] weight tile, DERIVED from the device
+    SMEM share for the router region (`_ROUTER_BD_COPIES` co-resident tiles: [BD,BB] + hc[BT,BD]). On a
+    99KB card ≈ 10K elements (~40KB) — the same BD selection the old hand-tuned 8192-element budget gave."""
+    return max(16, (_smem_budget() // _ROUTER_BD_COPIES) // _DTYPE_BYTES)
+
+
+def _router_bd_max():
+    """Upper BD cap, DERIVED so the hc[BT, BD] fp32 hidden tile of the decay build fits the router SMEM
+    share at the largest chunk (_CHUNK). With chunk now SMEM-derived up to 64, this is the binding tile —
+    it caps BD below the [BD,BB]-budget's pick (e.g. 128 on a 99KB card at BT=64), NDM tiling the rest."""
+    return max(16, _largest_pow2_leq((_smem_budget() // _ROUTER_BD_COPIES) // (_CHUNK * _DTYPE_BYTES)))
 
 
 def _router_bd_ndm(d_model, b):
@@ -201,12 +289,13 @@ def _router_bd_ndm(d_model, b):
     because [BD,BB] is intrinsically wide there. `_build_alpha` NDM-loops, so the cap only splits the d_model
     decay reduction into NDM blocks (output unchanged to fp tolerance). (Pre-F2b this also sized the router
     h·W build; that contraction is now a cuBLAS GEMM in the layer, so BD/NDM gate only the decay now.)"""
+    bd_budget = _router_bd_budget()
     BB = max(16, triton.next_power_of_2(b))
     bd_full = max(16, triton.next_power_of_2(d_model))
-    bd_cap = triton.next_power_of_2(max(1, _ROUTER_BD_BUDGET // BB))
-    while bd_cap > 16 and bd_cap * BB > _ROUTER_BD_BUDGET:
+    bd_cap = triton.next_power_of_2(max(1, bd_budget // BB))
+    while bd_cap > 16 and bd_cap * BB > bd_budget:
         bd_cap //= 2          # round DOWN to the largest pow2 keeping [BD,BB] within budget (floor 16)
-    BD = max(16, min(bd_full, bd_cap, _ROUTER_BD_MAX))
+    BD = max(16, min(bd_full, bd_cap, _router_bd_max()))
     return BD, triton.cdiv(d_model, BD)
 
 
@@ -746,9 +835,10 @@ def _rola_rla_routed_bwd(q, k, v, h, lr, lw, do, D, b, chunk, BG, H, Wg=None):
     # (dfr/fr with D levels) is precision-sensitive, so the logits + all gram dots run with fp32 operands.
     q, k, v, h, lr, lw, do = (x.float().contiguous() for x in (q, k, v, h, lr, lw, do))
     slo = (lw.stride(0), lw.stride(1), lw.stride(2), lw.stride(3))
-    chunk = min(chunk, _CHUNK)
-    if BK * BC * chunk * 4 > 16 * 1024:
-        chunk = min(chunk, _KAPPA_BWD_CHUNK)
+    # SMEM-derived: the BINDING kernel here is `_routed_bwd_intra` — it uses the FULL BK_full=next_pow2(dqk)
+    # tile (NOT the BK=16 loop of the inter/kappa kernels), so its footprint scales with dqk. Size the chunk
+    # to ITS per-row cost so frontier dqk steps the chunk down (dqk=128 → can't hold chunk=64 in 99KB → 32/16).
+    chunk = _fit_chunk(min(chunk, _CHUNK), _intra_row_bytes(BK_full, BVO))
     NCH = triton.cdiv(L, chunk)
     sel = _build_sel(D, b, nc, q.device)
     Wg = (Wg.float().contiguous() if use_g else q.new_zeros(H, d_model))
@@ -1195,13 +1285,15 @@ def _kappa_routed_fwd(q, k, v, h, lr, lw, kap, D, b, sel, chunk, global_norm, pe
     d_model = h.shape[-1]
     nc = b ** D
     BC = 16   # tl.dot needs the gram dim >=16; the nc tail is cmask'd (was max(16,min(nc,16)) ≡ 16)
-    BK = _kappa_bk_cap(dqk, dv, _KAPPA_BWD_CHUNK, BC)    # feature-tile (loop ND) — bounds the [BT,BC*BK] tiles
+    BK = _kappa_bk_cap(dqk, dv, min(chunk, _CHUNK_FWD), BC)  # feature-tile (loop ND) — bounds the [BT,BC*BK] tiles
     BV = _kappa_bv_tile(dqk, dv, BC)                     # value-tile (loop ND_V) so [BC*BK,BV] fits SRAM
     BD, NDM = _router_bd_ndm(d_model, b)                  # F5: cap BD so the [BD,BB] router tile fits SRAM
     BB = max(16, triton.next_power_of_2(b))
-    # The [BT,BC*BK] rq/wk tiles scale with BT, so the heavy-tile fwd chunk is capped like the bwd (the
-    # chunked scan is chunk-size invariant). Cheap dqk/dv keep the full fwd chunk (BC*BK*BT then fits).
-    chunk = chunk if BK * BC * chunk * 4 <= 24 * 1024 else min(chunk, _KAPPA_BWD_CHUNK)
+    # The [BT,BC*BK] rq/wk tiles scale with BT → the chunk is SMEM-derived (one uniform formula, fwd+bwd):
+    # the largest pow2 BT whose dominant fp32 chunk-tile fits the device budget. On a 99KB card this lands
+    # at the full 64 (the design-point win: 64 launches → 16); a smaller card steps down. Chunk-invariant
+    # scan, so a bit-identical readout at any chunk. Idempotent (the Function already capped to the ceiling).
+    chunk = _fit_chunk(min(chunk, _CHUNK_FWD), _kappa_row_bytes(BK, BC))
     NCBLK = triton.cdiv(nc, BC)
     ND = triton.cdiv(dqk, BK)
     NCH = triton.cdiv(L, chunk)
@@ -1747,8 +1839,13 @@ class _RoLARoutedKappaFn(torch.autograd.Function):
         global_norm, per_state, eps = ctx.global_norm, ctx.per_state, ctx.eps
         nc = b ** D
         sel = _build_sel(D, b, nc, q.device)
-        # The fused kappa backward is a single mega-kernel → cap the backward chunk at _KAPPA_BWD_CHUNK (16).
-        chunk = min(chunk, _KAPPA_BWD_CHUNK)
+        # SMEM-derive the backward chunk ONCE here so the recompute-forward AND the reverse-scan agree on
+        # NCH / the per-chunk snapshot alignment (both receive this fitted `chunk`). The fused kappa backward
+        # is a single mega-kernel; its dominant fp32 tile is the SAME [BT, BC·BK] as the forward, so it fits
+        # against the SAME budget — on a 99KB card this lands at the full 64 (the bwd read kernel measures
+        # 61KB < 99KB at chunk=64), graded down on smaller cards. No separate _KAPPA_BWD_CHUNK constant.
+        dqkb, dvb = q.shape[-1], v.shape[-1]
+        chunk = _fit_chunk(min(chunk, _CHUNK), _kappa_row_bytes(_kappa_bk_cap(dqkb, dvb, min(chunk, _CHUNK), 16)))
         # F4: the routing LOGITS lr/lw stay in their input dtype (bf16) — the router build is a bounded
         # softmax (the kernels upcast to fp32 internally). q/k/v/kap keep fp32 (den/decay-sensitive path).
         q, k, v, kap = (x.float().contiguous() for x in (q, k, v, kap))
@@ -1800,8 +1897,10 @@ def _kappa_routed_readout(qf, kf, vf, hf, Wr, Ww, kapf, D, b, chunk_size, global
 # measured finite). The differenced form e^{a_i-a_j} would be BT-free but can't be absorbed into the
 # routed read/write matmul nor the cross-chunk state carry — re-anchoring is the in-matmul-compatible
 # stabilization. SEPARATELY, the fused kappa-routed BACKWARD mega-kernel (decayed gram + 3-pass-κ fp32
-# tiles co-resident) is SMEM-bound, so its chunk is independently capped at _KAPPA_BWD_CHUNK=16 by the
-# BK·BC·chunk heuristic — a wall on the BACKWARD only, unaffected by the (now-relaxed) overflow limit.
+# tiles co-resident) is SMEM-bound, so its chunk is sized by the SAME `_fit_chunk` derive as the forward
+# (the dominant [BT, BC·BK] fp32 tile vs `_smem_budget()`) — on a 99KB card both land at 64 (the bwd read
+# kernel measures 61KB < 99KB there), graded down on smaller cards. This BT≤64 (overflow) ceiling is the
+# numerical bound the SMEM derive then caps under; the two limits are independent.
 #
 # FLOOR=-2.5 ⇒ per-token retention ≥ e^{-2.5} = 8.2%/tok. KEPT (160<177 fits BT=64, but the headroom is
 # thin — full floor removal would need a tighter per-tile anchor). The production layer's ld=log
