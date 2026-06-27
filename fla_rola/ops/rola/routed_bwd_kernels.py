@@ -202,6 +202,31 @@ def _ld_from_w(w_tile, alpha, cmask, GLA_FLOOR: tl.constexpr):
     return tl.where(cmask[None, :], ld, 0.0)
 
 
+@triton.jit
+def _decay_factors(a):
+    """Re-anchored GLA decay factors from the per-state intra-chunk cumsum a[BT,BC] (per-token log-decay
+    ld≤0 ⇒ a non-increasing down the chunk, a≤0). Returns (ea, ea_g, ena_g):
+
+      ea    = e^a                  TRUE per-token decay (≤1) — the INTER readout (q·Sval/Sden carry) and
+                                   the den's outer scale, where e^a multiplies the ABSOLUTELY-decayed
+                                   cross-chunk state (no dual e^{-a} to cancel a re-anchor against).
+      ea_g  = e^{a - a_ref}        ANCHORED read factor  ┐ the INTRA gram pair: ea_g·ena_g = e^{a_i-a_j},
+      ena_g = e^{a_ref - a}        ANCHORED write factor ┘ IDENTICAL to e^a·e^{-a}, but with a_ref the
+                                   per-state midpoint (max_t a + min_t a)/2 BOTH factors stay ≤ e^{span/2}
+                                   (span = |Λ| over the chunk) instead of e^{-a}=e^{|Λ|} overflowing fp32.
+
+    Stable-softmax / FlashAttention max-subtraction applied to the chunked-GLA decay: the product is
+    mathematically invariant to a_ref (so the readout + every grad are unchanged to fp tolerance), but the
+    per-tile exponents are re-anchored so they never overflow for any chunk size BT. (The decayed gram
+    Rgram = (r·ea_g)·(w·ena_g)ᵀ still holds +inf in its anti-causal triangle — e^{a_i-a_j}, i<j — for large
+    BT; the caller MUST `tl.where(causal, Rgram, 0)` before any 0·Rgram multiply, never `*causal`.)"""
+    a_ref = 0.5 * (tl.max(a, axis=0) + tl.min(a, axis=0))   # [BC] per-state midpoint anchor
+    ea = tl.exp(a)
+    ea_g = tl.exp(a - a_ref[None, :])
+    ena_g = tl.exp(a_ref[None, :] - a)
+    return ea, ea_g, ena_g
+
+
 # ============ INTRA backward kernel ============
 @triton.jit
 def _bwd_intra_kernel(
@@ -277,13 +302,17 @@ def _bwd_intra_kernel(
         if USE_G:
             ldc = _ld_from_w(w_tile, alpha, cmask, GLA_FLOOR)
             a = tl.cumsum(ldc, axis=0)
-            r_tile = r_tile * tl.exp(a)
-            w_tile = w_tile * tl.exp(-a)
+            _ea, ea_g, ena_g = _decay_factors(a)        # ANCHORED intra-gram pair (no e^{-a} overflow)
+            r_tile = r_tile * ea_g
+            w_tile = w_tile * ena_g
         Rgram += tl.dot(r_tile, tl.trans(w_tile))
-    A = G * Rgram * causal
+    # Rgram's anti-causal triangle is +inf at large BT (e^{a_i-a_j}, i<j) → mask via where (Rgram_m) so
+    # neither A nor dG forms 0·inf=NaN; bit-identical to `Rgram*causal` whenever Rgram is finite.
+    Rgram_m = tl.where(causal, Rgram, 0.0)
+    A = G * Rgram_m
     dv_acc = tl.dot(tl.trans(A).to(doc.dtype), doc)
     dRgram = dov * G
-    dG = dov * Rgram
+    dG = dov * Rgram_m
     dq_acc = tl.dot(dG.to(kc.dtype), kc)
     dk_acc = tl.dot(tl.trans(dG).to(qc.dtype), qc)
     tl.store(dv_ptr + pid_b * sv_b + rows[:, None] * sv_l + offs_v[None, :] * sv_d,
@@ -305,15 +334,16 @@ def _bwd_intra_kernel(
         if USE_G:
             ldc = _ld_from_w(w_tile, alpha, cmask, GLA_FLOOR)
             a = tl.cumsum(ldc, axis=0)
-            ea = tl.exp(a)
-            ena = tl.exp(-a)
-            rt = r_tile * ea
-            wt = w_tile * ena
-            # grads w.r.t. the DECAYED gates rt/wt, then chain to the routing factors r/w for the fold.
+            _ea, ea_g, ena_g = _decay_factors(a)             # ANCHORED intra-gram pair (pure gram → both cancel)
+            rt = r_tile * ea_g
+            wt = w_tile * ena_g
+            # grads w.r.t. the DECAYED gates rt/wt, then chain to the routing factors r/w for the fold. The
+            # a_ref of the anchored pair cancels in every product below (drt·rt, dr=drt·ea_g, dw=dwt·ena_g,
+            # da=drt·rt−dwt·wt), so each fold/grad is identical to the unanchored e^a/e^{-a} form.
             drt = tl.dot(dRgram.to(wt.dtype), wt)            # [BT,BC]
             dwt = tl.dot(tl.trans(dRgram).to(rt.dtype), rt)  # [BT,BC]
-            dr_tile = drt * ea                               # routing-factor grad (→ fold)
-            dw_tile = dwt * ena
+            dr_tile = drt * ea_g                             # routing-factor grad (→ fold)
+            dw_tile = dwt * ena_g
             # da-pieces: +dart_intra (=drt·rt), −da_wt (=dwt·wt); accumulate into the persistent gda buffer.
             da = drt * rt - dwt * wt
             tl.atomic_add(gda_ptr + pid_b * sga_b + rows[:, None] * sga_l + cols[None, :] * sga_c,
