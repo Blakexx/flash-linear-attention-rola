@@ -51,8 +51,9 @@ from fla_rola.utils import (
 
 # SMEM fitting follows the canonical FLA idiom: the chunk size BT is a fixed per-device constant
 # (a `check_shared_mem` gate — the one structural knob the autotuner can't own, since the host-side
-# Sb/dSa allocations + launch grid are sized from it before any kernel compiles, and GLA needs BT<=32
-# for its fp32 decay floor), while the INNER blocks (num_warps / num_stages / BD) are autotune knobs
+# Sb/dSa allocations + launch grid are sized from it before any kernel compiles; GLA's forward BT is 64
+# too now — the re-anchored decay relaxed the old BT<=32 fp32-overflow cap), while the INNER blocks
+# (num_warps / num_stages / BD) are autotune knobs
 # that Triton prunes via OutOfResources. The denominator-split (numerator-only readout, BV=next_pow2
 # (dv)) halved the per-program footprint, so the ada-class BT (64 RLA-fwd / 32 GLA+bwd) now fits down
 # to RTX 30xx (measured); sm75 (T4, 64KB) drops to BT=16.
@@ -783,9 +784,10 @@ def _rola_rla_routed_bwd(q, k, v, h, Wr, Ww, do, D, b, chunk, BG, b_r=None, b_w=
     sbias = _bias_strides(br, bw, has_bias)
     head = _router_head_strides(Wr, Ww, br, bw, has_bias)   # (H, swr_head, sww_head, sbr_head, sbw_head)
     # The fold kernels run fp32 operands (precision floor of the deep-Hadamard jacobian); fp32 doubles
-    # per-program SMEM vs the proto's bf16 regime, so the backward chunk is capped at _CHUNK (32) — the
-    # GLA/all-backwards device constant — independent of the forward chunk (each is just a tiling of the
-    # SAME sequence; the chunked readout is chunk-size invariant). Avoids the BT=64-fp32 SMEM wall.
+    # per-program SMEM vs the proto's bf16 regime, so the backward chunk is capped at _CHUNK, then
+    # re-capped to _KAPPA_BWD_CHUNK (16) just below when BK·BC·chunk is large (the large-dqk fp32-tile
+    # SMEM wall) — independent of the forward chunk (each is just a tiling of the SAME sequence; the
+    # chunked readout is chunk-size invariant).
     chunk = min(chunk, _CHUNK)
     # The inter [BT,BC*BK] read/write tiles scale with BT; at large dqk (small BK, many ND) the fp32
     # tiles + 3D elementwise temporaries exceed the cap at BT=32, so cap BT further when BC*BK is large
@@ -1928,27 +1930,28 @@ def _kappa_routed_readout(qf, kf, vf, hf, Wr, Ww, kapf, D, b, chunk_size, global
     return num, den.unsqueeze(-1)
 
 
-# --- GLA per-token log-decay floor — a GENUINE fp32+SMEM limit, NOT a tuning artifact (#33) ---------
+# --- GLA per-token log-decay floor — a GENUINE fp32 limit, NOT a tuning artifact (#33) ---------------
 # The chunked GLA scan FACTORS the per-chunk decay as e^{a_i} (into the read gate) × e^{-a_j} (into the
 # write gate), a=cumsum(ld) over a chunk, so the routing gram is ONE tl.dot R=(r·e^a)@(w·e^{-a})ᵀ and
 # the state carry is w_end=w·e^{Λ-a}, decvec=e^Λ. The decay DIFFERENCE e^{a_i-a_j} on the causal
-# triangle is in (0,1], but each FACTOR e^{±a}, e^{Λ-a} is unbounded: with ld≥FLOOR over BT rows the
-# largest factor is e^{BT·|FLOOR|}. fp32 overflows at ln(FLT_MAX)=88.72, so the hard constraint is
-#     BT · |FLOOR| ≲ 88.72.
-# At BT=32: 32·2.5 = 80 (fp32-safe, measured gram maxerr 1.2e-7). At BT=64: 64·2.5 = 160 → e^160 = inf
-# (measured: factored gram goes NaN). The differenced form (e^{a_i-a_j}, FLA simple_gla) would be
-# BT-free but cannot be absorbed into the routed read/write matmul nor the cross-chunk state carry —
-# it is structural to the chunked GLA recurrence shared by every FLA gated op. SEPARATELY, the fused
-# kappa-routed BACKWARD mega-kernel (decayed gram + 3-pass-κ fp32 tiles co-resident) OOMs the 99KB
-# Ampere SMEM at BT=64 (measured Required 102400 > 101376) — a second, independent wall that pins
-# BT≤32 (bwd≤16) regardless of the floor. Both limits point at the SAME shipped operating point.
+# triangle is in (0,1], but each UN-anchored FACTOR e^{±a} is unbounded (e^{BT·|FLOOR|} over BT rows),
+# and fp32 overflows at ln(FLT_MAX)=88.72. `_decay_factors` RE-ANCHORS each factor to the per-state span
+# midpoint (both factors ≤ e^{span/2}), so the fp32-safe span DOUBLES — the constraint is now
+#     BT · |FLOOR| ≲ 2·88.72 ≈ 177.
+# At BT=64 (the shipped GLA forward _CHUNK, now == RLA's _CHUNK_FWD): 64·2.5 = 160 < 177 (~11% headroom,
+# measured finite). The differenced form e^{a_i-a_j} would be BT-free but can't be absorbed into the
+# routed read/write matmul nor the cross-chunk state carry — re-anchoring is the in-matmul-compatible
+# stabilization. SEPARATELY, the fused kappa-routed BACKWARD mega-kernel (decayed gram + 3-pass-κ fp32
+# tiles co-resident) is SMEM-bound, so its chunk is independently capped at _KAPPA_BWD_CHUNK=16 by the
+# BK·BC·chunk heuristic — a wall on the BACKWARD only, unaffected by the (now-relaxed) overflow limit.
 #
-# FLOOR=-2.5 ⇒ per-token retention ≥ e^{-2.5} = 8.2%/tok. The production layer's ld=log(alpha_chunk)
-# CAN dip below this (alpha→0, write_gate→1), so the floor is NOT a structural no-op: it would alter a
-# learned decay. Per the no-silent-rewrite rule we make the floor LOUD — `_floor_ld` RAISES on
-# out-of-range ld by default; opt into clamp-with-warning via ROLA_GLA_FLOOR_CLAMP=1 (e.g. training
-# that tolerates the truncation). All GLA decay sites route through `_floor_ld`.
-_GLA_FLOOR = -2.5   # per-token log-decay floor (retention ≥ 8.2%/tok); fp32-safe for BT≤32 (see above)
+# FLOOR=-2.5 ⇒ per-token retention ≥ e^{-2.5} = 8.2%/tok. KEPT (160<177 fits BT=64, but the headroom is
+# thin — full floor removal would need a tighter per-tile anchor). The production layer's ld=log
+# (alpha_chunk) CAN dip below this (alpha→0, write_gate→1), so the floor is NOT a structural no-op: it
+# would alter a learned decay. Per the no-silent-rewrite rule the floor is LOUD — `_floor_ld` RAISES on
+# out-of-range ld by default; opt into clamp-with-warning via ROLA_GLA_FLOOR_CLAMP=1. All GLA decay
+# sites route through `_floor_ld`.
+_GLA_FLOOR = -2.5   # per-token log-decay floor (retention ≥ 8.2%/tok); re-anchored span fits BT=64 (see above)
 _GLA_FLOOR_CLAMP = os.environ.get('ROLA_GLA_FLOOR_CLAMP', '0') not in ('0', '', 'false', 'False')
 _gla_floor_warned = False
 
@@ -1975,7 +1978,8 @@ def _floor_ld(ld):
             raise ValueError(
                 f"GLA log-decay ld below the fp32-safe floor _GLA_FLOOR={_GLA_FLOOR} "
                 f"(min ld={mn.item():.4f}). The chunked GLA decay is factored e^{{±a}} and overflows "
-                f"fp32 (ln FLT_MAX=88.72) once BT·|ld|≳88.72; BT≤32 needs |ld|≤2.77, so the kernel "
+                f"fp32 (ln FLT_MAX=88.72); the re-anchored factoring doubles the safe span to BT·|ld|≲177, "
+                f"and at the shipped BT=64 that needs |ld|≤2.77, so the kernel "
                 f"cannot represent this decay rate. Reduce the decay (raise alpha / lower the write "
                 f"gate), or set ROLA_GLA_FLOOR_CLAMP=1 to clamp ld to the floor (truncating the "
                 f"learned decay) instead of raising."
