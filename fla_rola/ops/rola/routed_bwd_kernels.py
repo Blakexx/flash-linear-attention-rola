@@ -23,10 +23,10 @@
 # Device helpers (shared by the four kernels below):
 #   _build_factors : rebuilds the [BT,BC] read/write gate tiles for an nc-block by softmax+gathering the
 #                    PRECOMPUTED logits (mirrors the forward `_build_rw_tile_logits`; never saved as
-#                    [L,nc]). Also returns the per-level softmax factors fr/fw + selector sel (F3) so the
-#                    fold can REUSE them.
-#   _fold_level    : the router-grad fold for ONE tree level — takes the CACHED fr,fw,sel (no recompute;
-#                    F3), gathers the transient [BT,BC] gate-grads to dfr,dfw [BT,b], applies the softmax
+#                    [L,nc]).
+#   _build_level_factors : rebuilds one level's softmax factors fr/fw + selector sel for the fold.
+#   _fold_level    : the router-grad fold for ONE tree level — takes fr,fw,sel, gathers the transient
+#                    [BT,BC] gate-grads to dfr,dfw [BT,b], applies the softmax
 #                    jacobian, and atomic-adds the result into the per-level LOGIT-grad buffers dlr,dlw
 #                    [BH,L,D,b] (the routing bias grad db + dWr/dWw/d_h come from the GEMM-backward). This
 #                    is where dr,dw die.
@@ -48,9 +48,9 @@ import triton.language as tl
 # In-kernel device helpers shared by the backward kernels:
 #   _build_factors : rebuilds the [BT,BC] read/write gate tiles for an nc-block by softmax+gathering the
 #                    PRECOMPUTED logits (mirrors the forward `_build_rw_tile_logits`; never saved as [L,nc]).
-#                    Returns the per-level softmax factors fr/fw + selector sel (F3) for fold reuse.
-#   _fold_level    : the router-grad fold for ONE tree level — takes the CACHED fr,fw,sel (no
-#                    recompute; F3), gathers the transient [BT,BC] gate-grads to dfr,dfw [BT,b],
+#   _build_level_factors : rebuilds one level's softmax factors fr/fw + selector sel for fold use.
+#   _fold_level    : the router-grad fold for ONE tree level — takes fr,fw,sel, gathers the transient
+#                    [BT,BC] gate-grads to dfr,dfw [BT,b],
 #                    applies the softmax jacobian, atomic-adds into the per-level LOGIT grads dlr,dlw.
 
 @triton.jit
@@ -60,7 +60,7 @@ def _fold_level(dr_tile, dw_tile, r_tile, w_tile, fr, fw, sel,
                 slo_b, slo_l, slo_lvl, slo_bb, lvl,
                 BT: tl.constexpr, BB: tl.constexpr):
     # F2b: the router-grad fold for ONE tree level. fr,fw,sel are the per-level softmax factors + selector
-    # CACHED by `_build_factors` (the SAME fp32 values). The gate-grads dr_tile,dw_tile are gathered to the
+    # rebuilt by `_build_level_factors` (the SAME fp32 values). The gate-grads dr_tile,dw_tile are gathered to the
     # per-level logit grads dlr,dlw [BT,b] via the Sel gather + softmax jacobian, then EMITTED into the
     # [BH,L,D,b] dlogit buffers (atomic-add: the nc-blocks + the intra/inter folds accumulate into the same
     # per-(token,level,branch) slot). The d_model-contraction backward (dlogit -> dWr,dWw,dh,db) is now a
@@ -87,17 +87,12 @@ def _build_factors(lr_ptr, lw_ptr, sel_ptr, cols, cmask,
                    D: tl.constexpr, BT: tl.constexpr,
                    BB: tl.constexpr, BC: tl.constexpr):
     # F2b: rebuild the [BT,BC] read/write gate tiles for an nc-block from the PRECOMPUTED per-level logits
-    # lr,lw ∈ [BH,L,D,b] (the cuBLAS-GEMM stand-in for the in-kernel h·W d_model-contraction). Collects the
-    # per-level softmax factors fr/fw + selector sel so the router-grad fold (`_fold_level`) REUSES them.
-    # `tl.static_range` unrolls the D levels (D constexpr) so frs/fws/sels are compile-time tuples. The
-    # routing bias is already folded into the logits. Mirrors the forward `_build_rw_tile_logits`.
+    # lr,lw ∈ [BH,L,D,b] (the cuBLAS-GEMM stand-in for the in-kernel h·W d_model-contraction).
+    # The routing bias is already folded into the logits. Mirrors the forward `_build_rw_tile_logits`.
     r_tile = tl.full([BT, BC], 1.0, dtype=tl.float32)
     w_tile = tl.full([BT, BC], 1.0, dtype=tl.float32)
-    frs = ()
-    fws = ()
-    sels = ()
     neg = tl.full([BT, BB], float('-inf'), dtype=tl.float32)
-    for lvl in tl.static_range(D):
+    for lvl in tl.static_range(0, D):
         off = pid_b * slo_b + rows[:, None] * slo_l + lvl * slo_lvl + offs_bb[None, :] * slo_bb
         lr = tl.load(lr_ptr + off, mask=rmask[:, None] & bmask[None, :], other=0.0).to(tl.float32)
         lw = tl.load(lw_ptr + off, mask=rmask[:, None] & bmask[None, :], other=0.0).to(tl.float32)
@@ -111,12 +106,30 @@ def _build_factors(lr_ptr, lw_ptr, sel_ptr, cols, cmask,
                       mask=bmask[:, None] & cmask[None, :], other=0.0)
         r_tile *= tl.dot(fr, sel)
         w_tile *= tl.dot(fw, sel)
-        frs = frs + (fr,)
-        fws = fws + (fw,)
-        sels = sels + (sel,)
     r_tile = tl.where(cmask[None, :], r_tile, 0.0)
     w_tile = tl.where(cmask[None, :], w_tile, 0.0)
-    return r_tile, w_tile, frs, fws, sels
+    return r_tile, w_tile
+
+
+@triton.jit
+def _build_level_factors(lr_ptr, lw_ptr, sel_ptr, cols, cmask,
+                         pid_b, rows, rmask, offs_bb, bmask,
+                         slo_b, slo_l, slo_lvl, slo_bb, ssel_lvl, ssel_b, ssel_c,
+                         lvl: tl.constexpr, BT: tl.constexpr,
+                         BB: tl.constexpr):
+    neg = tl.full([BT, BB], float('-inf'), dtype=tl.float32)
+    off = pid_b * slo_b + rows[:, None] * slo_l + lvl * slo_lvl + offs_bb[None, :] * slo_bb
+    lr = tl.load(lr_ptr + off, mask=rmask[:, None] & bmask[None, :], other=0.0).to(tl.float32)
+    lw = tl.load(lw_ptr + off, mask=rmask[:, None] & bmask[None, :], other=0.0).to(tl.float32)
+    lr = tl.where(bmask[None, :], lr, neg)
+    lw = tl.where(bmask[None, :], lw, neg)
+    er = tl.exp(lr - tl.max(lr, axis=1)[:, None])
+    ew = tl.exp(lw - tl.max(lw, axis=1)[:, None])
+    fr = er / tl.sum(er, axis=1)[:, None]
+    fw = ew / tl.sum(ew, axis=1)[:, None]
+    sel = tl.load(sel_ptr + lvl * ssel_lvl + offs_bb[:, None] * ssel_b + cols[None, :] * ssel_c,
+                  mask=bmask[:, None] & cmask[None, :], other=0.0)
+    return fr, fw, sel
 
 
 # ============================================================================
@@ -246,7 +259,7 @@ def _bwd_intra_kernel(
     for cb in range(NCBLK):
         cols = cb * BC + offs_c
         cmask = cols < nc
-        r_tile, w_tile, _frs, _fws, _sels = _build_factors(
+        r_tile, w_tile = _build_factors(
                                         lr_ptr, lw_ptr, sel_ptr, cols, cmask,
                                         pid_b, rows, rmask, offs_bb, bmask,
                                         slo_b, slo_l, slo_lvl, slo_bb, ssel_lvl, ssel_b, ssel_c,
@@ -277,7 +290,7 @@ def _bwd_intra_kernel(
     for cb in range(NCBLK):
         cols = cb * BC + offs_c
         cmask = cols < nc
-        r_tile, w_tile, frs, fws, sels = _build_factors(
+        r_tile, w_tile = _build_factors(
                                         lr_ptr, lw_ptr, sel_ptr, cols, cmask,
                                         pid_b, rows, rmask, offs_bb, bmask,
                                         slo_b, slo_l, slo_lvl, slo_bb, ssel_lvl, ssel_b, ssel_c,
@@ -302,8 +315,13 @@ def _bwd_intra_kernel(
         else:
             dr_tile = tl.dot(dRgram.to(w_tile.dtype), w_tile)
             dw_tile = tl.dot(tl.trans(dRgram).to(r_tile.dtype), r_tile)
-        for lvl in tl.static_range(D):
-            _fold_level(dr_tile, dw_tile, r_tile, w_tile, frs[lvl], fws[lvl], sels[lvl],
+        for lvl in tl.static_range(0, D):
+            fr, fw, sel = _build_level_factors(
+                        lr_ptr, lw_ptr, sel_ptr, cols, cmask,
+                        pid_b, rows, rmask, offs_bb, bmask,
+                        slo_b, slo_l, slo_lvl, slo_bb, ssel_lvl, ssel_b, ssel_c,
+                        lvl, BT, BB)
+            _fold_level(dr_tile, dw_tile, r_tile, w_tile, fr, fw, sel,
                         dlr_ptr, dlw_ptr, pid_b, rows, rmask, offs_bb, bmask,
                         slo_b, slo_l, slo_lvl, slo_bb, lvl, BT, BB)
 
@@ -348,7 +366,7 @@ def _bwd_inter_read_kernel(
     cb = tl.program_id(1)
     cols = cb * BC + offs_c
     cmask = cols < nc
-    r_tile, w_tile, _frs, _fws, _sels = _build_factors(
+    r_tile, w_tile = _build_factors(
                                     lr_ptr, lw_ptr, sel_ptr, cols, cmask,
                                     pid_b, rows, rmask, offs_bb, bmask,
                                     slo_b, slo_l, slo_lvl, slo_bb, ssel_lvl, ssel_b, ssel_c,
@@ -445,7 +463,7 @@ def _bwd_inter_state_kernel(
     cb = tl.program_id(1)
     cols = cb * BC + offs_c
     cmask = cols < nc
-    r_tile, w_tile, _frs, _fws, _sels = _build_factors(
+    r_tile, w_tile = _build_factors(
                                     lr_ptr, lw_ptr, sel_ptr, cols, cmask,
                                     pid_b, rows, rmask, offs_bb, bmask,
                                     slo_b, slo_l, slo_lvl, slo_bb, ssel_lvl, ssel_b, ssel_c,
@@ -528,7 +546,7 @@ def _fold_kernel(
     # adders). USE_G: the per-head decay-logit reduction dz[BT] is now a PER-PROGRAM PARTIAL — each program
     # folds its own dz into dWg/dh via the SAME post-pass `tl.atomic_add` (the recombine is the atomic).
     # F2b: folds the transient [BT,nc] gate-grads (gdr/gdw) into the per-level dlogit buffers dlr/dlw via
-    # `_build_factors`(logits) + `_fold_level`(dlogits); the dWr/dWw/dh router contraction is a cuBLAS
+    # `_build_factors`(logits) + `_build_level_factors` + `_fold_level`(dlogits); the dWr/dWw/dh router contraction is a cuBLAS
     # GEMM-backward in torch. USE_G (GLA, #45): the per-state log-decay ld is computed in-kernel from Wg +
     # the write gate, so ITS gradient is folded HERE (the natural home — this kernel already rebuilds
     # w_tile and folds w → dlogit_w). dld_ptr carries the assembled ∂L/∂ld (the driver's reverse-cumsum
@@ -551,7 +569,7 @@ def _fold_kernel(
     cb = tl.program_id(1)
     cols = cb * BC + offs_c
     cmask = cols < nc
-    r_tile, w_tile, frs, fws, sels = _build_factors(
+    r_tile, w_tile = _build_factors(
                                     lr_ptr, lw_ptr, sel_ptr, cols, cmask,
                                     pid_b, rows, rmask, offs_bb, bmask,
                                     slo_b, slo_l, slo_lvl, slo_bb, ssel_lvl, ssel_b, ssel_c,
@@ -570,8 +588,13 @@ def _fold_kernel(
         dld = tl.where(cmask[None, :] & active, dld_tile, 0.0)
         dw_tile += dld * (-one_minus_a / m)                       # ∂ld/∂w = -(1-alpha)/m
         dz += tl.sum(dld * (w_tile / m), axis=1) * (alpha * (1.0 - alpha))  # ∂ld/∂alpha · ∂alpha/∂z
-    for lvl in tl.static_range(D):
-        _fold_level(dr_tile, dw_tile, r_tile, w_tile, frs[lvl], fws[lvl], sels[lvl],
+    for lvl in tl.static_range(0, D):
+        fr, fw, sel = _build_level_factors(
+                    lr_ptr, lw_ptr, sel_ptr, cols, cmask,
+                    pid_b, rows, rmask, offs_bb, bmask,
+                    slo_b, slo_l, slo_lvl, slo_bb, ssel_lvl, ssel_b, ssel_c,
+                    lvl, BT, BB)
+        _fold_level(dr_tile, dw_tile, r_tile, w_tile, fr, fw, sel,
                     dlr_ptr, dlw_ptr, pid_b, rows, rmask, offs_bb, bmask,
                     slo_b, slo_l, slo_lvl, slo_bb, lvl, BT, BB)
     if USE_G:
