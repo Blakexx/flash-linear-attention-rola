@@ -94,3 +94,22 @@ def test_short_seq_inference_path_preserved():
         out = m(x)
         o = out[0] if isinstance(out, tuple) else out
     assert torch.isfinite(o).all(), 'short-seq inference (recurrent) forward produced non-finite output'
+
+
+def test_layer_torch_compile_fwd_bwd_global_rla():
+    """The production layer remains torch.compile-compatible through the routed chunk fwd+bwd path.
+
+    Keep the shape intentionally small: this is a Dynamo/custom-autograd integration gate, not a Triton
+    resource-limit test. Larger kappa cells can exceed shared memory on local sm86 cards.
+    """
+    if device != 'cuda':
+        pytest.skip('RoLA Triton kernels require CUDA')
+    if not hasattr(torch, 'compile'):
+        pytest.skip('torch.compile unavailable')
+    torch.manual_seed(0)
+    m = _build('rla', nc=4).to(torch.bfloat16)
+    x = torch.randn(1, 16, 64, device=device, dtype=torch.bfloat16, requires_grad=True)
+    compiled = torch.compile(m)
+    out = compiled(x)
+    o = out[0] if isinstance(out, tuple) else out
+    _assert_grads_flow(m, x, o)
