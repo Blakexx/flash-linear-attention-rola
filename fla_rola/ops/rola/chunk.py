@@ -629,11 +629,17 @@ def _routed_fwd_tiled(q, k, v, h, Wr, Ww, D, b, sel, chunk, BG, BK=64, b_r=None,
     BK = min(BK, max(16, triton.next_power_of_2(dqk)))
     BD = max(16, triton.next_power_of_2(d_model))
     BB = max(16, triton.next_power_of_2(b))
+    use_g = Wg is not None
+    if use_g:
+        # GLA inter-scan carries several [BT, BG*BV]-scale fp32 regions (P/P3, WV, decay vectors, plus
+        # dot staging). On 99KB-class GPUs the nominal BT=64 variant can compile above the hard SMEM
+        # limit even when BV=16, so fit the chunk before autotune/cache selection can replay an illegal
+        # launch. Chunking is output-invariant up to the same reduction-order tolerance tested below.
+        chunk = _fit_chunk(chunk, 6 * BG * BV * _DTYPE_BYTES)
     ND = triton.cdiv(dqk, BK)
     NB = triton.cdiv(nc, BG)
     NCH = triton.cdiv(L, chunk)
     NDM = triton.cdiv(d_model, BD)
-    use_g = Wg is not None
     if lr is None:
         # plain/test path: GEMM the logits here from the per-head router weights (bias folded in).
         q, k, v, h, Wr, Ww = [x.contiguous() for x in (q, k, v, h, Wr, Ww)]
@@ -1779,7 +1785,7 @@ def _kappa_bwd_read(h_ptr, q_ptr, k_ptr, v_ptr, lr_ptr, lw_ptr, sel_ptr, kap_ptr
 
 def _kappa_routed_bwd(q, k, v, h, lr, lw, kap, ckpt_val, ckpt_den, dnum, dden,
                       D, b, sel, chunk, global_norm, per_state, eps, H, Wg=None,
-                      checkpoint_window_override=None):
+                      checkpoint_window_override=None, out=None):
     """Reverse chunk-scan backward for the fused global/kappa/per_state path. Carries dSval,dSden
     adjoints; recomputes r,w,d,r_tilde transiently per chunk; folds the [BT,nc] gate-grads into
     dWr,dWw,dh (and db_r/db_w when a routing bias is present — transient, never [L,nc]). Returns
@@ -1822,6 +1828,7 @@ def _kappa_routed_bwd(q, k, v, h, lr, lw, kap, ckpt_val, ckpt_den, dnum, dden,
     dkap = torch.zeros(B, L, device=q.device, dtype=torch.float32)
     dSval = torch.zeros(B, nc, dqk, dv, device=q.device, dtype=torch.float32)
     dSden = torch.zeros(B, nc, dqk, device=q.device, dtype=torch.float32)
+    out = out.contiguous() if out is not None else None
     dnum = dnum.contiguous()
     dden = dden.contiguous()
     # Wg:[H,d_model] (GLA) — the per-head decay weight; ld is computed IN-KERNEL (never a [L,nc] ld). RLA
@@ -1913,6 +1920,29 @@ def _kappa_routed_bwd(q, k, v, h, lr, lw, kap, ckpt_val, ckpt_den, dnum, dden,
             swg[0], swg[1],
             D=D, b=b, BB=BB, BT=chunk, BC=BC, BD=BD, NDM=NDM,
             USE_G=use_g, GLA_FLOOR=_GLA_FLOOR, num_warps=4, num_stages=1)
+    if out is not None and not global_norm and not per_state and L > 0:
+        # Token 0 has no carried state and only its diagonal intra term, so for every state c:
+        # N_0^c = d_0^c * v_0. The normalized kappa gradient can therefore be formed as the small centered
+        # residual d_0^c * <dnum_0, v_0 - out_0>, instead of relying on fp32 cancellation between the
+        # numerator and denominator contributions. This touches only [B,nc] token-0 gates, never [L,nc].
+        with torch.no_grad():
+            def first_token_gates(logits):
+                factors = [torch.softmax(logits[:, 0, lvl].float(), dim=-1) for lvl in range(D)]
+                leaves = []
+                for leaf in range(nc):
+                    digs = [(leaf // (b ** (D - 1 - lvl))) % b for lvl in range(D)]
+                    g_leaf = factors[0][:, digs[0]]
+                    for lvl in range(1, D):
+                        g_leaf = g_leaf * factors[lvl][:, digs[lvl]]
+                    leaves.append(g_leaf)
+                return torch.stack(leaves, dim=-1)
+
+            r0 = first_token_gates(lr)
+            w0 = first_token_gates(lw)
+            d0 = (q[:, 0].float() * k[:, 0].float()).sum(-1, keepdim=True) * w0
+            rt0 = r0 * (d0 + eps).pow(-kap[:, 0, None].float())
+            z0 = (dnum[:, 0].float() * (v[:, 0].float() - out[:, 0].float())).sum(-1)
+            dkap[:, 0].copy_(((-rt0 * d0 * (d0 + eps).log()).sum(-1) * z0).to(dkap.dtype))
     if use_g:
         return (dq[..., :dqk], dk[..., :dqk], dvv[..., :dv], dh, dlr, dlw, dkap, dWg)
     return (dq[..., :dqk], dk[..., :dqk], dvv[..., :dv], dh, dlr, dlw, dkap)
@@ -1920,10 +1950,9 @@ def _kappa_routed_bwd(q, k, v, h, lr, lw, kap, ckpt_val, ckpt_den, dnum, dden,
 
 class _RoLARoutedKappaFn(torch.autograd.Function):
     """End-to-end differentiable FUSED kappa/per_state tree-routed RLA path. Forward runs the fused
-    chunk-scan (`_kappa_routed_fwd`) returning the un-divided (num, den); backward runs the reverse
+    chunk-scan (`_kappa_routed_fwd`) and returns the normalized readout. Backward runs the reverse
     chunk-scan, recomputing the snapshots for fp-parity and folding the transient [BT,nc] gate-grads
-    into the router. The [L,nc] gates AND the per-state den d / rescaled r_tilde are NEVER materialized.
-    The final divide out=num/(den+eps) is left to torch (autograd handles it)."""
+    into the router. The [L,nc] gates AND the per-state den d / rescaled r_tilde are NEVER materialized."""
     @staticmethod
     @input_guard
     @autocast_custom_fwd
@@ -1955,19 +1984,29 @@ class _RoLARoutedKappaFn(torch.autograd.Function):
             num, den, _sv, _sd, _ck = _kappa_routed_fwd(q, k, v, h, lr, lw, kap, D, b, sel, chunk,
                                                         global_norm, per_state, eps, H, Wg=Wgc)
             ckv = ckd = None
+        den_f = den.float()
+        out = num.float() / (den_f.unsqueeze(-1) + eps)
+        if out.shape[1] > 0:
+            # At the first token there is no prior state and the causal block contains only the diagonal,
+            # so num_0 = den_0 * v_0 for every normalized mode. Use that identity directly; the generic
+            # tiled numerator/denominator path is algebraically equivalent but leaves a tiny fp32 mismatch
+            # that gets amplified in the kappa-gradient cancellation.
+            out[:, 0].copy_(v[:, 0].float() * (den_f[:, 0] / (den_f[:, 0] + eps))[:, None])
         # #45: the GLA decay's saved activation is the [H,d_model] Wg (NOT a [L,nc] ld) — the saved-act win.
-        ctx.save_for_backward(q, k, v, h, lr, lw, kap, Wgc, ckv, ckd)
+        # Save fp32 out/den so backward owns the normalization and can avoid the worst dκ num/den
+        # cancellation at the custom autograd boundary.
+        ctx.save_for_backward(q, k, v, h, lr, lw, kap, Wgc, ckv, ckd, out, den_f)
         ctx.D, ctx.b, ctx.chunk, ctx.H = D, b, chunk, H
         ctx.global_norm, ctx.per_state, ctx.eps = global_norm, per_state, eps
         ctx.q_dtype = q_dtype
         ctx.h_dtype = h_dtype
-        return num.to(q_dtype), den.to(q_dtype)
+        return out.to(q_dtype)
 
     @staticmethod
     @input_guard
     @autocast_custom_bwd
-    def backward(ctx, dnum, dden):
-        q, k, v, h, lr, lw, kap, Wg, ckpt_val, ckpt_den = ctx.saved_tensors
+    def backward(ctx, do):
+        q, k, v, h, lr, lw, kap, Wg, ckpt_val, ckpt_den, out, den = ctx.saved_tensors
         use_g = Wg is not None
         D, b, chunk, H = ctx.D, ctx.b, ctx.chunk, ctx.H
         global_norm, per_state, eps = ctx.global_norm, ctx.per_state, ctx.eps
@@ -1982,9 +2021,13 @@ class _RoLARoutedKappaFn(torch.autograd.Function):
         # (idempotent → same chunk + NCH + window as the forward), then recomputes each segment's snapshots
         # on demand from √NCH checkpoints that match the old dense recompute for q/k/v/kap state precision.
         # Reverse-scan order and routing operand dtypes are unchanged.
+        den_e = den.unsqueeze(-1) + eps
+        do = do.float().contiguous()
+        dnum = do / den_e
+        dden = -(do * out).sum(-1) / (den + eps)
         grads = _kappa_routed_bwd(
-            q, k, v, h, lr, lw, kap, ckpt_val, ckpt_den, dnum.float(), dden.float(),
-            D, b, sel, chunk, global_norm, per_state, eps, H, Wg=Wgf)
+            q, k, v, h, lr, lw, kap, ckpt_val, ckpt_den, dnum, dden,
+            D, b, sel, chunk, global_norm, per_state, eps, H, Wg=Wgf, out=out.float())
         # _kappa_routed_bwd returns (dq,dk,dv,dh,dlr,dlw,dkap[,dWg]); dWg present iff use_g.
         dq, dk, dv, dh, dlr, dlw, dkap = grads[:7]
         dWg = grads[7] if use_g else None
@@ -1999,7 +2042,7 @@ class _RoLARoutedKappaFn(torch.autograd.Function):
 
 def _kappa_routed_readout(qf, kf, vf, hf, Wr, Ww, kapf, D, b, chunk_size, global_norm, per_state, eps,
                           b_r=None, b_w=None, Wg=None, lr=None, lw=None, H=None):
-    """Fused global/kappa/per_state tree-routed readout returning (num[BH,L,V], den[BH,L,1]),
+    """Fused global/kappa/per_state tree-routed readout returning normalized out[BH,L,V],
     differentiable. kapf:[BH,L,1]. F2b: the per-level routing logits (h·Wr+b_r, h·Ww+b_w) are a cuBLAS
     GEMM (`_router_logits`, autograd-tracked) and the kernel only softmax+gathers them; dWr/dWw/dh/db flow
     through the GEMM-backward. lr,lw:[BH,L,D,b] may be passed precomputed (the layer dedup). Optional
@@ -2011,10 +2054,9 @@ def _kappa_routed_readout(qf, kf, vf, hf, Wr, Ww, kapf, D, b, chunk_size, global
     ckpt_inputs = (qf, kf, vf, hf, lr, lw, kap, Wg)
     save_checkpoints = torch.is_grad_enabled() and any(
         t is not None and t.requires_grad for t in ckpt_inputs)
-    num, den = _RoLARoutedKappaFn.apply(qf, kf, vf, hf, lr, lw, kap, D, b, chunk_size,
-                                        global_norm, per_state, eps,
-                                        H if H is not None else Wr.shape[0], save_checkpoints, Wg)
-    return num, den.unsqueeze(-1)
+    return _RoLARoutedKappaFn.apply(qf, kf, vf, hf, lr, lw, kap, D, b, chunk_size,
+                                    global_norm, per_state, eps,
+                                    H if H is not None else Wr.shape[0], save_checkpoints, Wg)
 
 
 # --- GLA per-token log-decay floor — a GENUINE fp32 limit, NOT a tuning artifact (#33) ---------------
@@ -2345,11 +2387,11 @@ def chunk_rola_routed(q, k, v, h, Wr, Ww, D, b, norm='kappa', kappa=None, scale=
         # `global` is `kappa` with the rescale skipped (r̃=r): same in-kernel den machinery (the carried
         # Sden^c den state + transient [BT,nc] d), den D_i=Σ_c r^c d^c, never a [L,nc] gate/den/r̃ buffer.
         kapf = fold(kappa) if norm == 'kappa' else qf.new_ones(qf.shape[0], qf.shape[1], 1)
-        num, den = _kappa_routed_readout(qf, kf, vf, hf, Wr, Ww, kapf.to(compute_dtype), D, b,
-                                         chunk_size, global_norm=(norm == 'global'),
-                                         per_state=(norm == 'per_state'), eps=eps,
-                                         b_r=b_r, b_w=b_w, Wg=Wgf, lr=lr, lw=lw, H=H)
-        return unfold(num.float() / (den.float() + eps)).to(v.dtype)
+        out = _kappa_routed_readout(qf, kf, vf, hf, Wr, Ww, kapf.to(compute_dtype), D, b,
+                                    chunk_size, global_norm=(norm == 'global'),
+                                    per_state=(norm == 'per_state'), eps=eps,
+                                    b_r=b_r, b_w=b_w, Wg=Wgf, lr=lr, lw=lw, H=H)
+        return unfold(out.float()).to(v.dtype)
 
     # CPU reference path (qf not on CUDA) for all normalized norms: the per-state den pre-pass on
     # explicit gates + the eager-core numerator. ALL CUDA normalized norms (incl. 'global') route through
