@@ -1896,30 +1896,33 @@ class _RoLARoutedKappaFn(torch.autograd.Function):
         chunk = cap if chunk is None else min(chunk, cap)
         nc = b ** D
         sel = _build_sel(D, b, nc, q.device)
+        q_dtype = q.dtype
+        h_dtype = h.dtype
         q, k, v, h, lr, lw, kap = (x.contiguous() for x in (q, k, v, h, lr, lw, kap))
         Wgc = Wg.contiguous() if Wg is not None else None
         # #55: the wrapper passes save_checkpoints only when grad mode is enabled and a tensor input needs
         # grad. That distinction matters for no-grad inference: parameters may still have requires_grad=True,
         # but no backward can consume checkpoints, so no checkpoint tensor should be allocated.
-        num, den, _sv, _sd, _ck = _kappa_routed_fwd(q, k, v, h, lr, lw, kap, D, b, sel, chunk,
-                                                    global_norm, per_state, eps, H, Wg=Wgc)
         if save_checkpoints:
-            # Match the old dense backward recompute for checkpoint boundaries: q/k/v/kap are the
-            # den/state-sensitive operands that backward upcasts to fp32; h/lr/lw intentionally stay in the
-            # F4 routing dtype, and Wg is fp32. This replay stores only √NCH boundary states.
-            _n, _d, ckv, ckd, _ck = _kappa_routed_fwd(
-                q.float().contiguous(), k.float().contiguous(), v.float().contiguous(),
-                h, lr, lw, kap.float().contiguous(), D, b, sel, chunk,
-                global_norm, per_state, eps, H,
-                Wg=(Wgc.float().contiguous() if Wgc is not None else None),
-                save_checkpoints=True)
+            # Strict training policy: compute the differentiable kappa readout with the same
+            # den/state-sensitive precision policy backward uses, and save sparse boundaries in that pass.
+            # h/lr/lw intentionally stay in the F4 routing dtype; Wg is fp32 for decay.
+            q, k, v, kap = (x.float().contiguous() for x in (q, k, v, kap))
+            Wgc = Wgc.float().contiguous() if Wgc is not None else None
+            num, den, ckv, ckd, _ck = _kappa_routed_fwd(q, k, v, h, lr, lw, kap, D, b, sel, chunk,
+                                                        global_norm, per_state, eps, H, Wg=Wgc,
+                                                        save_checkpoints=True)
         else:
+            num, den, _sv, _sd, _ck = _kappa_routed_fwd(q, k, v, h, lr, lw, kap, D, b, sel, chunk,
+                                                        global_norm, per_state, eps, H, Wg=Wgc)
             ckv = ckd = None
         # #45: the GLA decay's saved activation is the [H,d_model] Wg (NOT a [L,nc] ld) — the saved-act win.
         ctx.save_for_backward(q, k, v, h, lr, lw, kap, Wgc, ckv, ckd)
         ctx.D, ctx.b, ctx.chunk, ctx.H = D, b, chunk, H
         ctx.global_norm, ctx.per_state, ctx.eps = global_norm, per_state, eps
-        return num.to(q.dtype), den.to(q.dtype)
+        ctx.q_dtype = q_dtype
+        ctx.h_dtype = h_dtype
+        return num.to(q_dtype), den.to(q_dtype)
 
     @staticmethod
     @input_guard
@@ -1946,10 +1949,11 @@ class _RoLARoutedKappaFn(torch.autograd.Function):
         # _kappa_routed_bwd returns (dq,dk,dv,dh,dlr,dlw,dkap[,dWg]); dWg present iff use_g.
         dq, dk, dv, dh, dlr, dlw, dkap = grads[:7]
         dWg = grads[7] if use_g else None
-        q0 = ctx.saved_tensors[0]
+        q_dtype = ctx.q_dtype
+        h_dtype = ctx.h_dtype
         # forward arg order: q,k,v,h,lr,lw,kap,D,b,chunk,global_norm,per_state,eps,H,Wg
-        return (dq.to(q0.dtype), dk.to(q0.dtype), dv.to(q0.dtype), dh.to(q0.dtype),
-                dlr.to(lr.dtype), dlw.to(lw.dtype), dkap.to(q0.dtype),
+        return (dq.to(q_dtype), dk.to(q_dtype), dv.to(q_dtype), dh.to(h_dtype),
+                dlr.to(lr.dtype), dlw.to(lw.dtype), dkap.to(q_dtype),
                 None, None, None, None, None, None, None, None,
                 None if dWg is None else dWg.to(Wg.dtype))
 
