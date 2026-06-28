@@ -93,12 +93,14 @@ _AT_CFGS = [triton.Config({}, num_warps=w, num_stages=s) for w in _WARPS for s i
 # other's tuned warps/stages/BV. USE_G is a constexpr (so it specializes the compile regardless), but
 # it must also gate config SELECTION so each variant tunes its own (the GLA decay-replay has a heavier
 # SMEM profile than RLA, so the best config differs). Perf-only; no correctness change. (#22)
+# BT/BB/BD are INCLUDED because they change the compiled tile footprint. A chunk=32 structural warmup can
+# otherwise cache a scan config that is over-SMEM when replayed at chunk=64 on sm86.
 # nc is EXCLUDED on purpose: it only sets the host-side grid trip count `NB = cdiv(nc, BG)` (see ~L494)
 # — the per-program state block is a fixed BG-wide tile, so nc changes NEITHER a kernel constexpr tile
 # NOR per-program SMEM. The best warps/stages/BV is therefore nc-INVARIANT, and keying on nc forced a
 # needless full re-tune at every states-per-head in the scaling sweep. Perf-only (config REUSE across
 # nc); correctness is unaffected — the kernel still specializes on its real constexprs.
-_SCAN_KEY = ['dqk', 'dv', 'USE_G']
+_SCAN_KEY = ['dqk', 'dv', 'BT', 'BB', 'BD', 'USE_G']
 # `_CHUNK`/`_CHUNK_FWD` are the chunk-size CEILING — the largest BT the SMEM derive may pick. 64 is the
 # GLA fp32-overflow ceiling (the chunked-decay gram e^a·e^{-a}; `_decay_factors` re-anchors each factor to
 # the per-state midpoint, doubling the fp32-safe span to BT·|FLOOR|≲177, so 64·2.5=160<177 fits — the
@@ -2153,7 +2155,7 @@ def _final_state(kf, vf, wf, gf, B, H, raw=False):
         G = _floor_ld(gf).float().cumsum(1)
         wgt = wgt * (G[:, -1:, :] - G).exp()
     state = torch.einsum('btc,btd,bte->bcde', wgt, kf.float(), v1)      # [BH, nc, K, V+1]
-    return state.view(B, H * state.shape[1], state.shape[2], state.shape[3])
+    return state.reshape(B, H * state.shape[1], state.shape[2], state.shape[3])
 
 
 # ============================================================================
