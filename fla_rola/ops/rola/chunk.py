@@ -337,8 +337,8 @@ def _prune_bv(configs, named_args, **kwargs):
 # (`_bwd_intra_kernel`, `_bwd_inter_*`, `_fold_*` from `routed_bwd_kernels.py`) at the PRODUCTION
 # state-block width (BC=BG), and folds the transient [BT,nc] gate-grads into the per-level LOGIT grads
 # dlr/dlw in-kernel (the [L,nc] grads never materialize); dWr/dWw/d_h then flow through the cuBLAS
-# GEMM-backward (autograd). The forward builds the SAME `sel` map the bwd needs and routes through the SAME
-# [BT,BG] factor reconstruction (`_build_rw_tile_logits` ≡ `_build_factors`) the fold reuses.
+# GEMM-backward (autograd). The forward builds the SAME `sel` map the bwd needs; backward rebuilds the SAME
+# [BT,BG] factor reconstruction (`_build_rw_tile_logits` ≡ `_build_factors`) before folding logit grads.
 # ============================================================================
 
 
@@ -1283,7 +1283,8 @@ def _kappa_fit_chunk(dqk, dv, chunk, BC=16):
 def _kappa_ckpt_window(NCH):
     """#55 checkpoint window W = ⌈√NCH⌉ — shared by the forward (stores a checkpoint every W-th chunk)
     and the backward (seeds segment `seg` from ckpt[seg] at chunk seg·W). √NCH checkpoints + a W-wide
-    segment recompute ≈ 2√NCH·state peak instead of the all-snapshot NCH·state (∝ L² when nc∝L)."""
+    segment recompute bound the snapshot term to O(√NCH·state) instead of the all-snapshot NCH·state
+    (∝ L² when nc∝L)."""
     return max(1, math.ceil(math.sqrt(NCH)))
 
 
@@ -1887,7 +1888,8 @@ class _RoLARoutedKappaFn(torch.autograd.Function):
     @staticmethod
     @input_guard
     @autocast_custom_fwd
-    def forward(ctx, q, k, v, h, lr, lw, kap, D, b, chunk, global_norm, per_state, eps, H, Wg=None):
+    def forward(ctx, q, k, v, h, lr, lw, kap, D, b, chunk, global_norm, per_state, eps, H,
+                save_checkpoints=False, Wg=None):
         # F2b: lr,lw:[BH,L,D,b] are the cuBLAS-GEMM routing logits (h·W in torch by the wrapper). The kernel
         # softmax+gathers them; backward emits dlr,dlw (autograd routes them through the GEMM → dWr,dWw,dh,db).
         cap = _CHUNK if Wg is not None else _CHUNK_FWD
@@ -1896,14 +1898,23 @@ class _RoLARoutedKappaFn(torch.autograd.Function):
         sel = _build_sel(D, b, nc, q.device)
         q, k, v, h, lr, lw, kap = (x.contiguous() for x in (q, k, v, h, lr, lw, kap))
         Wgc = Wg.contiguous() if Wg is not None else None
-        # #55: when this call is differentiable (some input needs grad → backward WILL run), the forward
-        # stashes only the √NCH sparse boundary checkpoints (ckv/ckd) for the backward to seed segment
-        # recomputes from — so the backward needs NO extra forward pass, and inference (no grad) stores
-        # nothing. save_ckpt ⟺ backward-will-run, so the checkpoints exist exactly when the backward needs them.
-        save_ckpt = any(ctx.needs_input_grad)
-        num, den, ckv, ckd, _ck = _kappa_routed_fwd(q, k, v, h, lr, lw, kap, D, b, sel, chunk,
-                                                    global_norm, per_state, eps, H, Wg=Wgc,
-                                                    save_checkpoints=save_ckpt)
+        # #55: the wrapper passes save_checkpoints only when grad mode is enabled and a tensor input needs
+        # grad. That distinction matters for no-grad inference: parameters may still have requires_grad=True,
+        # but no backward can consume checkpoints, so no checkpoint tensor should be allocated.
+        num, den, _sv, _sd, _ck = _kappa_routed_fwd(q, k, v, h, lr, lw, kap, D, b, sel, chunk,
+                                                    global_norm, per_state, eps, H, Wg=Wgc)
+        if save_checkpoints:
+            # Match the old dense backward recompute for checkpoint boundaries: q/k/v/kap are the
+            # den/state-sensitive operands that backward upcasts to fp32; h/lr/lw intentionally stay in the
+            # F4 routing dtype, and Wg is fp32. This replay stores only √NCH boundary states.
+            _n, _d, ckv, ckd, _ck = _kappa_routed_fwd(
+                q.float().contiguous(), k.float().contiguous(), v.float().contiguous(),
+                h, lr, lw, kap.float().contiguous(), D, b, sel, chunk,
+                global_norm, per_state, eps, H,
+                Wg=(Wgc.float().contiguous() if Wgc is not None else None),
+                save_checkpoints=True)
+        else:
+            ckv = ckd = None
         # #45: the GLA decay's saved activation is the [H,d_model] Wg (NOT a [L,nc] ld) — the saved-act win.
         ctx.save_for_backward(q, k, v, h, lr, lw, kap, Wgc, ckv, ckd)
         ctx.D, ctx.b, ctx.chunk, ctx.H = D, b, chunk, H
@@ -1927,8 +1938,8 @@ class _RoLARoutedKappaFn(torch.autograd.Function):
         Wgf = Wg.float().contiguous() if use_g else None
         # #55: _kappa_routed_bwd re-fits the chunk from the ctx ceiling via the shared _kappa_fit_chunk
         # (idempotent → same chunk + NCH + window as the forward), then recomputes each segment's snapshots
-        # on demand from the forward-saved √NCH checkpoints (ckpt_val/ckpt_den) → ~2√NCH·state peak instead of
-        # the old [NCH,...] ∝ L², at NO extra forward pass. Reverse-scan order unchanged → grads bit-exact.
+        # on demand from √NCH checkpoints that match the old dense recompute for q/k/v/kap state precision.
+        # Reverse-scan order and routing operand dtypes are unchanged.
         grads = _kappa_routed_bwd(
             q, k, v, h, lr, lw, kap, ckpt_val, ckpt_den, dnum.float(), dden.float(),
             D, b, sel, chunk, global_norm, per_state, eps, H, Wg=Wgf)
@@ -1939,7 +1950,7 @@ class _RoLARoutedKappaFn(torch.autograd.Function):
         # forward arg order: q,k,v,h,lr,lw,kap,D,b,chunk,global_norm,per_state,eps,H,Wg
         return (dq.to(q0.dtype), dk.to(q0.dtype), dv.to(q0.dtype), dh.to(q0.dtype),
                 dlr.to(lr.dtype), dlw.to(lw.dtype), dkap.to(q0.dtype),
-                None, None, None, None, None, None, None,
+                None, None, None, None, None, None, None, None,
                 None if dWg is None else dWg.to(Wg.dtype))
 
 
@@ -1954,9 +1965,12 @@ def _kappa_routed_readout(qf, kf, vf, hf, Wr, Ww, kapf, D, b, chunk_size, global
     if lr is None:
         H = Wr.shape[0]
         lr, lw = _router_logits(hf, Wr, Ww, b_r, b_w, H)
+    ckpt_inputs = (qf, kf, vf, hf, lr, lw, kap, Wg)
+    save_checkpoints = torch.is_grad_enabled() and any(
+        t is not None and t.requires_grad for t in ckpt_inputs)
     num, den = _RoLARoutedKappaFn.apply(qf, kf, vf, hf, lr, lw, kap, D, b, chunk_size,
                                         global_norm, per_state, eps,
-                                        H if H is not None else Wr.shape[0], Wg)
+                                        H if H is not None else Wr.shape[0], save_checkpoints, Wg)
     return num, den.unsqueeze(-1)
 
 
