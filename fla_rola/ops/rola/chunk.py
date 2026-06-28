@@ -114,40 +114,52 @@ _DTYPE_BYTES = 4                         # the kappa chunk/grad kernels stage th
 # The state-slice region ([BC·BK, BV]) is the densest co-resident set in the fused kappa kernels: a READ
 # copy + a WRITE copy of the slice plus the tl.dot operand staging — ~4 live fp32 tiles. The chunk-tile
 # region ([BT, BC·BK]) has ONE dominant live copy (its model UPPER-BOUNDS the measured peak — 64KB model
-# vs 43/61KB real at chunk=64). These structural co-residence counts (read from the kernel source, NOT
-# tuned numbers) divide the device budget per region. On a 99KB card: chunk-tile budget 81KB → chunk 64;
-# state-slice budget ~20KB → BK=BV=16 (the tested envelope; the >16 paths stay assert-guarded, see below).
+# vs 43/61KB real at chunk=64 for the forward/read kernels). The kappa backward-state kernel additionally
+# carries multiple BT×BT / BT×BC live regions and measures above the sm86 hard ceiling at BT=64, so its fit
+# uses a calibrated BT-quadratic term below. These structural co-residence counts (read from the kernel
+# source, NOT tuned numbers) divide the device budget per region. On a 99KB card: state-slice budget ~20KB
+# → BK=BV=16 (the tested envelope; the >16 paths stay assert-guarded, see below), while the stricter
+# kappa-backward BT model derives chunk 32.
 _STATE_SLICE_COPIES = 4
 _ROUTER_BD_COPIES = 2                     # router decay build: [BD,BB] weight tile + hc[BT,BD] hidden tile
+_KAPPA_BWD_STATE_BT2_BYTES = 10            # measured missing live-set term:
+                                           # 1024*64 + 10*64^2 = 106496 bytes on sm86
 
 
-def _fit_chunk(want, row_bytes):
+def _fit_chunk(want, row_bytes, bt2_bytes=0):
     """Largest power-of-2 chunk in [16, want] whose dominant fp32 tiles (which scale linearly with BT) fit
     the device SMEM budget. This sizes BT — the host-side knob the autotuner can't own (it sets the
     Sval/snapshot allocations + the launch grid before any kernel compiles). `row_bytes` is the kernel's
     peak SMEM PER chunk-row: the summed width (bytes) of its co-resident fp32 tiles that scale with BT,
-    read from the kernel source and calibrated against Triton's `.metadata.shared`. Floors at 16 (tl.dot
-    gram dim ≥ 16). A bigger tile (large BK_full at frontier dqk) ⇒ a bigger row_bytes ⇒ a smaller chunk —
-    the derive NATURALLY steps the chunk down at large dqk and up at small dqk, one formula, no per-dqk
-    branch. The looped kappa kernels keep BK=16 (BT-only growth) → full chunk; the un-looped RLA-raw
-    backward intra kernel uses BK_full → its row_bytes scales with dqk → it steps down (the fit-critical
-    path: at dqk=128 chunk=64 needs 112KB > 99KB, so it derives down to a fitting chunk)."""
+    read from the kernel source and calibrated against Triton's `.metadata.shared`. `bt2_bytes` optionally
+    models BT-quadratic live regions (BT×BT grams / adjoints) that are not captured by a row-linear tile
+    width; keep it zero for kernels whose measured peak is row-linear. Floors at 16 (tl.dot gram dim ≥ 16).
+    A bigger tile (large BK_full at frontier dqk) ⇒ a bigger row_bytes ⇒ a smaller chunk — the derive
+    NATURALLY steps the chunk down at large dqk and up at small dqk, one formula, no per-dqk branch. The
+    un-looped RLA-raw backward intra kernel uses BK_full → its row_bytes scales with dqk → it steps down
+    (the fit-critical path: at dqk=128 chunk=64 needs 112KB > 99KB, so it derives down to a fitting chunk).
+    The kappa backward-state path adds the calibrated BT² term so sm86 derives BT=32 instead of launching
+    the measured 106KB BT=64 kernel against a 101KB hard limit."""
     budget = _smem_budget()
     chunk = max(16, want)
-    while chunk > 16 and row_bytes * chunk > budget:
+    while chunk > 16 and row_bytes * chunk + bt2_bytes * chunk * chunk > budget:
         chunk //= 2
     return chunk
 
 
 # Per-chunk-row fp32 SMEM footprints (bytes) of the BT-scaling kernels, calibrated to `.metadata.shared`:
-#   * looped kappa fwd/bwd: the dominant [BT, BC·BK] read/write tile (BK=16 looped, BC=16) → BC·BK·4. The
-#     kappa kernels also carry a fixed base (router build + [BT,BT] grams) but it is far under budget at
-#     every BT≤64 on a 99KB card (measured fwd 43KB / bwd-read 61KB), so the BT-linear term sizing is safe.
+#   * looped kappa fwd/read: the dominant [BT, BC·BK] read/write tile (BK=16 looped, BC=16) → BC·BK·4. The
+#     kappa backward-state kernel also carries enough BT×BT / BT×BC live state to overflow sm86 at BT=64,
+#     so `_kappa_fit_chunk` adds `_KAPPA_BWD_STATE_BT2_BYTES` and derives BT=32 on a 99KB card.
 #   * un-looped RLA-raw backward `_routed_bwd_intra`: 3 fp32 [BT, BK_full] tiles (q, k, dq/dk accumulator)
 #     + 2 fp32 [BT, BVO] tiles (v, do/dv) co-resident → (3·BK_full + 2·BVO)·4. EXACT vs the measured peak
 #     (chunk·(12·BK_full + 8·BVO): dqk16/dv64 704·BT, dqk128/dv64 2048·BT — verified across the sweep).
 def _kappa_row_bytes(BK, BC=16):
     return BC * BK * _DTYPE_BYTES
+
+def _routed_inter_state_row_bytes(BK, BC=16):
+    # `_bwd_inter_state_kernel` keeps both wk[BT,BC*BK] and N[BT,BC*BK] live in fp32.
+    return 2 * BC * BK * _DTYPE_BYTES
 
 def _intra_row_bytes(BK_full, BVO):
     return (3 * BK_full + 2 * BVO) * _DTYPE_BYTES
@@ -836,10 +848,13 @@ def _rola_rla_routed_bwd(q, k, v, h, lr, lw, do, D, b, chunk, BG, H, Wg=None):
     # (dfr/fr with D levels) is precision-sensitive, so the logits + all gram dots run with fp32 operands.
     q, k, v, h, lr, lw, do = (x.float().contiguous() for x in (q, k, v, h, lr, lw, do))
     slo = (lw.stride(0), lw.stride(1), lw.stride(2), lw.stride(3))
-    # SMEM-derived: the BINDING kernel here is `_routed_bwd_intra` — it uses the FULL BK_full=next_pow2(dqk)
-    # tile (NOT the BK=16 loop of the inter/kappa kernels), so its footprint scales with dqk. Size the chunk
-    # to ITS per-row cost so frontier dqk steps the chunk down (dqk=128 → can't hold chunk=64 in 99KB → 32/16).
-    chunk = _fit_chunk(min(chunk, _CHUNK), _intra_row_bytes(BK_full, BVO))
+    # SMEM-derived: both the full-feature intra kernel and the looped inter-state kernel can bind BT. Intra
+    # uses BK_full=next_pow2(dqk), so its footprint scales with dqk; inter-state keeps two [BT,BC*BK] fp32
+    # tiles live (wk and N) and exceeds the sm86 hard ceiling at BT=64 even for dqk=dv=16. Choose the smaller
+    # shared chunk so the snapshot pass, state-bwd, read-bwd, and fold all agree on the reverse-scan tiling.
+    chunk = min(
+        _fit_chunk(min(chunk, _CHUNK), _intra_row_bytes(BK_full, BVO)),
+        _fit_chunk(min(chunk, _CHUNK), _routed_inter_state_row_bytes(BK, BC)))
     NCH = triton.cdiv(L, chunk)
     sel = _build_sel(D, b, nc, q.device)
     Wg = (Wg.float().contiguous() if use_g else q.new_zeros(H, d_model))
@@ -1277,7 +1292,10 @@ def _kappa_fit_chunk(dqk, dv, chunk, BC=16):
     returns it, so the bwd recompute lands on the SAME chunk → NCH / snapshot alignment is guaranteed
     without threading the value through every call."""
     bk = _kappa_bk_cap(dqk, dv, min(chunk, _CHUNK_FWD), BC)
-    return _fit_chunk(min(chunk, _CHUNK_FWD), _kappa_row_bytes(bk, BC))
+    return _fit_chunk(
+        min(chunk, _CHUNK_FWD),
+        _kappa_row_bytes(bk, BC),
+        bt2_bytes=_KAPPA_BWD_STATE_BT2_BYTES)
 
 
 def _kappa_ckpt_window(NCH):
@@ -1989,11 +2007,12 @@ def _kappa_routed_readout(qf, kf, vf, hf, Wr, Ww, kapf, D, b, chunk_size, global
 # At BT=64 (the shipped GLA forward _CHUNK, now == RLA's _CHUNK_FWD): 64·2.5 = 160 < 177 (~11% headroom,
 # measured finite). The differenced form e^{a_i-a_j} would be BT-free but can't be absorbed into the
 # routed read/write matmul nor the cross-chunk state carry — re-anchoring is the in-matmul-compatible
-# stabilization. SEPARATELY, the fused kappa-routed BACKWARD mega-kernel (decayed gram + 3-pass-κ fp32
-# tiles co-resident) is SMEM-bound, so its chunk is sized by the SAME `_fit_chunk` derive as the forward
-# (the dominant [BT, BC·BK] fp32 tile vs `_smem_budget()`) — on a 99KB card both land at 64 (the bwd read
-# kernel measures 61KB < 99KB there), graded down on smaller cards. This BT≤64 (overflow) ceiling is the
-# numerical bound the SMEM derive then caps under; the two limits are independent.
+# stabilization. SEPARATELY, the fused kappa-routed BACKWARD state kernel is SMEM-bound: besides the
+# dominant [BT, BC·BK] fp32 tile, it carries enough BT×BT / BT×BC live state that BT=64 measures above the
+# sm86 hard ceiling. `_kappa_fit_chunk` therefore adds a calibrated BT² live-set term and derives BT=32 on
+# 99KB-class cards, while larger-SMEM devices can keep BT=64 if the same budget formula says it fits. This
+# BT≤64 overflow ceiling is the numerical upper bound the SMEM derive then caps under; the two limits are
+# independent.
 #
 # FLOOR=-2.5 ⇒ per-token retention ≥ e^{-2.5} = 8.2%/tok. KEPT (160<177 fits BT=64, but the headroom is
 # thin — full floor removal would need a tighter per-tile anchor). The production layer's ld=log

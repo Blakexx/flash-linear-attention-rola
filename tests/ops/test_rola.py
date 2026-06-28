@@ -408,6 +408,19 @@ _ROUTE_FLAT_SQ_TREE_16 = [(1, 16), (2, 4), (4, 2)]  # flat, square(nc=16), tree(
 # =============================================================================
 class TestIntraConfigEquivalence:
 
+    def test_kappa_fit_chunk_uses_device_smem_budget(self, monkeypatch):
+        """#55 resource-fit regression: kappa fwd/bwd must share the same BT, but the bwd-state kernel's
+        real BT=64 live set exceeds the sm86 hard SMEM ceiling. Fit from the reported device budget rather
+        than arch names: sm86-class cards derive BT=32, while A100-class budgets can keep BT=64."""
+        monkeypatch.setattr(C, '_device_smem', lambda: 101376)  # sm86/sm89 hard limit
+        assert C._kappa_fit_chunk(dqk=16, dv=16, chunk=64, BC=16) == 32
+        assert C._kappa_fit_chunk(dqk=16, dv=16, chunk=32, BC=16) == 32
+        assert C._fit_chunk(64, C._routed_inter_state_row_bytes(BK=16, BC=16)) == 32
+
+        monkeypatch.setattr(C, '_device_smem', lambda: 166912)  # A100 hard limit
+        assert C._kappa_fit_chunk(dqk=16, dv=16, chunk=64, BC=16) == 64
+        assert C._fit_chunk(64, C._routed_inter_state_row_bytes(BK=16, BC=16)) == 64
+
     def _mk(self, D=1, b=8, dtype=torch.float32, dv=24, dqk=16, dm=40, B=2, H=2, T=64, seed=0, grad=False):
         g = torch.Generator(device=device).manual_seed(seed)
 
