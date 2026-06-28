@@ -151,6 +151,42 @@ def test_chunk_prefill_cache_handoff_matches_decode(kernel, norm, routing):
     assert out_ratio < _TOL, f"{kernel}/{norm}/{routing}: prefill->decode output relmax {out_ratio:.3e}"
 
 
+@pytest.mark.parametrize('kernel,norm,routing', [
+    ('rla', 'kappa', 'tree'),
+    ('gla_scalar', 'raw', 'tree'),
+    ('gla_scalar', 'kappa', 'square'),
+])
+def test_short_conv_prefill_cache_handoff_matches_decode(kernel, norm, routing):
+    """Short-conv cache state must also survive chunk-prefill -> recurrent decode handoff."""
+    if device != 'cuda':
+        pytest.skip('RoLA Triton kernels require CUDA')
+    torch.manual_seed(123)
+    prefix = 80
+    total = 96
+    m = RoLA(hidden_size=_HID, num_heads=_H, head_k_dim=_DQK, head_v_dim=_DV, layer_idx=0,
+             states_per_head=_NC, kernel=kernel, state_norm=norm, routing=routing,
+             use_short_conv=True, conv_size=3).to(device).eval()
+    x = torch.randn(1, total, _HID, device=device)
+
+    with torch.inference_mode():
+        chunk_cache = Cache()
+        prefix_out = m(x[:, :prefix], past_key_values=chunk_cache, use_cache=True)[0]
+        mixed = [prefix_out]
+        for t in range(prefix, total):
+            mixed.append(m(x[:, t:t + 1], past_key_values=chunk_cache, use_cache=True)[0])
+        mixed = torch.cat(mixed, dim=1)
+
+        decode_cache = Cache()
+        pure = []
+        for t in range(total):
+            pure.append(m(x[:, t:t + 1], past_key_values=decode_cache, use_cache=True)[0])
+        pure = torch.cat(pure, dim=1)
+
+    ratio = ((mixed.float() - pure.float()).abs().max()
+             / pure.float().abs().max().clamp(min=1e-6)).item()
+    assert ratio < _TOL, f"{kernel}/{norm}/{routing}: short-conv handoff relmax {ratio:.3e}"
+
+
 def test_chunk_prefill_warns_on_learned_gla_floor():
     """Chunk prefill must keep the layer-level signal when learned GLA decay hits the fp32 floor."""
     if device != 'cuda':

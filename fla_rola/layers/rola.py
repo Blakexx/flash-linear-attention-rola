@@ -103,7 +103,8 @@ class RoLA(nn.Module):
         tie_routers (bool): share one router for read+write (symmetric). Default False.
         tie_router_init (bool): untied routers, but read STARTS == write. Default False.
         router_bias (bool): bias on the routing projections. Default False.
-        use_short_conv (bool): causal depthwise short conv (+SiLU) on q/k/v. Default False.
+        use_short_conv (bool): causal depthwise short conv on projected q/k/v, routing, kappa, and GLA
+                               gate streams. Default False.
         conv_size (int): short-conv kernel size. Default 4.
         conv_bias (bool): bias in the short conv. Default False.
         layer_idx (int): layer index (for the KV cache). Default None.
@@ -186,6 +187,14 @@ class RoLA(nn.Module):
             self.q_conv1d = ShortConvolution(self.key_dim, conv_size, bias=conv_bias, activation='silu')
             self.k_conv1d = ShortConvolution(self.key_dim, conv_size, bias=conv_bias, activation='silu')
             self.v_conv1d = ShortConvolution(self.value_dim, conv_size, bias=conv_bias, activation='silu')
+            route_dim = num_heads * self.route_D * self.route_b
+            self.write_route_conv1d = ShortConvolution(route_dim, conv_size, bias=conv_bias, activation=None)
+            if not tie_routers:
+                self.read_route_conv1d = ShortConvolution(route_dim, conv_size, bias=conv_bias, activation=None)
+            if state_norm == 'kappa':
+                self.kappa_conv1d = ShortConvolution(num_heads, conv_size, bias=conv_bias, activation=None)
+            if kernel == 'gla_scalar':
+                self.g_conv1d = ShortConvolution(num_heads, conv_size, bias=conv_bias, activation=None)
 
         # PER-HEAD per-level factor routers on the residual stream. RoLA routes per head: each head h
         # owns its OWN tree weights Wr/Ww ∈ [H, D, hidden, b] (b**D == nc), and the leaf gate is the
@@ -225,6 +234,7 @@ class RoLA(nn.Module):
 
         if kernel == 'gla_scalar':
             self.w_g = nn.Linear(hidden_size, num_heads, bias=False)  # per-head scalar forget gate
+            self.register_buffer('_unit_w_g', torch.ones(num_heads, 1), persistent=False)
         if state_norm == 'kappa':
             self.w_kappa = nn.Linear(hidden_size, num_heads)
             nn.init.zeros_(self.w_kappa.weight)
@@ -261,6 +271,13 @@ class RoLA(nn.Module):
             z = z + bias.to(x.dtype)[None, None]                  # [H,D,b] broadcast
         return z
 
+    def _conv_factor_logits(self, logits, conv, cache, use_cache, cu_seqlens):
+        flat = rearrange(logits, 'b l h d c -> b l (h d c)')
+        flat, cache = conv(flat, cache=cache, output_final_state=use_cache, cu_seqlens=cu_seqlens)
+        logits = rearrange(flat, 'b l (h d c) -> b l h d c',
+                           h=self.num_heads, d=self.route_D, c=self.route_b)
+        return logits, cache
+
     def _gates_from_logits(self, logits):
         """Fold per-level softmax factors into the explicit [B,L,H,nc] leaf gates (the DECODE/CPU
         reference path — the kernel builds these IN-KERNEL for the chunk path). logits:[B,L,H,D,b].
@@ -289,10 +306,11 @@ class RoLA(nn.Module):
         HF RoLAForCausalLM aggregates it explicitly). 0.0 when router_zloss_coef == 0."""
         return self._router_aux if self._router_aux is not None else 0.0
 
-    def _log_decay(self, x, write_gates):
+    def _log_decay(self, x, write_gates, alpha_logits=None):
         B, L = x.shape[0], x.shape[1]
         H = self.num_heads
-        alpha = F.logsigmoid(self.w_g(x).view(B, L, H)).exp()              # [B,L,H]
+        alpha_logits = self.w_g(x).view(B, L, H) if alpha_logits is None else alpha_logits.view(B, L, H)
+        alpha = F.logsigmoid(alpha_logits).exp()                           # [B,L,H]
         alpha_chunk = 1.0 - write_gates * (1.0 - alpha.unsqueeze(-1))       # [B,L,H,C]
         # Floor the log-decay to the kernel's fp32-safe domain (_GLA_FLOOR=-2.5 ⇒ retention ≥ 8.2%/tok).
         # This is a DELIBERATE, documented modeling floor — the chunked GLA decay is factored e^{±a} and
@@ -346,9 +364,20 @@ class RoLA(nn.Module):
         cu_seqlens = kwargs.get('cu_seqlens')
 
         if self.use_short_conv:
-            conv_state_q = conv_state_k = conv_state_v = None
-            if last_state is not None:
-                conv_state_q, conv_state_k, conv_state_v = last_state['conv_state']
+            conv_states = list(last_state['conv_state']) if last_state is not None else []
+            while len(conv_states) < 7:
+                conv_states.append(None)
+            conv_i = 0
+            conv_state_q = conv_states[conv_i]; conv_i += 1
+            conv_state_k = conv_states[conv_i]; conv_i += 1
+            conv_state_v = conv_states[conv_i]; conv_i += 1
+            conv_state_wl = conv_states[conv_i]; conv_i += 1
+            conv_state_rl = None if self.read_W is None else conv_states[conv_i]
+            conv_i += 1
+            conv_state_kappa = conv_states[conv_i] if self.state_norm == 'kappa' else None
+            conv_i += 1
+            conv_state_g = conv_states[conv_i] if self.kernel == 'gla_scalar' else None
+            conv_i += 1
             q, conv_state_q = self.q_conv1d(self.q_proj(x), cache=conv_state_q,
                                             output_final_state=use_cache, cu_seqlens=cu_seqlens)
             k, conv_state_k = self.k_conv1d(self.k_proj(x), cache=conv_state_k,
@@ -366,16 +395,40 @@ class RoLA(nn.Module):
             q, k = self.q_norm(q), self.k_norm(k)
 
         qf, kf = self._feature_map(q, k)
-        kap = (torch.sigmoid(self.w_kappa(x)).view(B, L, H, 1)
-               if self.state_norm == 'kappa' else None)
+        if self.state_norm == 'kappa':
+            kappa_logits = self.w_kappa(x)
+            if self.use_short_conv:
+                kappa_logits, conv_state_kappa = self.kappa_conv1d(
+                    kappa_logits, cache=conv_state_kappa,
+                    output_final_state=use_cache, cu_seqlens=cu_seqlens)
+            kap = torch.sigmoid(kappa_logits).view(B, L, H, 1)
+        else:
+            kap = None
         D, b = self.route_D, self.route_b
-        Wg = self.w_g.weight if self.kernel == 'gla_scalar' else None   # [H, hidden] per-head decay
+        alpha_logits = None
+        if self.kernel == 'gla_scalar':
+            alpha_logits = self.w_g(x)
+            if self.use_short_conv:
+                alpha_logits, conv_state_g = self.g_conv1d(
+                    alpha_logits, cache=conv_state_g,
+                    output_final_state=use_cache, cu_seqlens=cu_seqlens)
+            Wg = self._unit_w_g.to(device=x.device, dtype=torch.float32) if self.use_short_conv else self.w_g.weight
+        else:
+            Wg = None
 
         # Router z-loss is stashed from the (cheap, [L,nc]-free) per-level FACTOR logits on BOTH paths —
         # the chunk kernel never materializes the gates, so the layer computes the logits here purely for
         # the auxiliary loss + (decode) gate folding.
         wl = self._factor_logits(x, self.write_W, self.write_b)
         rl = self._factor_logits(x, self.read_W, self.read_b) if self.read_W is not None else wl
+        if self.use_short_conv:
+            wl, conv_state_wl = self._conv_factor_logits(
+                wl, self.write_route_conv1d, conv_state_wl, use_cache, cu_seqlens)
+            if self.read_W is None:
+                rl = wl
+            else:
+                rl, conv_state_rl = self._conv_factor_logits(
+                    rl, self.read_route_conv1d, conv_state_rl, use_cache, cu_seqlens)
         self._stash_zloss(wl, rl)
 
         # The ops own dtype/autocast (their Triton autograd Functions carry @input_guard +
@@ -388,7 +441,7 @@ class RoLA(nn.Module):
             # weights-in interface — no separate precomputed-gate chunk signature.
             write_gates = self._gates_from_logits(wl)
             read_gates = write_gates if self.read_W is None else self._gates_from_logits(rl)
-            g = self._log_decay(x, write_gates) if self.kernel == 'gla_scalar' else None
+            g = self._log_decay(x, write_gates, alpha_logits=alpha_logits) if self.kernel == 'gla_scalar' else None
             out, recurrent_state = fused_recurrent_rola(
                 qf, kf, v, r=read_gates, w=write_gates, g=g, norm=self.state_norm, kappa=kap, scale=1.0,
                 initial_state=recurrent_state, output_final_state=use_cache, cu_seqlens=cu_seqlens)
@@ -404,7 +457,8 @@ class RoLA(nn.Module):
             # z-loss) are passed straight to the kernel — the d_model-contraction h·W is a cuBLAS GEMM done
             # ONCE in `_factor_logits` (not re-done in the kernel nor re-GEMM'd in `chunk_rola_routed`); the
             # kernel only softmax+gathers, and dWrite_W/dRead_W/dx flow back through this einsum.
-            h = x.unsqueeze(2).expand(B, L, H, self.hidden_size)
+            h = (alpha_logits.view(B, L, H, 1) if (self.kernel == 'gla_scalar' and self.use_short_conv)
+                 else x.unsqueeze(2).expand(B, L, H, self.hidden_size))
             out = chunk_rola_routed(
                 qf, kf, v, h, self.write_W if self.read_W is None else self.read_W, self.write_W,
                 D, b, norm=self.state_norm, kappa=kap, scale=1.0,
@@ -419,7 +473,8 @@ class RoLA(nn.Module):
                 # readout path. No backward (decode is inference); training (use_cache=False) never hits it.
                 from fla_rola.ops.rola.chunk import _final_state
                 write_gates = self._gates_from_logits(wl)
-                gfull = self._log_decay(x, write_gates) if self.kernel == 'gla_scalar' else None
+                gfull = self._log_decay(x, write_gates, alpha_logits=alpha_logits) \
+                    if self.kernel == 'gla_scalar' else None
 
                 def _fold(t):
                     return t.permute(0, 2, 1, 3).reshape(B * H, L, t.shape[-1])
@@ -431,7 +486,10 @@ class RoLA(nn.Module):
 
         update_layer_cache(
             self, past_key_values, recurrent_state=recurrent_state,
-            conv_state=(conv_state_q, conv_state_k, conv_state_v) if self.use_short_conv else None,
+            conv_state=(
+                conv_state_q, conv_state_k, conv_state_v, conv_state_wl,
+                conv_state_rl, conv_state_kappa, conv_state_g,
+            ) if self.use_short_conv else None,
             offset=L)
 
         o = self.o_proj(out.reshape(B, L, H * self.head_v_dim))
@@ -440,13 +498,23 @@ class RoLA(nn.Module):
     # --- state accounting (zoology Hybrid.state_size / LM matched-state read these) ---
     def get_stats(self):
         per_entry = self.feat_dim * self.head_v_dim + (self.feat_dim if self.uses_v_plus_one else 0)
+        conv_state = 0
+        if self.use_short_conv:
+            route_dim = self.num_heads * self.route_D * self.route_b
+            conv_state = self.conv_size * (self.key_dim + self.key_dim + self.value_dim + route_dim)
+            if self.read_W is not None:
+                conv_state += self.conv_size * route_dim
+            if self.state_norm == 'kappa':
+                conv_state += self.conv_size * self.num_heads
+            if self.kernel == 'gla_scalar':
+                conv_state += self.conv_size * self.num_heads
         return {
             'd_qk': self.head_k_dim,
             'feat_dim': self.feat_dim,
             'd_v': self.head_v_dim,
             'n_heads': self.num_heads,
             'num_chunks': self.states_per_head,
-            'state_floats': self.num_heads * self.states_per_head * per_entry,
+            'state_floats': self.num_heads * self.states_per_head * per_entry + conv_state,
         }
 
     def state_size(self, sequence_length: int = None, **kwargs) -> int:
