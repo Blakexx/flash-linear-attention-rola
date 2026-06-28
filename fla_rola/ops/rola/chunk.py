@@ -93,14 +93,15 @@ _AT_CFGS = [triton.Config({}, num_warps=w, num_stages=s) for w in _WARPS for s i
 # other's tuned warps/stages/BV. USE_G is a constexpr (so it specializes the compile regardless), but
 # it must also gate config SELECTION so each variant tunes its own (the GLA decay-replay has a heavier
 # SMEM profile than RLA, so the best config differs). Perf-only; no correctness change. (#22)
-# BT/BB/BD are INCLUDED because they change the compiled tile footprint. A chunk=32 structural warmup can
-# otherwise cache a scan config that is over-SMEM when replayed at chunk=64 on sm86.
+# BT/BK/BB/BG/BD are INCLUDED because they change the compiled tile footprint. A chunk=32 structural warmup
+# or a different state-block width can otherwise cache a scan config that is over-SMEM when replayed at a
+# larger chunk/state tile on sm86.
 # nc is EXCLUDED on purpose: it only sets the host-side grid trip count `NB = cdiv(nc, BG)` (see ~L494)
 # — the per-program state block is a fixed BG-wide tile, so nc changes NEITHER a kernel constexpr tile
 # NOR per-program SMEM. The best warps/stages/BV is therefore nc-INVARIANT, and keying on nc forced a
 # needless full re-tune at every states-per-head in the scaling sweep. Perf-only (config REUSE across
 # nc); correctness is unaffected — the kernel still specializes on its real constexprs.
-_SCAN_KEY = ['dqk', 'dv', 'BT', 'BB', 'BD', 'USE_G']
+_SCAN_KEY = ['dqk', 'dv', 'BT', 'BK', 'BB', 'BG', 'BD', 'USE_G']
 # `_CHUNK`/`_CHUNK_FWD` are the chunk-size CEILING — the largest BT the SMEM derive may pick. 64 is the
 # GLA fp32-overflow ceiling (the chunked-decay gram e^a·e^{-a}; `_decay_factors` re-anchors each factor to
 # the per-state midpoint, doubling the fp32-safe span to BT·|FLOOR|≲177, so 64·2.5=160<177 fits — the
@@ -314,14 +315,30 @@ def _router_bd_ndm(d_model, b):
 
 
 def _prune_bv(configs, named_args, **kwargs):
-    """Cap BV at next_pow2(d_v): a bigger value-tile than the value dim is pure waste (and would blow
-    up the config grid). Floor 16 always survives — the routed forward inter-scan's value-axis prune."""
+    """Cap BV at next_pow2(d_v) and drop routed inter-scan tiles that cannot fit SMEM.
+
+    The scan's dominant live fp32 tile is the readout dot product/reinterpretation `P/P3` with shape
+    [BT, BG*BV]. At BT=64,BG=16,BV=32 this alone is 128 KiB, over the 99 KiB sm86/sm89 hard limit before
+    Triton's dot staging and routing temporaries are counted. Pruning it host-side prevents autotune cache
+    from ever selecting a launch shape that later replays as `OutOfResources`.
+    """
     try:
         cap = _bv_cap(named_args['dv'])
     except Exception:
         return configs
     keep = [c for c in configs if c.kwargs.get('BV', 16) <= cap]
-    return keep or [c for c in configs if c.kwargs.get('BV', 16) == 16] or configs
+    try:
+        BT = int(named_args['BT'])
+        BG = int(named_args['BG'])
+        budget = _smem_budget()
+        keep_fit = [
+            c for c in keep
+            if BT * BG * int(c.kwargs.get('BV', 16)) * _DTYPE_BYTES <= budget
+        ]
+    except Exception:
+        keep_fit = keep
+    return keep_fit or [c for c in keep if c.kwargs.get('BV', 16) == 16] \
+        or [c for c in configs if c.kwargs.get('BV', 16) == 16] or configs
 
 
 # ============================================================================
