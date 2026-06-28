@@ -2,19 +2,18 @@
 
 """Correctness suite for the routed RoLA operator — restructured into TWO principled axes + autograd (#46).
 
-The precomputed-gate RoLA Triton kernels are RETIRED (#44 convergence): the public `chunk_rola` is a
-PURE-TORCH naive reference (`C._chunk_rola_impl`, math core git-unchanged since before the fuse), the
-routed math lives entirely in the in-kernel `chunk_rola_routed` / `fused_recurrent_rola`, and the O(L²)
-`naive_rola_*` (imports only torch, lifted verbatim from the original CLA reference) are the anchors.
-EVERYTHING is validated against those ground truths — never a fresh re-encode of a kernel's own assumption.
+The precomputed-gate RoLA Triton kernels are RETIRED (#44 convergence): routed math lives in the
+in-kernel `chunk_rola_routed` / `fused_recurrent_rola`, and the O(L²) `naive_rola_*` plus fp64
+materialized-gate references below are the anchors. The old public precomputed-gate `chunk_rola` helper
+has been moved to rola-scratch; this suite validates the shipping interfaces.
 
 The suite has three legs:
 
   1. INTRA-CHUNK CONFIG-EQUIVALENCE (`TestIntraConfigEquivalence`) — the config axis. For a FIXED random
      input, run the kernel under EVERY output-equivalent config branch and assert IDENTICAL forward AND
      grads: the chunk size (NCH=1 single-chunk vs multi-chunk inter-scan), the autotune tile counts
-     (ND/ND_V/BV/BD via dv/dqk + a FORCED single-config sweep), BUILD_R True/False (write-only snapshot
-     path — bit-identical write factor), and the `chunk_rola` torch.compile flag. Bit-exact where the
+     (ND/ND_V/BV/BD via dv/dqk + a FORCED single-config sweep), and BUILD_R True/False (write-only snapshot
+     path — bit-identical write factor). Bit-exact where the
      branch is a pure reorder/flag; fp-tight where the reduction order genuinely differs across tiles.
      Catches tile/config/flag bugs SYSTEMATICALLY — the axis the old per-feature tests covered only
      incidentally (grep 'intra' on the old file → 0).
@@ -34,8 +33,7 @@ independence, signed-den consistency, the below-floor ld guard, the *_no_LNC_mat
 watches, and (tests/layers/test_rola_routing_init) the init-parity.
 
 Run:  PYTHONPATH=. pytest tests/ops/test_rola.py -q   (CUDA required; CPU is skipped).
-      Mind the GLA-routed cold autotune (~40min); run with ROLA_NO_COMPILE=1 where the chunk_rola
-      compile flag is not under test.
+      Mind the GLA-routed cold autotune (~40min).
 """
 
 import pytest
@@ -43,7 +41,7 @@ import torch
 import triton
 
 import fla_rola.ops.rola.chunk as C
-from fla_rola.ops.rola import chunk_rola, fused_recurrent_rola
+from fla_rola.ops.rola import fused_recurrent_rola
 from fla_rola.ops.rola.naive import (
     naive_rola_gla,
     naive_rola_global,
@@ -110,8 +108,8 @@ def _vh_combine(o_aug, r, nc, norm, dv):
     Bq, L = o_aug.shape[0], o_aug.shape[1]
     o = o_aug.view(Bq, L, _H, nc, dv + 1)
     num, den = o[..., :dv], o[..., dv]
-    # RAW signed den (the canonical convention: chunk `_kappa_rescale`, decode, `chunk_rola` torch, and
-    # the naive oracle all use raw (d+ε)). Tests run positive features (q,k=.abs(), softmax w ⇒ d>0), so
+    # RAW signed den (the canonical convention: routed chunk, decode, and the naive oracle all use
+    # raw (d+ε)). Tests run positive features (q,k=.abs(), softmax w ⇒ d>0), so
     # raw == |d|; the rescale r̃=r·(d+ε)^{−κ} | r/(d+ε) is only well-defined for d>0 (production = elu+1).
     if norm == 'kappa':
         r = r * (den + EPS).pow(-KAPPA)
@@ -145,13 +143,6 @@ def _naive(q, k, v, r, w, ld, gla):
     if gla:
         return naive_rola_gla(q, k, v, w, r, ld, normalized=True)
     return naive_rola_global(q, k, v, w, r)
-
-
-def _routed(q, k, v, r, w, ld, nc, norm):
-    """The torch-naive routed reference (`_chunk_rola_impl`) — the explicit-gate ground truth."""
-    kap = (torch.full((q.shape[0], q.shape[1], _H, 1), KAPPA, device=q.device, dtype=q.dtype)
-           if norm == 'kappa' else None)
-    return C._chunk_rola_impl(q, k, v, r=r, w=w, g=ld, norm=norm, kappa=kap, scale=1.0)
 
 
 def _grad_through(fwd, q, k, v, r, w, ld, gla, coef):
@@ -190,19 +181,17 @@ def _mk_oracle(B, L, H, K, nc, dv, dtype, seed=0, with_ld=False):
 #
 # RoLA routes PER HEAD: each head h owns its own [D,d_model,b] tree router (Wr,Ww ∈ [H,D,d_model,b]).
 # There is ONE ground truth for "the gates a router produces" — `_per_head_gates` — and EVERYTHING is
-# anchored to it: the production `chunk_rola` consumes these explicit gates, the chunked math refs build
-# on them, and the fused `chunk_rola_routed` must compute the SAME gates IN-KERNEL from the SAME router.
-# So the canonical assertion is chunk_rola_routed(router) == chunk_rola(_per_head_gates(router)) == the
-# chunked naive — all per-head, one truth. A shared-vs-per-head divergence CANNOT pass this (it would
-# break BOTH the equality-to-chunk_rola AND the per-head-independence test below) — which is exactly the
-# class of bug a fresh fused-only reference (re-encoding the kernel's own assumption) used to hide.
+# anchored to it: materialized-gate references build on these explicit gates, and the fused
+# `chunk_rola_routed` must compute the SAME gates IN-KERNEL from the SAME router. A shared-vs-per-head
+# divergence CANNOT pass this plus the per-head-independence test below — the class of bug a fresh
+# fused-only reference (re-encoding the kernel's own assumption) used to hide.
 # =============================================================================
 def _per_head_gates(hf, Wr, Ww, D, b, H, b_r=None, b_w=None):
     """THE canonical per-head tree gates. hf:[BH,T,d_model] (BH=(B,H) fold), Wr,Ww:[H,D,d_model,b],
     optional per-head bias b_r/b_w:[H,D,b]. Each head folds with its OWN router:
         r[...,leaf] = Π_lvl softmax(h·Wr[head,lvl] + b_r[head,lvl])[..., digit_lvl(leaf)].
-    Returns the explicit folded gates [BH,T,nc] that `chunk_rola` consumes — out-of-place (graph-reuse
-    safe). This is the ONLY routing reference; every routed test anchors to it."""
+    Returns the explicit folded gates [BH,T,nc] for the materialized-gate references — out-of-place
+    (graph-reuse safe). This is the ONLY routing reference; every routed test anchors to it."""
     BH, T, dm = hf.shape
     hr = hf.view(BH // H, H, T, dm)                       # [B,H,T,dm]
 
@@ -566,10 +555,10 @@ class TestIntraConfigEquivalence:
     def test_tile_count_equivalence_fwd(self, dv, dqk):
         """The host-computed tile counts (ND=cdiv(dqk,BK), ND_V=cdiv(dv,BV), BV/BD) change with dv/dqk —
         the value/feature LOOPS are reduction-order reassociations that must leave the output invariant. We
-        can't change ND_V for a FIXED dv (it's derived), so the equivalence is: the routed kernel ==
-        `_chunk_rola_impl` (the single-shot torch ground truth, no tiling) at EVERY (dv,dqk) tile regime —
-        pow2 (ND_V=1), non-pow2 dv (BV padding), and large dqk (ND>1 feature loop). A mis-tiled loop bound
-        diverges from the un-tiled reference somewhere in this grid."""
+        can't change ND_V for a FIXED dv (it's derived), so the equivalence is: the routed kernel matches
+        the materialized-gate reference at EVERY (dv,dqk) tile regime — pow2 (ND_V=1), non-pow2 dv
+        (BV padding), and large dqk (ND>1 feature loop). A mis-tiled loop bound diverges somewhere in this
+        grid."""
         if device != 'cuda':
             pytest.skip('RoLA Triton kernels require CUDA')
         D, b = 1, 8
@@ -577,13 +566,14 @@ class TestIntraConfigEquivalence:
             q, k, v, h, Wr, Ww = self._mk(dv=dv, dqk=dqk, seed=2)
             kw = dict(norm=norm, scale=1.0)
             of = C.chunk_rola_routed(q, k, v, h, Wr, Ww, D, b, **kw).float()
-            # the single-shot torch ground truth on the SAME per-head gates (no tiling, no chunk loop bound).
-            hf = h.permute(0, 2, 1, 3).reshape(2 * 2, 64, 40)
-            rg, wg = _per_head_gates(hf, Wr, Ww, D, b, 2)
-            rg = rg.view(2, 2, 64, -1).permute(0, 2, 1, 3).contiguous()
-            wg = wg.view(2, 2, 64, -1).permute(0, 2, 1, 3).contiguous()
-            oe = C._chunk_rola_impl(q, k, v, r=rg, w=wg, norm=norm, scale=1.0).float()
-            assert _relmax(of, oe) < 5e-3, f'norm={norm} dv={dv} dqk={dqk} tile vs un-tiled {_relmax(of, oe):.2e}'
+            if norm == 'raw':
+                oe = _routed_raw_ref(q.float(), k.float(), v.float(), h.float(),
+                                     Wr.float(), Ww.float(), D, b, 1.0).float()
+            else:
+                oe = _kappa_ref_chunked(q.float(), k.float(), v.float(), h.float(),
+                                        Wr.float(), Ww.float(), None, D, b, norm, 1.0,
+                                        min(64, max(16, triton.next_power_of_2(q.shape[1])))).float()
+            assert _relmax(of, oe) < 5e-3, f'norm={norm} dv={dv} dqk={dqk} tile vs ref {_relmax(of, oe):.2e}'
 
     @pytest.mark.parametrize('norm', ['raw', 'global', 'per_state', 'kappa'])
     @pytest.mark.parametrize('D,b', [(1, 16), (2, 4), (4, 2)])
@@ -635,45 +625,18 @@ class TestIntraConfigEquivalence:
             S = S + torch.einsum('btc,btk,btv->bckv', wf[:, c0:c1], kf[:, c0:c1], vf[:, c0:c1])
         assert worst < 5e-3, f'BUILD_R=False snapshot state vs analytic write-state {worst:.2e}'
 
-    @pytest.mark.parametrize('norm', ['raw', 'global', 'kappa'])
-    @pytest.mark.parametrize('gla', [False, True])
-    def test_chunk_rola_compile_flag_equivalence(self, norm, gla):
-        """`chunk_rola`'s torch.compile flag (ROLA_NO_COMPILE) is a config branch over the SAME pure-torch
-        impl — eager and compiled must agree fp-tight (compile only fuses the einsums; no math change).
-        Forces eager vs compiled by toggling C._ROLA_NO_COMPILE."""
-        if device != 'cuda':
-            pytest.skip('RoLA Triton kernels require CUDA')
-        nc, dv, L = 8, 16, 64
-        q, k, v, r, w, ld = _mk_inter(L, nc, dv, gla, 3)
-        kap = _kap(q, norm)
-        kw = dict(r=r, w=w, g=ld, norm=norm, kappa=kap, scale=1.0)
-        saved = C._ROLA_NO_COMPILE
-        try:
-            C._ROLA_NO_COMPILE = True
-            o_eager = chunk_rola(q, k, v, **kw)
-            C._ROLA_NO_COMPILE = False
-            C._chunk_rola_compiled = None
-            o_comp = chunk_rola(q, k, v, **kw)
-        finally:
-            C._ROLA_NO_COMPILE = saved
-            C._chunk_rola_compiled = None
-        assert _relmax(o_comp.float(), o_eager.float()) < 1e-4, \
-            f'compile vs eager {norm} gla={gla}: {_relmax(o_comp.float(), o_eager.float()):.2e}'
-
-
 # =============================================================================
 # SUITE 2 — INTER-CHUNK CORRECTNESS (fwd + bwd). For a fixed input, chunked == recurrent == naive across
 # the FULL semantic cross-product. ONE comprehensive grid subsuming the scattered per-feature tests.
 #
 # Two coupled grids share the cross-product:
-#   (A) the EXPLICIT-GATE backbone (chunk_simple_gla vh-chunk / fused_recurrent step-decode / torch-naive
-#       `chunk_rola` / direct O(L²) oracle) over norm × {RLA,GLA} × dims — the chunk==recurrent==naive
-#       four-way agreement (forward) + the routed-kernel-grad == autograd(naive) == autograd(vh-chunk)
-#       (backward). (was test_inter_equivalence_fwd / test_inter_backward_global.)
+#   (A) the backbone (chunk_simple_gla vh-chunk / fused_recurrent step-decode / direct O(L²) oracle)
+#       over norm × {RLA,GLA} × dims — the chunk==recurrent==naive agreement (forward) plus
+#       autograd(naive)==autograd(vh-chunk) for global backward.
 #   (B) the ROUTED-KERNEL grid (chunk_rola_routed, in-kernel routing) over norm × {RLA,GLA} × bias{on,off}
 #       × routing{flat,square,tree} × dims — the fused output AND all grads == autograd of the fp64
-#       chunked reference on the CANONICAL per-head gates, cross-checked against `_chunk_rola_impl` fed the
-#       SAME router's gates (the unified truth). SUBSUMES test_kappa_routed_*/test_gla_routed_*/
+#       chunked/materialized-gate reference on the CANONICAL per-head gates. SUBSUMES test_kappa_routed_*/
+#       test_gla_routed_*/
 #       test_routed_bias_*/test_routed_bwd_nonpow2_dv and closes the GLA×bias×routing holes BY CONSTRUCTION.
 # =============================================================================
 # (A) EXPLICIT-GATE backbone dims (curated (dqk,nc,dv): pow2 + non-pow2 dv/nc + large dqk — a full
@@ -768,44 +731,38 @@ class TestInterCorrectness:
             assert grad is not None
             assert torch.isfinite(grad.float()).all()
 
-    # ---- (A) the explicit-gate chunk==recurrent==naive backbone -------------------------------------
+    # ---- (A) the chunk==recurrent==naive backbone ---------------------------------------------------
     @pytest.mark.parametrize('dqk,nc,dv', _INTER_DIMS)
     @pytest.mark.parametrize('gla', [False, True])
     @pytest.mark.parametrize('norm', ['global', 'kappa', 'per_state'])
     def test_backbone_fwd(self, norm, gla, dqk, nc, dv):
-        """chunk (vh chunk_simple_gla) == recurrent (step fused_recurrent) == routed (torch-naive
-        `_chunk_rola_impl`) == naive direct O(L²) oracle (global), FORWARD, L=64, over 6 seeds. TOL 5e-3
+        """chunk (vh chunk_simple_gla) == recurrent (step fused_recurrent) == naive direct O(L²) oracle
+        (global), FORWARD, L=64, over 6 seeds. TOL 5e-3
         (clean ~1.5e-3; ~3x headroom). Swept over non-pow2 dv/nc + large dqk so any padding/stride/masking
-        bug in the routed fwd, the vh-chunk fwd, or the recurrent step fires somewhere in the grid."""
+        bug in the vh-chunk fwd or the recurrent step fires somewhere in the grid."""
         if device != 'cuda':
             pytest.skip('RoLA Triton kernels require CUDA')
         L, tol = 64, 5e-3
-        w_rc = w_kc = w_cn = w_rn = w_kn = 0.0
+        w_rc = w_cn = w_rn = 0.0
         for seed in range(6):
             q, k, v, r, w, ld = _mk_inter(L, nc, dv, gla, seed, dqk=dqk)
             o_chunk = _chunked(q, k, v, r, w, ld, nc, norm, dv)
             o_rec = _recurrent(q, k, v, r, w, ld, nc, norm, dv)
-            o_routed = _routed(q, k, v, r, w, ld, nc, norm)
             w_rc = max(w_rc, _relmax(o_rec, o_chunk))            # recurrent == chunked
-            w_kc = max(w_kc, _relmax(o_routed, o_chunk))         # routed-torch == vh chunk
             if norm == 'global':
                 o_naive = _naive(q, k, v, r, w, ld, gla)         # the direct-oracle anchor
                 w_cn = max(w_cn, _relmax(o_chunk, o_naive))
                 w_rn = max(w_rn, _relmax(o_rec, o_naive))
-                w_kn = max(w_kn, _relmax(o_routed, o_naive))
-        assert_close('routed==chunk', o_chunk, o_routed, tol)
         assert w_rc < tol, f'recurrent==chunk max-rel {w_rc:.2e}'
-        assert w_kc < tol, f'routed==chunk max-rel {w_kc:.2e}'
         if norm == 'global':
-            assert max(w_cn, w_rn, w_kn) < tol, \
-                f'chunk==naive {w_cn:.2e} rec==naive {w_rn:.2e} routed==naive {w_kn:.2e}'
+            assert max(w_cn, w_rn) < tol, f'chunk==naive {w_cn:.2e} rec==naive {w_rn:.2e}'
 
     @pytest.mark.parametrize('dv', [16, 32, 64])
     @pytest.mark.parametrize('nc', [16, 64])
     @pytest.mark.parametrize('gla', [False, True])
     def test_backbone_bwd(self, gla, nc, dv):
-        """INTER backward: routed-torch grad == autograd(naive oracle) == autograd(vh-chunk), norm=global,
-        BT=16 fp32 (value-tiled fp32 backward fits a small card → rigorous ~1e-3). TOL 1.2e-2 (the
+        """INTER backward: autograd(naive oracle) == autograd(vh-chunk), norm=global,
+        BT=16 fp32 (value-tiled fp32 backward fits a small card -> rigorous ~1e-3). TOL 1.2e-2 (the
         chunked + value-tiled fp32 reduction-order gap ranges to ~8e-3 and varies with the config picked,
         so 1.2e-2 clears the noise floor while still catching the ~2% MUT class)."""
         if device != 'cuda':
@@ -815,41 +772,18 @@ class TestInterCorrectness:
         C._CHUNK_FWD = 16
         try:
             tol = 1.2e-2
-            w_kn = w_kc = w_cn = 0.0
+            w_cn = 0.0
             for seed in range(3):
                 q, k, v, r, w, ld = _mk_inter(64, nc, dv, gla, seed)
                 coef = torch.randn(*v.shape, device=device)
-                g_routed = _grad_through(lambda a, b, c, d, e, f: _routed(a, b, c, d, e, f, nc, 'global'),
-                                         q, k, v, r, w, ld, gla, coef)
                 g_naive = _grad_through(lambda a, b, c, d, e, f: _naive(a, b, c, d, e, f, gla),
                                         q, k, v, r, w, ld, gla, coef)
                 g_chunk = _grad_through(lambda a, b, c, d, e, f: _chunked(a, b, c, d, e, f, nc, 'global', dv),
                                         q, k, v, r, w, ld, gla, coef)
-                w_kn = max(w_kn, max(_relmax(a, b) for a, b in zip(g_routed, g_naive)))
-                w_kc = max(w_kc, max(_relmax(a, b) for a, b in zip(g_routed, g_chunk)))
                 w_cn = max(w_cn, max(_relmax(a, b) for a, b in zip(g_chunk, g_naive)))
-            assert max(w_kn, w_kc, w_cn) < tol, \
-                f'routed==naive {w_kn:.2e} routed==vhchunk {w_kc:.2e} vhchunk==naive {w_cn:.2e}'
+            assert w_cn < tol, f'vhchunk==naive {w_cn:.2e}'
         finally:
             C._CHUNK, C._CHUNK_FWD = saved
-
-    @pytest.mark.parametrize('norm', ['raw', 'global', 'kappa', 'per_state'])
-    @pytest.mark.parametrize('gla', [False, True])
-    def test_recurrent_handoff(self, gla, norm):
-        """fused_recurrent_rola readout == chunk_rola readout, and chunk_rola(output_final_state) emits the
-        SAME state fused_recurrent_rola does → a chunked prefill hands off to recurrent decode. Different
-        reduction orders (chunked grams vs single-token scan) → rate-consistent to ~5e-3, NOT bit-exact.
-        'raw' (the gla-scalar default) has a [*,K,V] state (NO +1 den column), on BOTH RLA and GLA."""
-        if device != 'cuda':
-            pytest.skip('RoLA Triton kernels require CUDA')
-        nc, dv, L, tol = 8, 16, 64, 5e-3
-        for seed in range(4):
-            q, k, v, r, w, ld = _mk_inter(L, nc, dv, gla, seed)
-            kw = dict(r=r, w=w, g=ld, norm=norm, kappa=_kap(q, norm), scale=1.0, output_final_state=True)
-            o_chunk, s_chunk = chunk_rola(q, k, v, **kw)
-            o_rec, s_rec = fused_recurrent_rola(q, k, v, **kw)
-            assert_close('recurrent==chunk readout', o_chunk, o_rec, tol)
-            assert_close('prefill->decode state handoff', s_chunk, s_rec, tol)
 
     @pytest.mark.parametrize('norm', ['global', 'kappa', 'per_state'])
     @pytest.mark.parametrize('gla', [False, True])
@@ -876,7 +810,7 @@ class TestInterCorrectness:
             assert_close('split==whole readout', o_full, torch.cat([o1, o2], 1), tol)
             assert_close('split==whole state', s_full, s2, tol)
 
-    # ---- (B) the in-kernel ROUTED grid: fused == autograd(fp64 chunked ref) == _chunk_rola_impl(gates) --
+    # ---- (B) the in-kernel ROUTED grid: fused == autograd(fp64 materialized-gate refs) ----------------
     # The full semantic cross-product. Each node feeds (h, Wr, Ww[, Wg, b_r, b_w]) to chunk_rola_routed and
     # the fp64 chunked/naive reference on the SAME canonical per-head gates, asserting the fused output AND
     # every grad agree. norm × {RLA,GLA} × bias{on,off} × routing{flat,square,tree} × (dqk,dv).
@@ -893,8 +827,7 @@ class TestInterCorrectness:
         TIGHT; the gate/decay/bias grads to the documented GLA fp32 floor under decay. This SUBSUMES the
         old test_kappa_routed_autograd_fp64 / test_routed_bias_fwd_bwd / test_routed_bwd_nonpow2_dv /
         test_gla_routed_bwd_faithful / test_gla_routed_bias_bwd_faithful — the GLA×bias×routing holes the
-        gates caught are now grid nodes, not one cell. Also cross-checks the fused output ==
-        _chunk_rola_impl fed the SAME router's per-head gates (the unified torch-naive truth).
+        gates caught are now grid nodes, not one cell.
 
         The nc=16 / DEPTH-4 routing family (flat-16, square-16, tree-16 at D=4) is covered for the BACKWARD
         grads by the sibling `test_routed_bwd_nc16_depth4` (the old test_routed_bias_fwd_bwd gated db_r/db_w/
@@ -928,8 +861,8 @@ class TestInterCorrectness:
         gd*/gda/dWg/dh partials CONCURRENTLY into shared locations. norm='raw' drives the RLA-raw inter
         kernels (`_bwd_inter_state`/`_bwd_inter_read`); 'kappa'/'global' drive the kappa kernels
         (`_kappa_bwd_state`/`_kappa_bwd_read`); both paths hit `_fold_kernel` — all five #58-parallelized
-        kernels. Validated against the SAME fp64 canonical per-head-gate reference + `_chunk_rola_impl` as
-        test_routed_fwd_bwd (dq/dk/dv to the tight 8e-3 floor, the gate/kappa grads to their bounds). FAILS
+        kernels. Validated against the SAME fp64 canonical per-head-gate reference as test_routed_fwd_bwd
+        (dq/dk/dv to the tight 8e-3 floor, the gate/kappa grads to their bounds). FAILS
         BY CONSTRUCTION if a cross-cb atomic is reverted to a plain store: the 16 concurrent cb partials
         race / last-writer-win on the shared output, dropping ~15/16 of that gradient. Verified — reverting
         the dkappa atomic_add (a SOLE-source cross-cb reduction, unmaskable) drives the kappa grad to ~9.7e-1
@@ -1003,21 +936,6 @@ class TestInterCorrectness:
         for n, r in rels.items():
             tol_n = kappa_tol if n == 'kappa' else gate_tol
             assert r < tol_n, f'{n} grad {r:.2e} (norm={norm} gla={gla} bias={bias} rels={rels})'
-        # UNIFIED-TRUTH cross-check: fused == _chunk_rola_impl(torch naive) on the SAME router's per-head
-        # gates (anchored to what the torch naive does, not a fused-only re-encode). Per-head divergence
-        # fails this. (GLA threads the ld(Wg) on the biased write gate; RLA passes g=None.)
-        hf = h.float().permute(0, 2, 1, 3).reshape(B * H, T, dm)
-        rg, wg = _per_head_gates(hf, Wr.float(), Ww.float(), D, b, H,
-                                 b_r=(b_r.float() if bias else None), b_w=(b_w.float() if bias else None))
-        ld = _ld_from_Wg(hf, wg, Wg.float(), H) if gla else None
-        ld = ld.view(B, H, T, -1).permute(0, 2, 1, 3).contiguous() if gla else None
-        rg = rg.view(B, H, T, -1).permute(0, 2, 1, 3).contiguous()
-        wg = wg.view(B, H, T, -1).permute(0, 2, 1, 3).contiguous()
-        o_impl = C._chunk_rola_impl(q.float(), k.float(), v.float(), r=rg, w=wg, g=ld, norm=norm,
-                                    kappa=(kappa.float() if norm == 'kappa' else None), scale=scale)
-        assert _relmax(of.float(), o_impl.float()) < (3e-2 if gla else 1e-2), \
-            f'routed != _chunk_rola_impl(per-head gates): {_relmax(of.float(), o_impl.float()):.2e}'
-
     @pytest.mark.parametrize('norm', ['global', 'kappa', 'per_state'])
     @pytest.mark.parametrize('D,b', _ROUTE_FLAT_SQ_TREE_8)
     def test_routed_faithful_bf16(self, D, b, norm):
@@ -1160,9 +1078,9 @@ class TestStructuralGates:
 
     # ---- signed-den consistency (#36 F1) + below-floor ld guard (#33 F2): loud, not silently divergent --
     def test_signed_den_consistent_decode_chunk_routed(self):
-        """#36 F1 — SIGNED per-state den. Every path (decode / chunk / tree-routed) computes the RAW SIGNED
+        """#36 F1 — SIGNED per-state den. Decode and production tree-routed chunk compute the RAW SIGNED
         den — no path silently tl.abs()es it — so for the SAME signed input the paths agree, never silently
-        DIVERGE. (1) GLOBAL norm (den summed but NOT divided) is rate-consistent across all three. (2)
+        DIVERGE. (1) GLOBAL norm (den summed but NOT divided) is rate-consistent. (2)
         per_state / kappa produce the SAME non-finite MASK across paths (an abs() would change WHICH entries
         blow up); the divided magnitudes near d+ε≈0 are ill-conditioned + path-amplified, so the MASK (not
         the values) is the anti-divergence gate."""
@@ -1187,30 +1105,26 @@ class TestStructuralGates:
 
         def run(norm, kap=None):
             c = dict(r=r, w=w, norm=norm, kappa=kap, scale=1.0)
-            oc = chunk_rola(q, k, v, **c).float()
             od = fused_recurrent_rola(q, k, v, **c, output_final_state=True)[0].float()
             orr = C.chunk_rola_routed(q, k, v, h, Wr, Ww, D, b, norm=norm, kappa=kap, scale=1.0).float()
-            return oc, od, orr
+            return od, orr
 
-        oc, od, orr = run('global')
+        od, orr = run('global')
         rg = r.permute(0, 2, 1, 3).reshape(B * H, T, nc)             # [BH,T,nc]
         dg = _perstate_den_signed(q, k, w)                           # [BH,T,nc]
         Dglob = (rg * dg).sum(-1).view(B, H, T).permute(0, 2, 1)    # [B,T,H] global den
-        wc = (Dglob.abs() > 0.5)[..., None].expand_as(oc)           # [B,T,H,V]
+        wc = (Dglob.abs() > 0.5)[..., None].expand_as(od)           # [B,T,H,V]
         assert wc.any(), 'no well-conditioned (|den|>0.5) entries — adjust seed'
-        assert_close('signed-d global decode==chunk (well-cond)', oc[wc], od[wc], tol)
-        assert_close('signed-d global routed==chunk (well-cond)', oc[wc], orr[wc], tol)
+        assert_close('signed-d global routed==decode (well-cond)', od[wc], orr[wc], tol)
         for norm in ('per_state', 'kappa'):
             kap = torch.full((B, T, H, 1), KAPPA, device=device) if norm == 'kappa' else None
-            oc, od, orr = run(norm, kap)
-            fc, fd, fr_ = torch.isfinite(oc), torch.isfinite(od), torch.isfinite(orr)
-            assert torch.equal(fc, fd), f'{norm}: decode non-finite mask differs from chunk (abs() in a path?)'
-            assert torch.equal(fc, fr_), f'{norm}: routed non-finite mask differs from chunk (abs() in a path?)'
+            od, orr = run(norm, kap)
+            fd, fr_ = torch.isfinite(od), torch.isfinite(orr)
+            assert torch.equal(fd, fr_), f'{norm}: routed non-finite mask differs from decode (abs() in a path?)'
 
-    @pytest.mark.parametrize('path', ['chunk', 'decode'])
-    def test_below_floor_ld_raises_and_clamps(self, path, monkeypatch):
+    def test_decode_below_floor_ld_raises_and_clamps(self, monkeypatch):
         """#33 F2 — the GLA log-decay floor guard is LOUD. An ld below `_GLA_FLOOR` must RAISE by default on
-        BOTH the chunk and decode paths; with ROLA_GLA_FLOOR_CLAMP=1 it must instead WARN-once and clamp."""
+        the explicit-ld decode op; with ROLA_GLA_FLOOR_CLAMP=1 it must instead WARN-once and clamp."""
         if device != 'cuda':
             pytest.skip('RoLA Triton kernels require CUDA')
         B, H, T, Kd, V, nc = 1, 1, 16, 16, 16, 4
@@ -1227,8 +1141,6 @@ class TestStructuralGates:
         common = dict(r=r, w=w, g=ld, norm='global', scale=1.0)
 
         def call():
-            if path == 'chunk':
-                return chunk_rola(q, k, v, **common)
             return fused_recurrent_rola(q, k, v, **common, output_final_state=True)
         monkeypatch.setattr(C, '_GLA_FLOOR_CLAMP', False, raising=False)
         with pytest.raises(ValueError, match='floor'):

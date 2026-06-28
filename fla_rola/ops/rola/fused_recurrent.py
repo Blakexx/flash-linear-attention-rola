@@ -21,9 +21,8 @@ head)** (grid `(B*H,)` — never `B*H*nc`), single-token-stepping:
     registers — killing `vh_combine`;
   * per-state log-decay `g` (the GLA variant) decays the carried state before each write.
 
-The signature/handoff is unchanged: the recurrent state is the RoLA Kronecker state `[N, H*nc, K, V+1]`,
-layout-compatible with `chunk_rola`'s `output_final_state`, so a chunked prefill hands off bit-exactly
-to this decode path.
+The recurrent state is the RoLA Kronecker state `[N, H*nc, K, V+1]`, layout-compatible with the layer's
+chunk-prefill cache emission, so prefill hands off bit-exactly to this decode path.
 """
 
 import torch
@@ -60,7 +59,7 @@ def _rola_decode_kernel(
     un-normalized — there is NO per-state denominator at all, so the `+1` ones-column is ENTIRELY
     ABSENT: the value tile is `[dv]`, the state buffer is `[BH, nc, dqk, dv]`, the read gate is applied
     raw (rt=b_r, no rescale) and the final divide is skipped (o = num directly). Both layouts are
-    handoff-compatible with chunk_rola's `output_final_state` ([N, H*nc, K, V+1] normalized;
+    handoff-compatible with the layer's chunk-prefill final state ([N, H*nc, K, V+1] normalized;
     [N, H*nc, K, V] raw), mutated in place across tokens."""
     bh = tl.program_id(0)
     offs_k = tl.arange(0, BK)
@@ -110,8 +109,8 @@ def _rola_decode_kernel(
             qk = tl.reshape(tl.broadcast_to(b_q[None, :], [BC, BK]), [BC * BK])               # [BC*BK]
             p = tl.sum(tl.reshape(qk[:, None] * b_s, [BC, BK, BV]), axis=1)                   # [BC, BV]
             # rescale the read gate per the norm, inline. The per-state den d^c is the canonical RAW
-            # SIGNED mass Σ_{j≤t} w_j^c (φq·φk) — matching `_kappa_rescale` (chunk), `chunk_rola` torch,
-            # and the naive oracle. The rescale r̃=r/(d+ε) | r·(d+ε)^{−κ} is only well-defined for d>0
+            # SIGNED mass Σ_{j≤t} w_j^c (φq·φk) — matching routed chunk and the naive oracle. The
+            # rescale r̃=r/(d+ε) | r·(d+ε)^{−κ} is only well-defined for d>0
             # (the kappa pow / per_state divide of a signed d is ill-posed). PRODUCTION GUARANTEES d≥0:
             # the layer is elu+1-only (φ>0) with softmax write gates (w≥0) ⇒ d≥0 structurally. We do NOT
             # tl.abs() d here: an abs would SILENTLY rewrite the normalizer for signed d, making decode
@@ -203,16 +202,16 @@ def fused_recurrent_rola(
     """Recurrent RoLA readout (decode path) via a bespoke fused Triton kernel (one program per REAL
     head; the H*nc virtual heads are never materialized).
 
-    Mirrors `chunk_rola`'s routed signature, plus the recurrent triad `initial_state` /
-    `output_final_state` / `cu_seqlens`. `q`/`k` are the feature-mapped queries/keys (as for
-    `chunk_rola`). `norm` ∈ {'raw','global','per_state','kappa'}; 'kappa' rescales the read gate by
+    Mirrors the routed chunk tensor conventions, plus the recurrent triad `initial_state` /
+    `output_final_state` / `cu_seqlens`. `q`/`k` are the feature-mapped queries/keys. `norm` ∈
+    {'raw','global','per_state','kappa'}; 'kappa' rescales the read gate by
     `(dᶜ+eps)^{−κ}` per token (RAW signed den — the canonical convention; well-defined for d>0, which
     the production elu+1 layer guarantees); 'raw' emits the un-normalized numerator Σ_c r^c (q·Sᶜ)
     directly (no read-gate rescale, no divide). Returns `(o, final_state)`; `final_state` is the
     `[N, H*nc, K, V+1]` Kronecker state (the per-state denominator carried in the `+1` column) for the
     normalized norms, or `[N, H*nc, K, V]` (NO den column) for 'raw', when `output_final_state` else
-    `None`, layout-compatible with `chunk_rola(output_final_state=True)` so a chunked prefill hands off
-    to this decode path.
+    `None`, layout-compatible with the layer's chunk-prefill cache state so prefill hands off to this
+    decode path.
     """
     B, T, H, K = q.shape
     nc = r.shape[-1]

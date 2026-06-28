@@ -2,18 +2,17 @@
 #
 # RoLA routing — Triton kernels (additive extension of simple_gla).
 #
-# Routed linear attention shares the content gram G=qkᵀ across `nc` states and modulates it by a
+# Routed linear attention shares the content gram G=qk^T across `nc` states and modulates it by a
 # routing gram R=Σ_c r_i^c w_j^c (+ optional per-state scalar decay). The Triton kernels here compute the
 # *un-normalized* routed readout O = (G∘R∘causal) @ v — the FLA convention; the global denominator is
-# reconstructed by the caller as Σ_c r̃ᶜ·dᶜ from a per-state den pre-pass (see `chunk_rola` at the
-# bottom of this file — the norm-aware public entry point, FLA-style). Tiled
+# reconstructed by the caller as Σ_c r̃ᶜ·dᶜ from a per-state den pre-pass. Tiled
 # over state-blocks (BG states/program) so only this block's slice of the Kronecker state lives in
-# SRAM → scales to any nc. The content gram is formed ONCE per chunk (the FLOP win), never
-# materializing the L×nc product nor replicating q/k.
+# SRAM -> scales to any nc. The content gram is formed ONCE per chunk (the FLOP win), never
+# materializing the L x nc product nor replicating q/k.
 #
 # This file holds the production IN-KERNEL TREE-ROUTING kernels (RLA + GLA, fwd+bwd; the routing gram is
 # built from the hidden state h + per-head router weights, so the [L,nc] gates are never materialized)
-# and the pure-torch reference naive (`_rola_chunk_core` / `chunk_rola`). The readout is numerator-only
+# and the private pure-torch CPU/reference helpers. The readout is numerator-only
 # (width dv, BV=next_pow2(dv)); there is no ones-column augmentation — the denominator is a separate
 # per-state pre-pass.
 
@@ -2034,13 +2033,9 @@ def _floor_ld(ld):
     ROLA_GLA_FLOOR_CLAMP=1, clamp to the floor and warn ONCE. Returns a tensor safe for the chunk
     kernels (dtype/contiguity left to the caller).
 
-    Under torch.compile the data-dependent min-check is a graph break, so skip it while tracing. Only
-    `chunk_rola` is compiled, so ONLY it needs the separate eager pre-guard: it runs `_guard_ld(g)` once
-    BEFORE dispatching to its compiled region, then the compiled `_floor_ld` (this fn) sees
-    is_compiling()==True and applies only the cheap CLAMP (clamp-mode) or pass-through (default),
-    trusting that eager guard. `chunk_rola_routed` and `fused_recurrent_rola` are EAGER — they call this
-    `_floor_ld` directly (is_compiling()==False), so the loud min-check/raise runs inline for them; they
-    do NOT use `_guard_ld`."""
+    Under torch.compile the data-dependent min-check is a graph break, so skip it while tracing. The
+    shipping RoLA paths call this eagerly, so the loud min-check/raise runs inline for explicit-decay
+    decode and scratch/reference callers."""
     global _gla_floor_warned
     if torch.compiler.is_compiling():
         return ld.clamp(min=_GLA_FLOOR) if _GLA_FLOOR_CLAMP else ld
@@ -2068,39 +2063,10 @@ def _floor_ld(ld):
     return ld
 
 
-def _guard_ld(g):
-    """EAGER floor guard for the public entrypoints (runs before the compiled region so the
-    data-dependent `_floor_ld` min-check never graph-breaks inside torch.compile). Raises/warns
-    identically to `_floor_ld`; the value is discarded (the compiled impl re-floors compile-safely)."""
-    if g is not None:
-        _floor_ld(g)
-
-
-
 # ============================================================================
-# `chunk_rola` — the norm-aware public entry point (FLA inlines the norm-aware entrypoint at the
-# bottom of `chunk.py`, cf. `chunk_gla` in `ops/gla/chunk.py`).
-#
-# It is the ONE norm-aware entry point: it owns the whole recipe — the per-state denominator
-# pre-pass, the read-gate rescale, the (numerator-only) shared-gram readout, and the divide — so
-# callers (the LM layer) just pass `norm=...`. There is no routed branch bolted onto simple_gla and
-# no normalization logic in the model.
-#
-# Normalization is unified on the DENOMINATOR-SPLIT: the readout is always numerator-only
-# (BV=next_pow2(dv), no ones-column → ~2× occupancy, fits small smem), and the global denominator is
-# reconstructed as Σ_c r̃ᶜ·dᶜ from the per-state den pre-pass `d` (the same `d` that rescales the read
-# gates for kappa/per_state). global/kappa/per_state differ ONLY in how the read gates are rescaled:
-#   global    : r̃ = r                      (den = Σ_c rᶜ·dᶜ — the partition function)
-#   per_state : r̃ = r / (d+ε)              (≡ kappa=1, each state self-normalizes)
-#   kappa     : r̃ = r · (d+ε)^(-κ(x))      (input-dependent interpolation global↔per_state)
-#   raw       : numerator only, no divide   (GLA convention)
-#
-# Differentiable by COMPOSITION — the den pre-pass and the readout are verified autograd Functions
-# and the rescale/divide are plain torch, so gradients flow automatically (no custom backward).
-#
-# NO-CACHE LIMITATION: `chunk_rola` is the chunk-parallel (training) path only — there is no fused
-# recurrent / KV-cache decode kernel yet (the recurrent form lives in the tests as virtual-heads over
-# `fused_recurrent_simple_gla`). A first-class `fused_recurrent_rola.py` is deferred.
+# Private materialized-gate CPU/reference helpers. The production CUDA path is `chunk_rola_routed`;
+# these helpers remain for CPU fallback and fp64 reference construction without exposing a public
+# precomputed-gate chunk API.
 # ============================================================================
 _NORMS = ('raw', 'global', 'per_state', 'kappa')
 
@@ -2168,80 +2134,6 @@ def _perstate_den_torch(q, k, w, ld, chunk_size, eps=1e-5):
     return torch.exp(A) * s
 
 
-@input_guard
-def _chunk_rola_impl(q, k, v, r, w, g=None, norm='kappa', kappa=None, scale=None, eps=1e-5,
-                     output_final_state=False):
-    """Routed RoLA (shared-gram) readout with built-in normalization — the TORCH NAIVE: the pure-torch,
-    device-agnostic chunked reference on EXPLICIT precomputed gates (the ground truth). The Triton
-    precomputed-gate kernels were retired in the #44 convergence (production routes through the in-kernel
-    `chunk_rola_routed`); this stays as the explicit-gate reference the routed op + tests validate against,
-    and as the `chunk_rola` public entry point (eager torch on every device; torch.compile-able).
-
-    The chunked pass ALWAYS starts from a zero recurrent state — there is no `initial_state` ingestion
-    (#34). The bidirectional handoff is one-directional: `output_final_state` IS honored (a chunked prefill
-    emits the recurrent state for `fused_recurrent_rola` to seed via ITS `initial_state`), but the input
-    counterpart is NOT accepted — `chunk_rola` RAISES on a non-None `initial_state` (the continuation-decode
-    path is `fused_recurrent_rola`).
-
-    Args:
-        q, k:  φ-mapped queries/keys [B, T, H, K] (the feature map φ stays in the caller — the
-               reference is φ-agnostic, seeing only the content gram G=φ(q)φ(k)ᵀ).
-        v:     values [B, T, H, V].
-        r, w:  read / write routing gates [B, T, H, nc].
-        g:     per-state log-decay [B, T, H, nc] for the scalar-gated (GLA) variant, or None (RLA).
-        norm:  'raw' | 'global' | 'per_state' | 'kappa'.
-        kappa: per-token exponent [B, T, H, 1] (required for norm='kappa').
-        scale: query scale (default 1/sqrt(K)).
-    Returns:
-        Normalized readout [B, T, H, V] ('raw' returns the un-normalized numerator).
-    """
-    if norm not in _NORMS:
-        raise ValueError(f"norm must be one of {_NORMS}, got {norm!r}")
-    if norm == 'kappa' and kappa is None:
-        raise ValueError("norm='kappa' requires a per-token `kappa` exponent tensor [B,T,H,1]")
-    B, T, H, K = q.shape
-    if scale is None:
-        scale = K ** -0.5
-    chunk_size = min(64, max(16, triton.next_power_of_2(T)))
-
-    def fold(t):
-        return t.permute(0, 2, 1, 3).reshape(B * H, T, t.shape[-1])
-
-    def unfold(t):
-        return t.view(B, H, T, -1).permute(0, 2, 1, 3).contiguous()
-
-    # Torch reference: fp32 throughout (device-agnostic; no Triton, no kernel dtype contract). The
-    # shared-gram eager core (`_rola_chunk_core`) and the per-state den pre-pass (`_perstate_den_torch`)
-    # ARE the explicit-gate math the in-kernel routed op reproduces — this is the ground truth, fp32-exact.
-    qf, kf, vf, wf = fold(q).float() * scale, fold(k).float(), fold(v).float(), fold(w).float()
-    gf = fold(g).float() if g is not None else None
-    if gf is not None:
-        gf = _floor_ld(gf)   # enforce the fp32-safe decay floor once (#33), matching every GLA decay site
-
-    if norm == 'raw':
-        out = unfold(_rola_chunk_core(qf, kf, vf, wf, fold(r).float(), gf, chunk_size)).to(v.dtype)
-        if not output_final_state:
-            return out
-        # raw carries NO per-state denominator, so the emitted state is [N, H*nc, K, V] (no +1 den
-        # column) — exactly the layout fused_recurrent_rola(norm='raw') ingests and continues.
-        return out, _final_state(kf, vf, wf, gf, B, H, raw=True)
-
-    # global / per_state / kappa: per-state den pre-pass → rescale read gates → numerator-only
-    # readout → divide by the reconstructed global den Σ_c r̃ᶜ·dᶜ.
-    d = _perstate_den_torch(qf, kf, wf, gf, chunk_size, eps)
-    rf32 = fold(r).float()
-    if norm == 'kappa':
-        rf32 = rf32 * (d + eps).pow(-fold(kappa).float())
-    elif norm == 'per_state':
-        rf32 = rf32 / (d + eps)
-    num = _rola_chunk_core(qf, kf, vf, wf, rf32, gf, chunk_size)
-    den = (rf32 * d).sum(-1, keepdim=True)
-    out = unfold(num.float() / (den + eps)).to(v.dtype)
-    if not output_final_state:
-        return out
-    return out, _final_state(kf, vf, wf, gf, B, H)
-
-
 def _final_state(kf, vf, wf, gf, B, H, raw=False):
     """Final recurrent state of the chunked pass: `stateᶜ = Σ_t [e^{G_T-G_t}·]wᵗᶜ·kf_t⊗[vf_t;1]`,
     shaped `[N, H*nc, K, V+1]` (the `+1` ones-column is the per-state denominator) — byte-compatible
@@ -2257,63 +2149,19 @@ def _final_state(kf, vf, wf, gf, B, H, raw=False):
     if gf is not None:                                                  # GLA: token t decays by Σ_{t'>t} g
         # Apply the SAME GLA decay floor (`_floor_ld`) every chunked GLA decay site uses (readout/den/
         # routed). Without it the emitted final state would decay at a faster rate than the chunked
-        # prefill it must hand off to (`test_recurrent_handoff`) — a prefill→decode decay-rate gap.
+        # prefill it must hand off to decode — a prefill→decode decay-rate gap.
         G = _floor_ld(gf).float().cumsum(1)
         wgt = wgt * (G[:, -1:, :] - G).exp()
     state = torch.einsum('btc,btd,bte->bcde', wgt, kf.float(), v1)      # [BH, nc, K, V+1]
     return state.view(B, H * state.shape[1], state.shape[2], state.shape[3])
 
 
-# ----------------------------------------------------------------------------
-# `chunk_rola` — the explicit-precomputed-gate public entry point, now the PURE-TORCH NAIVE reference
-# (`_chunk_rola_impl`): the precomputed-gate Triton kernels were retired in the #44 convergence (the
-# production path is the in-kernel `chunk_rola_routed` + `fused_recurrent_rola` decode). This stays as
-# the explicit-gate ground truth the routed op and the tests validate against. torch.compile wraps the
-# pure-torch impl on CUDA by default (a trivial inductor fuse over the chunked einsums — no Triton
-# autotuner to trace, so Dynamo stays fullgraph); ROLA_NO_COMPILE=1 forces eager. Compile is skipped on
-# CPU and whenever Dynamo is already tracing (avoid nested-compile recursion).
-_ROLA_NO_COMPILE = os.environ.get('ROLA_NO_COMPILE', '0') not in ('0', '', 'false', 'False')
-_chunk_rola_compiled = None
-
-
-def chunk_rola(q, k, v, r, w, g=None, norm='kappa', kappa=None, scale=None, eps=1e-5,
-               initial_state=None, output_final_state=False):
-    """Explicit-precomputed-gate RoLA readout — the PURE-TORCH naive reference (see `_chunk_rola_impl`).
-    torch.compile is the DEFAULT on CUDA (lazily compiled on first call over the pure-torch chunked impl;
-    no Triton, so Dynamo stays fullgraph). Set ROLA_NO_COMPILE=1 to force eager. Compile is skipped on CPU
-    and whenever Dynamo is already tracing (avoid nested-compile recursion).
-
-    `initial_state` is NOT ingested by the chunked pass (#34): seeding the inter scan from a carried
-    state is decode-only territory (the chunked readout starts from zero state and provides no backward
-    through a carried state). The param is kept only to RAISE loudly on a non-None value — rather than
-    silently dropping it and returning wrong results — so a caller meaning to continue from a prefilled
-    state is told to use `fused_recurrent_rola` (which DOES ingest `initial_state`)."""
-    global _chunk_rola_compiled
-    if initial_state is not None:
-        raise NotImplementedError(
-            "chunk_rola does not ingest an initial_state — the chunked pass always starts from a zero "
-            "recurrent state (#34). output_final_state IS honored (a chunked prefill emits the state), "
-            "but to CONTINUE from a prefilled state use fused_recurrent_rola(..., initial_state=...), "
-            "which carries it. Passing initial_state here would have been silently ignored."
-        )
-    _guard_ld(g)   # eager floor guard (raises out-of-range) BEFORE the compiled region — no graph break (#33)
-    kw = dict(g=g, norm=norm, kappa=kappa, scale=scale, eps=eps,
-              output_final_state=output_final_state)
-    if _ROLA_NO_COMPILE or not q.is_cuda or torch.compiler.is_compiling():
-        return _chunk_rola_impl(q, k, v, r, w, **kw)
-    if _chunk_rola_compiled is None:
-        _chunk_rola_compiled = torch.compile(_chunk_rola_impl)
-    return _chunk_rola_compiled(q, k, v, r, w, **kw)
-
-
 # ============================================================================
 # `chunk_rola_routed` — public TREE-ROUTED entry point. DIFFERENTIABLE end-to-end.
 #
-# The in-kernel-routing counterpart of `chunk_rola`: instead of precomputed gates r,w it takes the
-# hidden state h + per-level router weights Wr,Ww and builds the routing gram IN-KERNEL (the [L,nc]
-# gates are never materialized). Flat (D=1, b=nc) is the strict fused equivalent of `chunk_rola`'s
-# precomputed-gate path with r,w the D=1 router's explicit softmax gates — confirming this is a
-# generalization that reuses the real RLA kernel.
+# Instead of precomputed gates r,w, this entry point takes the hidden state h + per-level router weights
+# Wr,Ww and builds the routing gram IN-KERNEL (the [L,nc] gates are never materialized). Flat
+# (D=1, b=nc) is the single-level softmax-router case.
 #
 # The numerator readout (`rola_rla_routed_triton`) is a full autograd.Function (`_RoLARoutedFn`):
 # forward runs the optimized routed kernels, backward folds the transient [BT,nc] gate-grads into

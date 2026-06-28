@@ -3,7 +3,7 @@
 """Naive O(L^2) reference implementations for the RoLA kernel gates — the FLA `ops/<op>/naive.py`
 convention (cf. `ops/gla/naive.py`, `ops/kda/naive.py`). Ground-truth O(L^2) parallel readout
 (global-norm + scalar-GLA) and per-state denominator (RLA + GLA), used by tests to validate
-`chunk_rola`. Lifted verbatim from the original CLA `rola.py` reference before it was reduced.
+the routed RoLA kernels. Lifted verbatim from the original CLA `rola.py` reference before it was reduced.
 """
 import torch
 import torch.nn.functional as F
