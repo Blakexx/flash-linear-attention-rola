@@ -24,6 +24,7 @@ import torch
 
 from fla_rola.layers.rola import RoLA
 from fla_rola.models.utils import Cache
+from fla_rola.ops.rola import fused_recurrent_rola
 from fla_rola.utils import device
 
 _H, _HID, _DQK, _DV, _NC, _L, _B = 2, 64, 16, 16, 16, 96, 2
@@ -71,3 +72,57 @@ def test_chunk_decode_parity(kernel, norm, routing):
     assert ratio < _TOL, (f"{kernel}/{norm}/{routing}: chunk vs decode diverge — global relmax {ratio:.3e} "
                           f"(absmax {diff.item():.3e}) exceeds {_TOL}. Structural divergence in the "
                           f"in-kernel-vs-torch routing/decay/norm reconstruction.")
+
+
+@pytest.mark.parametrize('name,config,kwargs', [
+    ('tie_routers_tree', {'kernel': 'rla', 'state_norm': 'kappa', 'routing': 'tree'}, {'tie_routers': True}),
+    ('router_bias_flat', {'kernel': 'rla', 'state_norm': 'kappa', 'routing': 'flat'}, {'router_bias': True}),
+    ('qk_norm_square', {'kernel': 'rla', 'state_norm': 'per_state', 'routing': 'square'}, {'qk_norm': True}),
+    ('short_conv_tree', {'kernel': 'rla', 'state_norm': 'kappa', 'routing': 'tree'},
+     {'use_short_conv': True, 'conv_size': 3}),
+    ('short_conv_gla_raw', {'kernel': 'gla_scalar', 'state_norm': 'raw', 'routing': 'tree'},
+     {'use_short_conv': True, 'conv_size': 3}),
+])
+def test_decode_option_chunk_parity(name, config, kwargs):
+    """Representative decode branch smokes for options outside the full kernel/norm/routing matrix."""
+    if device != 'cuda':
+        pytest.skip('RoLA Triton kernels require CUDA')
+    torch.manual_seed(10)
+    m = RoLA(hidden_size=_HID, num_heads=_H, head_k_dim=_DQK, head_v_dim=_DV, layer_idx=0,
+             states_per_head=_NC, **config, **kwargs).to(device).eval()
+    x = torch.randn(1, _L, _HID, device=device)
+
+    with torch.no_grad():
+        oc = m(x)
+        oc = oc[0] if isinstance(oc, tuple) else oc
+
+    outs = []
+    with torch.inference_mode():
+        cache = Cache()
+        for t in range(_L):
+            ot = m(x[:, t:t + 1], past_key_values=cache, use_cache=True)
+            outs.append(ot[0] if isinstance(ot, tuple) else ot)
+    od = torch.cat(outs, dim=1)
+
+    ratio = ((oc.float() - od.float()).abs().max() / oc.float().abs().max().clamp(min=1e-6)).item()
+    assert ratio < _TOL, f"{name}: chunk-vs-decode relmax {ratio:.3e} exceeds {_TOL}"
+
+
+def test_decode_rejects_varlen_cu_seqlens():
+    """Varlen decode is unsupported today; keep both layer plumbing and op contract loud."""
+    if device != 'cuda':
+        pytest.skip('RoLA Triton kernels require CUDA')
+    m = RoLA(hidden_size=_HID, num_heads=_H, head_k_dim=_DQK, head_v_dim=_DV, layer_idx=0,
+             states_per_head=_NC, kernel='rla', state_norm='kappa', routing='tree').to(device).eval()
+    x = torch.randn(1, 2, _HID, device=device)
+    cu = torch.tensor([0, 2], device=device, dtype=torch.long)
+    with torch.inference_mode(), pytest.raises(NotImplementedError, match='cu_seqlens'):
+        m(x, cu_seqlens=cu)
+
+    q = torch.randn(1, 2, 1, 8, device=device)
+    k = torch.randn(1, 2, 1, 8, device=device)
+    v = torch.randn(1, 2, 1, 8, device=device)
+    r = torch.softmax(torch.randn(1, 2, 1, 4, device=device), -1)
+    w = torch.softmax(torch.randn(1, 2, 1, 4, device=device), -1)
+    with pytest.raises(NotImplementedError, match='cu_seqlens'):
+        fused_recurrent_rola(q, k, v, r=r, w=w, norm='global', cu_seqlens=cu)
