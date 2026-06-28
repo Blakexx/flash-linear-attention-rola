@@ -1308,7 +1308,7 @@ def _kappa_ckpt_window(NCH):
 
 def _kappa_routed_fwd(q, k, v, h, lr, lw, kap, D, b, sel, chunk, global_norm, per_state, eps,
                       H, Wg=None, need_snapshots=False, state_in=None, c_lo=0, c_hi=None,
-                      save_checkpoints=False):
+                      save_checkpoints=False, checkpoint_every_override=None):
     """Fused global/kappa/per_state tree-routed forward. Returns (num[B,L,BV], den[B,L], snap_val, snap_den).
     #55 snapshot modes (at most one): need_snapshots=True stores the DENSE per-chunk pre-states for chunks
     [c_lo,c_hi) (the backward's per-segment recompute); save_checkpoints=True stores only the SPARSE √NCH
@@ -1346,6 +1346,8 @@ def _kappa_routed_fwd(q, k, v, h, lr, lw, kap, D, b, sel, chunk, global_norm, pe
     # #55: save_checkpoints (the differentiable forward) → store the sparse √NCH boundary states the
     # backward seeds its segment recomputes from. Resolved to the shared window so fwd-store/bwd-index agree.
     checkpoint_every = _kappa_ckpt_window(NCH) if save_checkpoints else None
+    if checkpoint_every is not None and checkpoint_every_override is not None:
+        checkpoint_every = max(1, int(checkpoint_every_override))
     # F7: num at the TRUE dv (not the padded next_pow2(dv)) — the in-kernel store is already vfmask'd to
     # `offs_vf < dv` (the [dv, NDVP*BV) pad lanes never touch memory), so the buffer needs only dv columns,
     # exactly like dq/dk/dvv above. Saves the BVO−dv pad columns (the [B,L,*] alloc) every forward.
@@ -1758,7 +1760,8 @@ def _kappa_bwd_read(h_ptr, q_ptr, k_ptr, v_ptr, lr_ptr, lw_ptr, sel_ptr, kap_ptr
 
 
 def _kappa_routed_bwd(q, k, v, h, lr, lw, kap, ckpt_val, ckpt_den, dnum, dden,
-                      D, b, sel, chunk, global_norm, per_state, eps, H, Wg=None):
+                      D, b, sel, chunk, global_norm, per_state, eps, H, Wg=None,
+                      checkpoint_window_override=None):
     """Reverse chunk-scan backward for the fused global/kappa/per_state path. Carries dSval,dSden
     adjoints; recomputes r,w,d,r_tilde transiently per chunk; folds the [BT,nc] gate-grads into
     dWr,dWw,dh (and db_r/db_w when a routing bias is present — transient, never [L,nc]). Returns
@@ -1837,7 +1840,7 @@ def _kappa_routed_bwd(q, k, v, h, lr, lw, kap, ckpt_val, ckpt_den, dnum, dden,
     # order is unchanged (global c=NCH-1..0), preserving carried adjoints and GLA decay. Segment recompute
     # seeds fp32 state from the same fp32 forward checkpoints, so fp32 matches the all-snapshot path exactly;
     # bf16 remains within normal rounding-scale tolerance. W matches the forward's via _kappa_ckpt_window.
-    W = _kappa_ckpt_window(NCH)
+    W = _kappa_ckpt_window(NCH) if checkpoint_window_override is None else max(1, int(checkpoint_window_override))
     seg_lo = NCH   # chunk range [seg_lo, seg_hi) of the currently-loaded segment snapshots (lazy, reverse)
     seg_val = seg_den = None
     for c in reversed(range(NCH)):

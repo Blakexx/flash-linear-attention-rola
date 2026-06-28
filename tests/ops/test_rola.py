@@ -354,7 +354,7 @@ def _gla_routed_ref(q, k, v, h, Wr, Ww, Wg, D, b, scale, b_r=None, b_w=None):
     return o.view(B, H, T, -1).permute(0, 2, 1, 3).contiguous()
 
 
-def _gla_bias_norm_ref(q, k, v, h, Wr, Ww, Wg, kappa, D, b, norm, scale, b_r, b_w):
+def _gla_bias_norm_ref(q, k, v, h, Wr, Ww, Wg, kappa, D, b, norm, scale, b_r, b_w, chunk=None):
     """fp64 NORMALIZED GLA(+bias) reference for the kappa-path norms (global|per_state|kappa): the
     per-state decayed den + the decayed numerator on the BIASED per-head gates, ld from the LAYER's
     _log_decay on those biased write gates. Differentiable w.r.t. all of (q,k,v,h,Wr,Ww,Wg,b_r,b_w[,kappa])."""
@@ -368,7 +368,7 @@ def _gla_bias_norm_ref(q, k, v, h, Wr, Ww, Wg, kappa, D, b, norm, scale, b_r, b_
     qf, kf, vf, hf = fold(q) * scale, fold(k), fold(v), fold(h)
     rf, wf = _per_head_gates(hf, Wr, Ww, D, b, H, b_r=b_r, b_w=b_w)
     ld = _ld_from_Wg(hf, wf, Wg, H)                                  # ld(Wg) on the BIASED write gate
-    chunk = min(64, max(16, T))
+    chunk = min(64, max(16, T)) if chunk is None else chunk
     d = C._perstate_den_torch(qf, kf, wf, ld, chunk, EPS)           # decayed per-state den
     if norm == 'kappa':
         rt = rf * (d + EPS).pow(-fold(kappa))
@@ -420,6 +420,50 @@ class TestIntraConfigEquivalence:
         monkeypatch.setattr(C, '_device_smem', lambda: 166912)  # A100 hard limit
         assert C._kappa_fit_chunk(dqk=16, dv=16, chunk=64, BC=16) == 64
         assert C._fit_chunk(64, C._routed_inter_state_row_bytes(BK=16, BC=16)) == 64
+
+    @pytest.mark.parametrize('gla', [False, True])
+    def test_kappa_sparse_checkpoints_match_dense_checkpoint_bwd(self, gla):
+        """#55 proof: the production sqrt-spaced checkpoint backward must match the old dense every-chunk
+        snapshot schedule. This compares the actual fused backward kernels, not only the fp64 reference."""
+        if device != 'cuda':
+            pytest.skip('RoLA Triton kernels require CUDA')
+        B, T, Kd, V, dm, H, D, b = 1, 320, 16, 16, 24, 1, 3, 2
+        g = torch.Generator(device=device).manual_seed(55)
+
+        def rand(*shape, positive=False):
+            x = torch.randn(*shape, device=device, generator=g)
+            return torch.nn.functional.elu(x) + 1.0 if positive else x
+
+        q, k = rand(B, T, Kd, positive=True), rand(B, T, Kd, positive=True)
+        v, h = rand(B, T, V), rand(B, T, dm)
+        lr, lw = rand(B, T, D, b) * 0.4, rand(B, T, D, b) * 0.4
+        kap = torch.full((B, T), 0.5, device=device)
+        Wg = torch.zeros(H, dm, device=device) if gla else None
+        sel = C._build_sel(D, b, b ** D, q.device)
+        chunk = 64
+
+        num_s, den_s, ckv_s, ckd_s, _ = C._kappa_routed_fwd(
+            q, k, v, h, lr, lw, kap, D, b, sel, chunk,
+            global_norm=False, per_state=False, eps=EPS, H=H, Wg=Wg, save_checkpoints=True)
+        num_d, den_d, ckv_d, ckd_d, _ = C._kappa_routed_fwd(
+            q, k, v, h, lr, lw, kap, D, b, sel, chunk,
+            global_norm=False, per_state=False, eps=EPS, H=H, Wg=Wg, save_checkpoints=True,
+            checkpoint_every_override=1)
+        assert _relmax(num_s, num_d) < 1e-6
+        assert _relmax(den_s, den_d) < 1e-6
+
+        dnum = torch.randn(num_s.shape, device=device, generator=g)
+        dden = torch.randn(den_s.shape, device=device, generator=g)
+        gs = C._kappa_routed_bwd(
+            q, k, v, h, lr, lw, kap, ckv_s, ckd_s, dnum, dden, D, b, sel, chunk,
+            global_norm=False, per_state=False, eps=EPS, H=H, Wg=Wg)
+        gd = C._kappa_routed_bwd(
+            q, k, v, h, lr, lw, kap, ckv_d, ckd_d, dnum, dden, D, b, sel, chunk,
+            global_norm=False, per_state=False, eps=EPS, H=H, Wg=Wg,
+            checkpoint_window_override=1)
+        names = ['dq', 'dk', 'dv', 'dh', 'dlr', 'dlw', 'dkap'] + (['dWg'] if gla else [])
+        for name, sparse, dense in zip(names, gs, gd):
+            assert _relmax(sparse, dense) < 2e-4, f'{name}: sparse vs dense checkpoint rel {_relmax(sparse, dense):.2e}'
 
     def _mk(self, D=1, b=8, dtype=torch.float32, dv=24, dqk=16, dm=40, B=2, H=2, T=64, seed=0, grad=False):
         g = torch.Generator(device=device).manual_seed(seed)
@@ -645,6 +689,85 @@ _INTER_DIMS = [
 
 
 class TestInterCorrectness:
+    @pytest.mark.parametrize('gla', [False, True])
+    def test_kappa_production_autograd_uses_checkpoint_path(self, gla):
+        """#55 inter-kernel/reference smoke: `chunk_rola_routed` uses the shipped autograd Function
+        (sparse checkpoints, ctx chunk refit, optional Wg, torch divide) and matches the fp64 reference to
+        the precision floor of the path."""
+        if device != 'cuda':
+            pytest.skip('RoLA Triton kernels require CUDA')
+        B, T, H, Kd, V, dm, D, b = 1, 320, 1, 16, 16, 24, 3, 2
+        scale = Kd ** -0.5
+        g = torch.Generator(device=device).manual_seed(56)
+
+        def mk(*shape, positive=False):
+            x = torch.randn(*shape, device=device, dtype=torch.float64, generator=g)
+            x = torch.nn.functional.elu(x) + 1.0 if positive else x
+            return x.requires_grad_()
+
+        q, k = mk(B, T, H, Kd, positive=True), mk(B, T, H, Kd, positive=True)
+        v, h = mk(B, T, H, V), mk(B, T, H, dm)
+        Wr = (torch.randn(H, D, dm, b, device=device, dtype=torch.float64, generator=g) * 0.4).requires_grad_()
+        Ww = (torch.randn(H, D, dm, b, device=device, dtype=torch.float64, generator=g) * 0.4).requires_grad_()
+        Wg = torch.zeros(H, dm, device=device, dtype=torch.float64, requires_grad=True) if gla else None
+        kap = (torch.rand(B, T, H, 1, device=device, dtype=torch.float64, generator=g) * 0.4 + 0.4).requires_grad_()
+        go = torch.randn(B, T, H, V, device=device, dtype=torch.float64, generator=g)
+        ref_args = [q, k, v, h, Wr, Ww] + ([Wg] if gla else []) + [kap]
+
+        def f32_leaf(t):
+            return t.detach().float().requires_grad_()
+
+        qt, kt, vt, ht = (f32_leaf(t) for t in (q, k, v, h))
+        Wrt, Wwt, kapt = (f32_leaf(t) for t in (Wr, Ww, kap))
+        Wgt = f32_leaf(Wg) if gla else None
+        prod_args = [qt, kt, vt, ht, Wrt, Wwt] + ([Wgt] if gla else []) + [kapt]
+
+        out = C.chunk_rola_routed(
+            qt, kt, vt, ht, Wrt, Wwt, D, b, norm='kappa', kappa=kapt, scale=scale, Wg=Wgt)
+        grads = torch.autograd.grad(out, prod_args, go.to(out.dtype))
+        prod_chunk = C._kappa_fit_chunk(Kd, V, min(64, max(16, triton.next_power_of_2(T))), BC=16)
+        if gla:
+            ref = _gla_bias_norm_ref(q, k, v, h, Wr, Ww, Wg, kap, D, b, 'kappa', scale, None, None,
+                                     chunk=prod_chunk)
+        else:
+            ref = _kappa_ref_chunked(q, k, v, h, Wr, Ww, kap, D, b, 'kappa', scale, chunk=prod_chunk)
+        ref_grads = torch.autograd.grad(ref, ref_args, go)
+
+        assert _relmax(out.float(), ref.float()) < (3e-2 if gla else 1e-2)
+        names = ['q', 'k', 'v', 'h', 'Wr', 'Ww'] + (['Wg'] if gla else []) + ['kappa']
+        for name, got, exp in zip(names, grads, ref_grads):
+            tol = _GLA_BWD_TOL if gla else (2.5e-2 if name == 'kappa' else 1e-2)
+            assert _relmax(got.float(), exp.float()) < tol, f'{name}: {_relmax(got.float(), exp.float()):.2e}'
+
+    @pytest.mark.parametrize('gla', [False, True])
+    def test_kappa_checkpoint_wrapper_bf16_upcast_smoke(self, gla):
+        """#55 dtype smoke: bf16 q/k/v/kap enter the production checkpointed wrapper and are upcast
+        internally for the saved state path. This is a branch/finite-grad guard, not an fp64 equivalence gate."""
+        if device != 'cuda':
+            pytest.skip('RoLA Triton kernels require CUDA')
+        B, T, H, Kd, V, dm, D, b = 1, 320, 1, 16, 16, 24, 3, 2
+        g = torch.Generator(device=device).manual_seed(57)
+
+        def bf16(*shape, positive=False):
+            x = torch.randn(*shape, device=device, generator=g)
+            x = torch.nn.functional.elu(x) + 1.0 if positive else x
+            return x.to(torch.bfloat16).requires_grad_()
+
+        q, k = bf16(B, T, H, Kd, positive=True), bf16(B, T, H, Kd, positive=True)
+        v, h = bf16(B, T, H, V), bf16(B, T, H, dm)
+        Wr = (torch.randn(H, D, dm, b, device=device, generator=g) * 0.4).to(torch.bfloat16).requires_grad_()
+        Ww = (torch.randn(H, D, dm, b, device=device, generator=g) * 0.4).to(torch.bfloat16).requires_grad_()
+        Wg = torch.zeros(H, dm, device=device, dtype=torch.bfloat16, requires_grad=True) if gla else None
+        kap = (torch.rand(B, T, H, 1, device=device, generator=g) * 0.4 + 0.4).to(torch.bfloat16).requires_grad_()
+        out = C.chunk_rola_routed(q, k, v, h, Wr, Ww, D, b, norm='kappa', kappa=kap, scale=Kd ** -0.5,
+                                  Wg=Wg)
+        args = [q, k, v, h, Wr, Ww] + ([Wg] if gla else []) + [kap]
+        grads = torch.autograd.grad(out, args, torch.randn(out.shape, device=device, dtype=out.dtype, generator=g))
+        assert torch.isfinite(out.float()).all()
+        for grad in grads:
+            assert grad is not None
+            assert torch.isfinite(grad.float()).all()
+
     # ---- (A) the explicit-gate chunk==recurrent==naive backbone -------------------------------------
     @pytest.mark.parametrize('dqk,nc,dv', _INTER_DIMS)
     @pytest.mark.parametrize('gla', [False, True])
