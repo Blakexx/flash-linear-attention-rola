@@ -1783,9 +1783,9 @@ def _kappa_bwd_read(h_ptr, q_ptr, k_ptr, v_ptr, lr_ptr, lw_ptr, sel_ptr, kap_ptr
     tl.atomic_add(dkap_ptr + pid_b*sk_b + rows*sk_l, dkap_acc, mask=rmask)
 
 
-def _kappa_routed_bwd(q, k, v, h, lr, lw, kap, ckpt_val, ckpt_den, dnum, dden,
+def _kappa_routed_bwd(q, k, v, h, lr, lw, kap, ckpt_val, ckpt_den, out, dnum, dden,
                       D, b, sel, chunk, global_norm, per_state, eps, H, Wg=None,
-                      checkpoint_window_override=None, out=None):
+                      checkpoint_window_override=None):
     """Reverse chunk-scan backward for the fused global/kappa/per_state path. Carries dSval,dSden
     adjoints; recomputes r,w,d,r_tilde transiently per chunk; folds the [BT,nc] gate-grads into
     dWr,dWw,dh (and db_r/db_w when a routing bias is present — transient, never [L,nc]). Returns
@@ -1828,7 +1828,7 @@ def _kappa_routed_bwd(q, k, v, h, lr, lw, kap, ckpt_val, ckpt_den, dnum, dden,
     dkap = torch.zeros(B, L, device=q.device, dtype=torch.float32)
     dSval = torch.zeros(B, nc, dqk, dv, device=q.device, dtype=torch.float32)
     dSden = torch.zeros(B, nc, dqk, device=q.device, dtype=torch.float32)
-    out = out.contiguous() if out is not None else None
+    out = out.contiguous()
     dnum = dnum.contiguous()
     dden = dden.contiguous()
     # Wg:[H,d_model] (GLA) — the per-head decay weight; ld is computed IN-KERNEL (never a [L,nc] ld). RLA
@@ -1920,7 +1920,7 @@ def _kappa_routed_bwd(q, k, v, h, lr, lw, kap, ckpt_val, ckpt_den, dnum, dden,
             swg[0], swg[1],
             D=D, b=b, BB=BB, BT=chunk, BC=BC, BD=BD, NDM=NDM,
             USE_G=use_g, GLA_FLOOR=_GLA_FLOOR, num_warps=4, num_stages=1)
-    if out is not None and not global_norm and not per_state and L > 0:
+    if not global_norm and not per_state and L > 0:
         # Token 0 has no carried state and only its diagonal intra term, so for every state c:
         # N_0^c = d_0^c * v_0. The normalized kappa gradient can therefore be formed as the small centered
         # residual d_0^c * <dnum_0, v_0 - out_0>, instead of relying on fp32 cancellation between the
@@ -2026,8 +2026,8 @@ class _RoLARoutedKappaFn(torch.autograd.Function):
         dnum = do / den_e
         dden = -(do * out).sum(-1) / (den + eps)
         grads = _kappa_routed_bwd(
-            q, k, v, h, lr, lw, kap, ckpt_val, ckpt_den, dnum, dden,
-            D, b, sel, chunk, global_norm, per_state, eps, H, Wg=Wgf, out=out.float())
+            q, k, v, h, lr, lw, kap, ckpt_val, ckpt_den, out.float(), dnum, dden,
+            D, b, sel, chunk, global_norm, per_state, eps, H, Wg=Wgf)
         # _kappa_routed_bwd returns (dq,dk,dv,dh,dlr,dlw,dkap[,dWg]); dWg present iff use_g.
         dq, dk, dv, dh, dlr, dlw, dkap = grads[:7]
         dWg = grads[7] if use_g else None

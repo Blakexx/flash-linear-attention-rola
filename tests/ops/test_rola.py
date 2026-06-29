@@ -441,13 +441,21 @@ class TestIntraConfigEquivalence:
         assert _relmax(num_s, num_d) < 1e-6
         assert _relmax(den_s, den_d) < 1e-6
 
-        dnum = torch.randn(num_s.shape, device=device, generator=g)
-        dden = torch.randn(den_s.shape, device=device, generator=g)
+        out_s = num_s / (den_s.unsqueeze(-1) + EPS)
+        out_d = num_d / (den_d.unsqueeze(-1) + EPS)
+        if out_s.shape[1] > 0:
+            out_s[:, 0].copy_(v[:, 0] * (den_s[:, 0] / (den_s[:, 0] + EPS))[:, None])
+            out_d[:, 0].copy_(v[:, 0] * (den_d[:, 0] / (den_d[:, 0] + EPS))[:, None])
+        do = torch.randn(num_s.shape, device=device, generator=g)
+        dnum_s = do / (den_s.unsqueeze(-1) + EPS)
+        dden_s = -(do * out_s).sum(-1) / (den_s + EPS)
+        dnum_d = do / (den_d.unsqueeze(-1) + EPS)
+        dden_d = -(do * out_d).sum(-1) / (den_d + EPS)
         gs = C._kappa_routed_bwd(
-            q, k, v, h, lr, lw, kap, ckv_s, ckd_s, dnum, dden, D, b, sel, chunk,
+            q, k, v, h, lr, lw, kap, ckv_s, ckd_s, out_s, dnum_s, dden_s, D, b, sel, chunk,
             global_norm=False, per_state=False, eps=EPS, H=H, Wg=Wg)
         gd = C._kappa_routed_bwd(
-            q, k, v, h, lr, lw, kap, ckv_d, ckd_d, dnum, dden, D, b, sel, chunk,
+            q, k, v, h, lr, lw, kap, ckv_d, ckd_d, out_d, dnum_d, dden_d, D, b, sel, chunk,
             global_norm=False, per_state=False, eps=EPS, H=H, Wg=Wg,
             checkpoint_window_override=1)
         names = ['dq', 'dk', 'dv', 'dh', 'dlr', 'dlw', 'dkap'] + (['dWg'] if gla else [])
