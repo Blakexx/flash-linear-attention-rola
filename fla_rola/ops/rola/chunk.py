@@ -893,8 +893,8 @@ def _rola_rla_routed_bwd(q, k, v, h, lr, lw, do, D, b, chunk, BG, H, Wg=None):
     dlr = torch.zeros(B, L, D, b, device=q.device, dtype=torch.float32)     # per-level read-logit grad (F2b)
     dlw = torch.zeros(B, L, D, b, device=q.device, dtype=torch.float32)     # per-level write-logit grad
     dWg = torch.zeros(H, d_model, device=q.device, dtype=torch.float32)     # per-head decay-weight grad (#45)
-    # gda[B,L,nc]: persistent per-token log-decay adjoint accumulator (USE_G); reverse-cumsummed per chunk
-    # into dld at the end. RLA leaves it a 1-col stub.
+    # gda[B,L,nc]: persistent per-token log-decay adjoint accumulator (USE_G). Fold reverse-cumsums the
+    # current chunk in-kernel into dld. RLA leaves it a 1-col stub.
     gda = torch.zeros(B, L, nc, device=q.device, dtype=torch.float32) if use_g \
         else q.new_zeros(B, 1, 1)
     sga = (gda.stride(0), gda.stride(1), gda.stride(2))
@@ -912,8 +912,6 @@ def _rola_rla_routed_bwd(q, k, v, h, lr, lw, do, D, b, chunk, BG, H, Wg=None):
     dS = torch.zeros(B, nc, dqk, dv, device=q.device, dtype=torch.float32)
     gdr = torch.zeros(B, chunk, nc, device=q.device, dtype=torch.float32)   # transient, OVERWRITTEN/chunk
     gdw = torch.zeros(B, chunk, nc, device=q.device, dtype=torch.float32)
-    dld_chunk = torch.zeros(B, chunk, nc, device=q.device, dtype=torch.float32) if use_g \
-        else q.new_zeros(B, 1, 1)
     inter_common = dict(D=D, b=b, BB=BB, BT=chunk, BK=BK, BV=BV, BD=BD, BC=BC,
                         ND=ND, NDM=NDM, USE_G=use_g,
                         GLA_FLOOR=_GLA_FLOOR, num_warps=4, num_stages=1)
@@ -930,13 +928,6 @@ def _rola_rla_routed_bwd(q, k, v, h, lr, lw, do, D, b, chunk, BG, H, Wg=None):
             dS.stride(0), dS.stride(1), dS.stride(2), dS.stride(3),
             gdr.stride(0), gdr.stride(1), gdr.stride(2), *sga,
             **inter_common)
-        if use_g:
-            # decay the running dS adjoint by decvec=e^{Λ_c} — the reverse of the forward's state carry.
-            # Λ_c recomputed chunk-locally from Wg + the write logits ([B,len,nc], never [L,nc]).
-            r0, r1 = c * chunk, min(c * chunk + chunk, L)
-            ld_c = _ld_chunk(h[:, r0:r1], lw[:, r0:r1], Wg, D, b, H)   # [B,len,nc]
-            Lam_c = ld_c.sum(dim=1)                                    # [B,nc] chunk-total per state
-            dS = dS * torch.exp(Lam_c)[:, :, None, None]
         _routed_bwd_inter_read[(B, NCBLK)](
             h, q, lr, lw, sel, Wg, Sj, dS, do, dq, gdr, gda,
             L, d_model, dqk, dv, nc, c * chunk, H,
@@ -947,23 +938,16 @@ def _rola_rla_routed_bwd(q, k, v, h, lr, lw, do, D, b, chunk, BG, H, Wg=None):
             do.stride(0), do.stride(1), do.stride(2),
             gdr.stride(0), gdr.stride(1), gdr.stride(2), *sga,
             **inter_common)
-        if use_g:
-            # assemble dld for THIS chunk = intra-chunk reverse-cumsum of gda. Chunk-local [B,chunk,nc].
-            r0, r1 = c * chunk, min(c * chunk + chunk, L)
-            g_sl = gda[:, r0:r1]
-            tot = g_sl.sum(dim=1, keepdim=True)
-            dld_chunk.zero_()
-            dld_chunk[:, :r1 - r0] = tot - g_sl.cumsum(dim=1) + g_sl
         _routed_bwd_fold[(B, NCBLK)](
             h, lr, lw, sel, gdr, gdw, dh, dlr, dlw,
-            Wg, dWg, dld_chunk,
+            Wg, dWg, gda,
             L, d_model, nc, c * chunk, H,
             h.stride(0), h.stride(1), h.stride(2), *slo,
             sel.stride(0), sel.stride(1), sel.stride(2),
             gdr.stride(0), gdr.stride(1), gdr.stride(2), dh.stride(0), dh.stride(1), dh.stride(2),
-            swg[0], swg[1],
+            swg[0], swg[1], *sga,
             D=D, b=b, BB=BB, BT=chunk, BC=BC, BD=BD, NDM=NDM,
-            USE_G=use_g, GLA_FLOOR=_GLA_FLOOR, num_warps=4, num_stages=1)
+            USE_G=use_g, GLA_FLOOR=_GLA_FLOOR, DLD_FROM_GDA=use_g, num_warps=4, num_stages=1)
     if use_g:
         return dq[..., :dqk], dk[..., :dqk], dvv[..., :dv], dh, dlr, dlw, dWg
     return dq[..., :dqk], dk[..., :dqk], dvv[..., :dv], dh, dlr, dlw
@@ -1479,7 +1463,8 @@ def _kappa_bwd_state(h_ptr, k_ptr, v_ptr, lr_ptr, lw_ptr, sel_ptr, wg_ptr, sval_
     USE_G (GLA): both writes use w_end=w·e^{Λ-a}; dk/dv flow through w_end; the write routing-factor grad
     is dw_end·e^{Λ-a} (→ gdw). da-pieces: da_wend=−dw_end·w_end, and the per-chunk Λ-coupling
     dlam = e^Λ·Σ(S_j∘ds_in) − Σ_t da_wend (over BOTH the Sval and Sden carries) on the LAST row of gda.
-    The ds_in here is the PRE-decvec adjoint of S_{j+1}; the driver decays dS by e^Λ AFTER this kernel."""
+    The ds_in here is the PRE-decvec adjoint of S_{j+1}; this kernel then overwrites dS with e^Λ·ds_in,
+    the adjoint of S_j's carry."""
     pid_b = tl.program_id(0)
     ND_V = (dv + BV - 1) // BV       # value-blocks (BV is the value TILE; ND_V==1 ⇒ the un-tiled kernel)
     offs_t = tl.arange(0, BT)
@@ -1504,6 +1489,7 @@ def _kappa_bwd_state(h_ptr, k_ptr, v_ptr, lr_ptr, lw_ptr, sel_ptr, wg_ptr, sval_
         ldc = _ld_from_w(w_tile, alpha, cmask, GLA_FLOOR)
         a = tl.cumsum(ldc, axis=0)
         Lam = tl.sum(tl.where(offs_t[:, None] == (BT - 1), a, 0.0), axis=0)   # [BC] chunk-total
+        dec = tl.exp(Lam)
         wend = w_tile * tl.exp(Lam[None, :] - a)     # decayed write gate (both writes)
     else:
         wend = w_tile
@@ -1539,6 +1525,9 @@ def _kappa_bwd_state(h_ptr, k_ptr, v_ptr, lr_ptr, lw_ptr, sel_ptr, wg_ptr, sval_
                              mask=ckmask[:, None] & vmask[None, :], other=0.0)
                 sd = tl.where(ckmask[:, None] & vmask[None, :], sj * dSval, 0.0)
                 ZdZ += tl.sum(tl.reshape(tl.sum(sd, axis=1), [BC, BK]), axis=1)
+                dec_k = tl.reshape(dec[:, None] * tl.full([BC, BK], 1.0, tl.float32), [BC * BK])
+                tl.store(dsval_ptr + pid_b*ssv_b + ck[:, None]*ssv_k + offs_v[None, :]*ssv_v,
+                         dSval * dec_k[:, None], mask=ckmask[:, None] & vmask[None, :])
         Nvr = tl.reshape(Nval, [BT, BC, BK])
         dw += tl.sum(Nvr * kc[:, None, :], axis=2)
         dk_acc = tl.sum(Nvr * wend[:, :, None], axis=1)
@@ -1551,6 +1540,8 @@ def _kappa_bwd_state(h_ptr, k_ptr, v_ptr, lr_ptr, lw_ptr, sel_ptr, wg_ptr, sval_
             sjd = tl.load(sden_ptr + pid_b*ssd_b + ck*ssd_k, mask=ckmask, other=0.0)
             sdd = tl.where(ckmask, sjd * dSden, 0.0)
             ZdZ += tl.sum(tl.reshape(sdd, [BC, BK]), axis=1)
+            dec_k = tl.reshape(dec[:, None] * tl.full([BC, BK], 1.0, tl.float32), [BC * BK])
+            tl.store(dsden_ptr + pid_b*ssd_b + ck*ssd_k, dSden * dec_k, mask=ckmask)
         tl.atomic_add(dk_ptr + pid_b*sq_b + rows[:, None]*sq_l + offs_k[None, :]*sq_d,
                       dk_acc, mask=rmask[:, None] & kmask[None, :])
     if USE_G:
@@ -1796,8 +1787,8 @@ def _kappa_routed_bwd(q, k, v, h, lr, lw, kap, ckpt_val, ckpt_den, out, dnum, dd
     paths (decayed gates rd=r̃·e^a, wt=w·e^{-a}, w_end=w·e^{Λ-a}; the den d carries decay; the da-pieces
     accumulate into a persistent gda[B,L,nc]). Between state-bwd and read-bwd BOTH carried adjoints decay
     by e^Λ (the reverse of the forward's e^Λ state carry; Λ_c recomputed chunk-locally from Wg). At each
-    chunk gda is reverse-cumsummed → a PER-CHUNK dld[B,chunk,nc] (never [L,nc]); the fold splits it into
-    dWg + the extra dh + the decay's write-gate grad. Wg=None is RLA (byte-identical; gda/dld unused)."""
+    chunk the fold kernel reverse-cumsums gda in-kernel into dld, then splits it into dWg + the extra dh +
+    the decay's write-gate grad. Wg=None is RLA (byte-identical; gda/dld unused)."""
     use_g = Wg is not None
     B, L, d_model = h.shape
     dqk = q.shape[-1]
@@ -1836,11 +1827,9 @@ def _kappa_routed_bwd(q, k, v, h, lr, lw, kap, ckpt_val, ckpt_den, out, dnum, dd
     Wg = (Wg.float().contiguous() if use_g else q.new_zeros(H, d_model))
     swg = (Wg.stride(0), Wg.stride(1))
     # gda[B,L,nc]: persistent per-token log-decay adjoint (USE_G) — state/read kernels add their da-pieces
-    # per chunk; reverse-cumsummed per chunk into a PER-CHUNK dld at the fold. RLA leaves it a 1-col stub.
+    # per chunk. Fold reverse-cumsums the current chunk in-kernel into dld. RLA leaves it a 1-col stub.
     gda = torch.zeros(B, L, nc, device=q.device, dtype=torch.float32) if use_g else q.new_zeros(B, 1, 1)
     sga = (gda.stride(0), gda.stride(1), gda.stride(2))
-    dld_chunk = torch.zeros(B, chunk, nc, device=q.device, dtype=torch.float32) if use_g \
-        else q.new_zeros(B, 1, 1)
     # transient per-chunk gate-grad scratch [B,chunk,nc], OVERWRITTEN each chunk — never [L,nc].
     gdr = torch.zeros(B, chunk, nc, device=q.device, dtype=torch.float32)
     gdw = torch.zeros(B, chunk, nc, device=q.device, dtype=torch.float32)
@@ -1887,14 +1876,6 @@ def _kappa_routed_bwd(q, k, v, h, lr, lw, kap, ckpt_val, ckpt_den, out, dnum, dd
             h, k, v, lr, lw, sel, Wg, Sval, Sden, dSval, dSden, dk, dvv, gdw, gda,
             L, d_model, dqk, dv, nc, c * chunk, H,
             *sH, *sB, *sV, *slo, *sSel, swg[0], swg[1], *sSV, *sSD, *sGD, *sga, **state_common)
-        if use_g:
-            # decay the running adjoints by decvec=e^{Λ_c} — the reverse of the forward's e^Λ state carry.
-            # Λ_c recomputed chunk-locally from Wg + the write logits ([B,len,nc], never [L,nc]).
-            r0, r1 = c * chunk, min(c * chunk + chunk, L)
-            ld_c = _ld_chunk(h[:, r0:r1], lw[:, r0:r1], Wg, D, b, H)
-            Lam_c = ld_c.sum(dim=1)                                 # [B,nc] chunk-total per state
-            dSval = dSval * torch.exp(Lam_c)[:, :, None, None]
-            dSden = dSden * torch.exp(Lam_c)[:, :, None]
         # K2: readout/den/d bwd (adds dw, produces dr,dq,dv-intra,dkappa; folds dSval/dSden adjoints).
         _kappa_bwd_read[(B, NCBLK)](
             h, q, k, v, lr, lw, sel, kap, Wg, Sval, Sden, dnum, dden,
@@ -1903,23 +1884,17 @@ def _kappa_routed_bwd(q, k, v, h, lr, lw, kap, ckpt_val, ckpt_den, out, dnum, dd
             *sH, *sB, *sV, kap.stride(0), kap.stride(1), *slo, *sSel, swg[0], swg[1], *sSV, *sSD,
             dnum.stride(0), dnum.stride(1), dnum.stride(2), dden.stride(0), dden.stride(1), *sGD, *sga,
             **read_common)
-        if use_g:
-            # assemble dld for THIS chunk = intra-chunk reverse-cumsum of gda. Chunk-local [B,chunk,nc].
-            r0, r1 = c * chunk, min(c * chunk + chunk, L)
-            g_sl = gda[:, r0:r1]
-            tot = g_sl.sum(dim=1, keepdim=True)
-            dld_chunk.zero_()
-            dld_chunk[:, :r1 - r0] = tot - g_sl.cumsum(dim=1) + g_sl
         # fold the transient gate-grads -> dlr,dlw (+ decay's dh,dWg); the dWr/dWw/dh router contraction is
-        # the cuBLAS GEMM-backward in torch. USE_G also splits dld_chunk → dWg + decay dh + decay write-grad.
+        # the cuBLAS GEMM-backward in torch. USE_G reverse-cumsums gda in-kernel, then splits dld → dWg +
+        # decay dh + decay write-grad.
         _routed_bwd_fold[(B, NCBLK)](
             h, lr, lw, sel, gdr, gdw, dh, dlr, dlw,
-            Wg, dWg, dld_chunk,
+            Wg, dWg, gda,
             L, d_model, nc, c * chunk, H, *sH, *slo, *sSel,
             gdr.stride(0), gdr.stride(1), gdr.stride(2), dh.stride(0), dh.stride(1), dh.stride(2),
-            swg[0], swg[1],
+            swg[0], swg[1], *sga,
             D=D, b=b, BB=BB, BT=chunk, BC=BC, BD=BD, NDM=NDM,
-            USE_G=use_g, GLA_FLOOR=_GLA_FLOOR, num_warps=4, num_stages=1)
+            USE_G=use_g, GLA_FLOOR=_GLA_FLOOR, DLD_FROM_GDA=use_g, num_warps=4, num_stages=1)
     if not global_norm and not per_state and L > 0:
         # Token 0 has no carried state and only its diagonal intra term, so for every state c:
         # N_0^c = d_0^c * v_0. The normalized kappa gradient can therefore be formed as the small centered

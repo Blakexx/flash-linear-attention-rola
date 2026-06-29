@@ -446,7 +446,7 @@ def _bwd_inter_state_kernel(
     # gate w_end=w·e^{Λ−a} (Λ=chunk-total ld); dk/dv flow through w_end; the write routing-factor grad +=
     # dw_end·e^{Λ−a} (→ gdw). da-pieces: −da_wend (=dw_end·w_end), and the chunk-total Λ coupling
     # dlam = e^Λ·Σ(S_j∘ds_in) − Σ_t da_wend placed on the LAST row of gda. ds_in MUST be the pre-decvec
-    # adjoint of S_{j+1} (the driver applies the e^Λ state-carry decay to ds AFTER this kernel).
+    # adjoint of S_{j+1}; this kernel then overwrites ds with e^Λ·ds_in, the adjoint of S_j's carry.
     pid_b = tl.program_id(0)
     _hd = pid_b % H                              # per-head decay-weight slice (BH fold is (B,H))
     wg_ptr = wg_ptr + _hd * swg_head            # per-head decay weight (read-only here; #45)
@@ -472,6 +472,7 @@ def _bwd_inter_state_kernel(
         ldc = _ld_from_w(w_tile, alpha, cmask, GLA_FLOOR)
         a = tl.cumsum(ldc, axis=0)
         Lam = tl.sum(tl.where(offs_t[:, None] == (BT - 1), a, 0.0), axis=0)   # [BC] chunk-total
+        dec = tl.exp(Lam)
         wend_tile = w_tile * tl.exp(Lam[None, :] - a)     # decayed write gate
     else:
         wend_tile = w_tile
@@ -506,6 +507,9 @@ def _bwd_inter_state_kernel(
                              mask=ckmask[:, None] & vmask[None, :], other=0.0)
                 sd = tl.where(ckmask[:, None] & vmask[None, :], sj * dS_in, 0.0)
                 ZdZ += tl.sum(tl.reshape(tl.sum(sd, axis=1), [BC, BK]), axis=1)
+                dec_k = tl.reshape(dec[:, None] * tl.full([BC, BK], 1.0, tl.float32), [BC * BK])
+                tl.store(ds_ptr + pid_b * ss_b + ckv[:, None] * ss_k + offs_v[None, :] * ss_v,
+                         dS_in * dec_k[:, None], mask=ckmask[:, None] & vmask[None, :])
         Nr = tl.reshape(N, [BT, BC, BK])
         dw_inter += tl.sum(Nr * kc[:, None, :], axis=2)
         dk_acc = tl.sum(Nr * wend_tile[:, :, None], axis=1)
@@ -534,11 +538,11 @@ def _fold_kernel(
     L, d_model, nc, t_start, H,
     sh_b, sh_l, sh_d, slo_b, slo_l, slo_lvl, slo_bb,
     ssel_lvl, ssel_b, ssel_c, sg_b, sg_t, sg_c, sdh_b, sdh_l, sdh_d,
-    swg_head, swg_d,
+    swg_head, swg_d, sdld_b, sdld_t, sdld_c,
     D: tl.constexpr, b: tl.constexpr, BB: tl.constexpr,
     BT: tl.constexpr, BC: tl.constexpr, BD: tl.constexpr,
     NDM: tl.constexpr,
-    USE_G: tl.constexpr = False, GLA_FLOOR: tl.constexpr = -2.5,
+    USE_G: tl.constexpr = False, GLA_FLOOR: tl.constexpr = -2.5, DLD_FROM_GDA: tl.constexpr = False,
 ):
     # #58 grid (B·H, NCBLK): ONE program owns ONE nc-state-block cb=program_id(1) (was an in-program serial
     # `for cb` loop) — the occupancy widen (16→256 blocks). `_fold_level` atomic-adds dlr/dlw (cb-local cols
@@ -549,9 +553,10 @@ def _fold_kernel(
     # `_build_factors`(logits) + `_build_level_factors` + `_fold_level`(dlogits); the dWr/dWw/dh router contraction is a cuBLAS
     # GEMM-backward in torch. USE_G (GLA, #45): the per-state log-decay ld is computed in-kernel from Wg +
     # the write gate, so ITS gradient is folded HERE (the natural home — this kernel already rebuilds
-    # w_tile and folds w → dlogit_w). dld_ptr carries the assembled ∂L/∂ld (the driver's reverse-cumsum
-    # of gda) for this chunk [BT,nc]; we split it into ∂L/∂w (added to dw_tile → dlogit_w via the SAME tree
-    # fold) and ∂L/∂z (z=h·Wg) → dWg, dh (the decay's dh STAYS in-kernel; h·Wg is the tiny [d_model]→1).
+    # w_tile and folds w → dlogit_w). dld_ptr either carries the assembled ∂L/∂ld for this chunk [BT,nc],
+    # or, when DLD_FROM_GDA, the raw gda[B,L,nc] da-pieces that this program reverse-cumsums in-kernel. We
+    # split dld into ∂L/∂w (added to dw_tile → dlogit_w via the SAME tree fold) and ∂L/∂z (z=h·Wg) → dWg,
+    # dh (the decay's dh STAYS in-kernel; h·Wg is the tiny [d_model]→1).
     pid_b = tl.program_id(0)
     _hd = pid_b % H                              # per-head decay-weight slice (BH fold is (B,H))
     wg_ptr = wg_ptr + _hd * swg_head
@@ -580,12 +585,17 @@ def _fold_kernel(
                       mask=rmask[:, None] & cmask[None, :], other=0.0)
     if USE_G:
         # split the assembled ∂L/∂ld for this block into ∂L/∂w (→ dw_tile) and ∂L/∂z (→ dz).
-        dld_tile = tl.load(dld_ptr + pid_b * sg_b + offs_t[:, None] * sg_t + cols[None, :] * sg_c,
-                           mask=rmask[:, None] & cmask[None, :], other=0.0)
+        if DLD_FROM_GDA:
+            gda_tile = tl.load(dld_ptr + pid_b * sdld_b + rows[:, None] * sdld_t + cols[None, :] * sdld_c,
+                               mask=rmask[:, None] & cmask[None, :], other=0.0)
+            dld_tile = tl.sum(gda_tile, axis=0)[None, :] - tl.cumsum(gda_tile, axis=0) + gda_tile
+        else:
+            dld_tile = tl.load(dld_ptr + pid_b * sdld_b + offs_t[:, None] * sdld_t + cols[None, :] * sdld_c,
+                               mask=rmask[:, None] & cmask[None, :], other=0.0)
         one_minus_a = 1.0 - alpha[:, None]
         m = 1.0 - w_tile * one_minus_a
         active = (m > 1e-8) & (tl.log(tl.maximum(m, 1e-8)) >= GLA_FLOOR)
-        dld = tl.where(cmask[None, :] & active, dld_tile, 0.0)
+        dld = tl.where(rmask[:, None] & cmask[None, :] & active, dld_tile, 0.0)
         dw_tile += dld * (-one_minus_a / m)                       # ∂ld/∂w = -(1-alpha)/m
         dz += tl.sum(dld * (w_tile / m), axis=1) * (alpha * (1.0 - alpha))  # ∂ld/∂alpha · ∂alpha/∂z
     for lvl in tl.static_range(0, D):
