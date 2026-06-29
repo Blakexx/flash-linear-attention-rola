@@ -452,15 +452,17 @@ class RoLA(nn.Module):
                 raise NotImplementedError(
                     "chunk_rola_routed has no carried initial_state yet; continuation decode uses the "
                     "fused_recurrent path (auto-selected for L<=64).")
-            # CHUNK: in-kernel routing + decay. h is the residual stream broadcast per head ([B,L,H,hidden]);
-            # the kernel folds the routing gram, the per-state den, the read-gate rescale AND (GLA) the
-            # per-state log-decay IN-KERNEL — the [L,nc] gates + ld are NEVER materialized (the training
-            # saved-activation win). F2b: the per-level routing logits wl/rl (already computed above for the
-            # z-loss) are passed straight to the kernel — the d_model-contraction h·W is a cuBLAS GEMM done
-            # ONCE in `_factor_logits` (not re-done in the kernel nor re-GEMM'd in `chunk_rola_routed`); the
-            # kernel only softmax+gathers, and dWrite_W/dRead_W/dx flow back through this einsum.
-            h = (alpha_logits.view(B, L, H, 1) if (self.kernel == 'gla_scalar' and self.use_short_conv)
-                 else x.unsqueeze(2).expand(B, L, H, self.hidden_size))
+            # CHUNK: routing logits wl/rl and scalar alpha are precomputed above. The normalized CUDA
+            # forward consumes those directly, so only raw/CPU or GLA training backward needs the full
+            # routing hidden. Keep the no-grad/inference argument compact so input guards cannot clone the
+            # expanded [B,L,H,hidden] view before the kernel wrapper sees it.
+            needs_h = (not x.is_cuda) or self.state_norm == 'raw' or (
+                torch.is_grad_enabled() and self.kernel == 'gla_scalar')
+            if needs_h:
+                h = (alpha_logits.view(B, L, H, 1) if (self.kernel == 'gla_scalar' and self.use_short_conv)
+                     else x.unsqueeze(2).expand(B, L, H, self.hidden_size))
+            else:
+                h = x.new_empty(B, L, H, 1)
             out = chunk_rola_routed(
                 qf, kf, v, h, self.write_W if self.read_W is None else self.read_W, self.write_W,
                 D, b, norm=self.state_norm, kappa=kap, scale=1.0,
