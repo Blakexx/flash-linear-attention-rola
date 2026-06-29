@@ -837,78 +837,6 @@ def _ld_chunk(h_c, lw_c, Wg, D, b, H):
     return ld.clamp(min=_GLA_FLOOR)
 
 
-def _kappa_dkap_centered_torch(q, k, v, h, lr, lw, kap, do, D, b, chunk, eps, H, Wg=None):
-    """Chunk-streamed centered dκ for the normalized kappa readout. This recomputes only the scalar kappa
-    gradient from N_c - out*d_c, avoiding the fp32 cancellation in the fused drt + dden path."""
-    use_g = Wg is not None
-    B, L, dqk = q.shape
-    dv = v.shape[-1]
-    nc = b ** D
-    qd, kd, vd = q.double(), k.double(), v.double()
-    hd, lrd, lwd = h.double(), lr.double(), lw.double()
-    kapd, dod = kap.squeeze(-1).double(), do.double()
-    Wgd = Wg.double() if use_g else None
-
-    def gates(logits):
-        f = torch.softmax(logits, dim=-1)
-        g = f[..., 0, :]
-        for i in range(1, D):
-            g = (g.unsqueeze(-1) * f[..., i, :].unsqueeze(-2)).flatten(-2)
-        return g
-
-    def ld_chunk(h_c, lw_c):
-        wf = gates(lw_c)
-        BH, T, dm = h_c.shape
-        hr = h_c.view(BH // H, H, T, dm)
-        alpha = torch.sigmoid(torch.einsum('bhtd,hd->bht', hr, Wgd)).reshape(BH, T, 1)
-        return (1.0 - wf * (1.0 - alpha)).clamp(min=1e-8).log().clamp(min=_GLA_FLOOR)
-
-    Sval = torch.zeros(B, nc, dqk, dv, device=q.device, dtype=torch.float64)
-    Sden = torch.zeros(B, nc, dqk, device=q.device, dtype=torch.float64)
-    dkap = torch.zeros(B, L, device=q.device, dtype=torch.float64)
-    for r0 in range(0, L, chunk):
-        r1 = min(r0 + chunk, L)
-        qc, kc, vc = qd[:, r0:r1], kd[:, r0:r1], vd[:, r0:r1]
-        doc = dod[:, r0:r1]
-        rc = gates(lrd[:, r0:r1])
-        wc = gates(lwd[:, r0:r1])
-        G = torch.einsum('bid,bjd->bij', qc, kc)
-        causal = torch.tril(torch.ones(r1 - r0, r1 - r0, device=q.device, dtype=torch.float64))
-        Gc = G * causal
-        if use_g:
-            ld = ld_chunk(hd[:, r0:r1], lwd[:, r0:r1])
-            a = torch.cumsum(ld, dim=1)
-            ea = torch.exp(a)
-            wt = wc * torch.exp(-a)
-            n_intra = ea[..., None] * torch.einsum('bij,bjc,bjv->bicv', Gc, wt, vc)
-            n_inter = ea[..., None] * torch.einsum('bid,bcdv->bicv', qc, Sval)
-            d_intra = ea * torch.einsum('bij,bjc->bic', Gc, wt)
-            d_inter = ea * torch.einsum('bid,bcd->bic', qc, Sden)
-            d = d_intra + d_inter
-        else:
-            n_intra = torch.einsum('bij,bjc,bjv->bicv', Gc, wc, vc)
-            n_inter = torch.einsum('bid,bcdv->bicv', qc, Sval)
-            d = torch.einsum('bij,bjc->bic', Gc, wc) + torch.einsum('bid,bcd->bic', qc, Sden)
-        N = n_intra + n_inter
-        rt = rc * (d + eps).pow(-kapd[:, r0:r1, None])
-        den = (rt * d).sum(-1)
-        num = (rt[..., None] * N).sum(2)
-        out_ref = num / (den[..., None] + eps)
-        dnum_ref = doc / (den[..., None] + eps)
-        centered = N - out_ref[:, :, None, :] * d[..., None]
-        z = (dnum_ref[:, :, None, :] * centered).sum(-1)
-        dkap[:, r0:r1] = (-rt * (d + eps).log() * z).sum(-1)
-        if use_g:
-            Lam = a[:, -1]
-            w_end = wc * torch.exp(Lam[:, None, :] - a)
-            Sval = torch.exp(Lam)[:, :, None, None] * Sval + torch.einsum('bjc,bjd,bjv->bcdv', w_end, kc, vc)
-            Sden = torch.exp(Lam)[:, :, None] * Sden + torch.einsum('bjc,bjd->bcd', w_end, kc)
-        else:
-            Sval = Sval + torch.einsum('bjc,bjd,bjv->bcdv', wc, kc, vc)
-            Sden = Sden + torch.einsum('bjc,bjd->bcd', wc, kc)
-    return dkap.float()
-
-
 def _rola_rla_routed_bwd(q, k, v, h, lr, lw, do, D, b, chunk, BG, H, Wg=None):
     """Tree-routed RLA backward at the PRODUCTION state-block width BC=BG. F2b: the routing factors are
     rebuilt from the PRECOMPUTED logits lr,lw:[BH,L,D,b] and the router-grad fold EMITS per-level LOGIT
@@ -1854,7 +1782,8 @@ def _kappa_bwd_read(h_ptr, q_ptr, k_ptr, v_ptr, lr_ptr, lw_ptr, sel_ptr, kap_ptr
                       dk_g, mask=rmask[:, None] & kmask[None, :])
     tl.atomic_add(dkap_ptr + pid_b*sk_b + rows*sk_l, dkap_acc, mask=rmask)
 
-def _kappa_routed_bwd(q, k, v, h, lr, lw, kap, ckpt_val, ckpt_den, out, do, dnum, dden,
+
+def _kappa_routed_bwd(q, k, v, h, lr, lw, kap, ckpt_val, ckpt_den, out, dnum, dden,
                       D, b, sel, chunk, global_norm, per_state, eps, H, Wg=None,
                       checkpoint_window_override=None):
     """Reverse chunk-scan backward for the fused global/kappa/per_state path. Carries dSval,dSden
@@ -1991,9 +1920,29 @@ def _kappa_routed_bwd(q, k, v, h, lr, lw, kap, ckpt_val, ckpt_den, out, do, dnum
             swg[0], swg[1],
             D=D, b=b, BB=BB, BT=chunk, BC=BC, BD=BD, NDM=NDM,
             USE_G=use_g, GLA_FLOOR=_GLA_FLOOR, num_warps=4, num_stages=1)
-    if not global_norm and not per_state:
-        dkap = _kappa_dkap_centered_torch(q, k, v, h, lr, lw, kap, do, D, b, chunk, eps, H,
-                                          Wg=(Wg if use_g else None))
+    if not global_norm and not per_state and L > 0:
+        # Token 0 has no carried state and only its diagonal intra term, so for every state c:
+        # N_0^c = d_0^c * v_0. The normalized kappa gradient can therefore be formed as the small centered
+        # residual d_0^c * <dnum_0, v_0 - out_0>, instead of relying on fp32 cancellation between the
+        # numerator and denominator contributions. This touches only [B,nc] token-0 gates, never [L,nc].
+        with torch.no_grad():
+            def first_token_gates(logits):
+                factors = [torch.softmax(logits[:, 0, lvl].float(), dim=-1) for lvl in range(D)]
+                leaves = []
+                for leaf in range(nc):
+                    digs = [(leaf // (b ** (D - 1 - lvl))) % b for lvl in range(D)]
+                    g_leaf = factors[0][:, digs[0]]
+                    for lvl in range(1, D):
+                        g_leaf = g_leaf * factors[lvl][:, digs[lvl]]
+                    leaves.append(g_leaf)
+                return torch.stack(leaves, dim=-1)
+
+            r0 = first_token_gates(lr)
+            w0 = first_token_gates(lw)
+            d0 = (q[:, 0].float() * k[:, 0].float()).sum(-1, keepdim=True) * w0
+            rt0 = r0 * (d0 + eps).pow(-kap[:, 0, None].float())
+            z0 = (dnum[:, 0].float() * (v[:, 0].float() - out[:, 0].float())).sum(-1)
+            dkap[:, 0].copy_(((-rt0 * d0 * (d0 + eps).log()).sum(-1) * z0).to(dkap.dtype))
     if use_g:
         return (dq[..., :dqk], dk[..., :dqk], dvv[..., :dv], dh, dlr, dlw, dkap, dWg)
     return (dq[..., :dqk], dk[..., :dqk], dvv[..., :dv], dh, dlr, dlw, dkap)
@@ -2077,7 +2026,7 @@ class _RoLARoutedKappaFn(torch.autograd.Function):
         dnum = do / den_e
         dden = -(do * out).sum(-1) / (den + eps)
         grads = _kappa_routed_bwd(
-            q, k, v, h, lr, lw, kap, ckpt_val, ckpt_den, out.float(), do, dnum, dden,
+            q, k, v, h, lr, lw, kap, ckpt_val, ckpt_den, out.float(), dnum, dden,
             D, b, sel, chunk, global_norm, per_state, eps, H, Wg=Wgf)
         # _kappa_routed_bwd returns (dq,dk,dv,dh,dlr,dlw,dkap[,dWg]); dWg present iff use_g.
         dq, dk, dv, dh, dlr, dlw, dkap = grads[:7]
