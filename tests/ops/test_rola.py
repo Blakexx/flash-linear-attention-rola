@@ -452,10 +452,10 @@ class TestIntraConfigEquivalence:
         dnum_d = do / (den_d.unsqueeze(-1) + EPS)
         dden_d = -(do * out_d).sum(-1) / (den_d + EPS)
         gs = C._kappa_routed_bwd(
-            q, k, v, h, lr, lw, kap, ckv_s, ckd_s, out_s, dnum_s, dden_s, D, b, sel, chunk,
+            q, k, v, h, lr, lw, kap, ckv_s, ckd_s, out_s, do, dnum_s, dden_s, D, b, sel, chunk,
             global_norm=False, per_state=False, eps=EPS, H=H, Wg=Wg)
         gd = C._kappa_routed_bwd(
-            q, k, v, h, lr, lw, kap, ckv_d, ckd_d, out_d, dnum_d, dden_d, D, b, sel, chunk,
+            q, k, v, h, lr, lw, kap, ckv_d, ckd_d, out_d, do, dnum_d, dden_d, D, b, sel, chunk,
             global_norm=False, per_state=False, eps=EPS, H=H, Wg=Wg,
             checkpoint_window_override=1)
         names = ['dq', 'dk', 'dv', 'dh', 'dlr', 'dlw', 'dkap'] + (['dWg'] if gla else [])
@@ -708,7 +708,11 @@ class TestInterCorrectness:
         names = ['q', 'k', 'v', 'h', 'Wr', 'Ww'] + (['Wg'] if gla else []) + ['kappa']
         for name, got, exp in zip(names, grads, ref_grads):
             tol = _GLA_BWD_TOL if gla else (2.5e-2 if name == 'kappa' else 1e-2)
-            assert _relmax(got.float(), exp.float()) < tol, f'{name}: {_relmax(got.float(), exp.float()):.2e}'
+            rel = _relmax(got.float(), exp.float())
+            assert rel < tol, f'{name}: {rel:.2e}'
+            if name == 'kappa':
+                abs_err = (got.float() - exp.float()).abs().max().item()
+                assert abs_err < 2e-3, f'{name} abs: {abs_err:.2e}'
 
     @pytest.mark.parametrize('gla', [False, True])
     def test_kappa_checkpoint_wrapper_bf16_upcast_smoke(self, gla):
@@ -928,14 +932,13 @@ class TestInterCorrectness:
                 oe = _kappa_ref_chunked(q, k, v, h, Wr, Ww, kappa, D, b, norm, scale, chunk)
         ge = torch.autograd.grad(oe, sel, go)
         rels = {n: _relmax(a.float(), c.float()) for n, a, c in zip(names, gf, ge)}
+        abses = {n: (a.float() - c.float()).abs().max().item() for n, a, c in zip(names, gf, ge)}
         out_tol = 3e-2 if gla else 1e-2   # GLA fwd carries the decay fp32 floor; RLA is rigorous fp64
         assert _relmax(of.float(), oe.float()) < out_tol, f'out {_relmax(of.float(), oe.float()):.2e}'
         # q/k/v TIGHT (the dv=24 / bias-threading bugs spiked these to ~1e0/~2-3e-1); the gate/bias grads to
         # the rigorous fp64 ~1e-2 (RLA), or — under GLA decay — the documented GLA fp32 floor. The dkappa
-        # grad gets its OWN bound: it flows through the read-rescale exponent ∂/∂κ (d+ε)^{−κ} = −ln(d+ε)·
-        # (d+ε)^{−κ}, the most ill-conditioned grad in the readout — surveyed worst-case 1.73e-2 over the
-        # full tree×large-dqk×bias kappa grid (all OTHER grads stay ≤4e-3 there; verified fp64, no kernel
-        # bug). 2.5e-2 clears it with headroom while still tripping a real ~3% dκ error.
+        # grad also has an absolute cap so the old ~1e-2 centered-cancellation regression fails even when
+        # relative error is distorted by near-zero reference entries.
         tight = 8e-3
         gate_tol = _GLA_BWD_TOL if gla else 1e-2
         kappa_tol = _GLA_BWD_TOL if gla else 2.5e-2
@@ -944,6 +947,9 @@ class TestInterCorrectness:
         for n, r in rels.items():
             tol_n = kappa_tol if n == 'kappa' else gate_tol
             assert r < tol_n, f'{n} grad {r:.2e} (norm={norm} gla={gla} bias={bias} rels={rels})'
+            if n == 'kappa':
+                assert abses[n] < 2e-3, \
+                    f'{n} abs {abses[n]:.2e} (norm={norm} gla={gla} bias={bias} rels={rels})'
     @pytest.mark.parametrize('norm', ['global', 'kappa', 'per_state'])
     @pytest.mark.parametrize('D,b', _ROUTE_FLAT_SQ_TREE_8)
     def test_routed_faithful_bf16(self, D, b, norm):
