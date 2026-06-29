@@ -406,12 +406,14 @@ class RoLA(nn.Module):
             kap = None
         D, b = self.route_D, self.route_b
         alpha_logits = None
+        alpha = None
         if self.kernel == 'gla_scalar':
             alpha_logits = self.w_g(x)
             if self.use_short_conv:
                 alpha_logits, conv_state_g = self.g_conv1d(
                     alpha_logits, cache=conv_state_g,
                     output_final_state=use_cache, cu_seqlens=cu_seqlens)
+            alpha = torch.sigmoid(alpha_logits).view(B, L, H)
             Wg = self._unit_w_g.to(device=x.device, dtype=torch.float32) if self.use_short_conv else self.w_g.weight
         else:
             Wg = None
@@ -463,7 +465,7 @@ class RoLA(nn.Module):
                 qf, kf, v, h, self.write_W if self.read_W is None else self.read_W, self.write_W,
                 D, b, norm=self.state_norm, kappa=kap, scale=1.0,
                 b_r=(self.write_b if self.read_W is None else self.read_b), b_w=self.write_b, Wg=Wg,
-                wl=wl, rl=rl)
+                wl=wl, rl=rl, alpha=alpha)
             recurrent_state = None
             if use_cache:
                 # Prefill→decode handoff (inference only): the routed readout stays [L,nc]-free, but the
