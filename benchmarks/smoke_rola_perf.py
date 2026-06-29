@@ -50,6 +50,13 @@ def main():
 
     D, b = 1, nc                       # flat routing (D=1, b=nc) — the in-kernel router takes h + Wr/Ww
     dm = H * dv                        # a representative hidden width
+
+    def routed_kwargs(h, Wr, Ww, Wg=None):
+        wl = torch.einsum('bthm,hdmc->bthdc', h, Ww.to(h.dtype)).contiguous()
+        rl = torch.einsum('bthm,hdmc->bthdc', h, Wr.to(h.dtype)).contiguous()
+        alpha = torch.sigmoid(torch.einsum('bthm,hm->bth', h.float(), Wg.float())) if Wg is not None else None
+        return dict(wl=wl, rl=rl, alpha=alpha)
+
     for gla in (False, True):
         q = (torch.nn.functional.elu(rb(B, L, H, K)) + 1).requires_grad_()
         k = (torch.nn.functional.elu(rb(B, L, H, K)) + 1).requires_grad_()
@@ -63,7 +70,8 @@ def main():
         for norm in ("global", "kappa"):
             def fn(norm=norm):
                 return chunk_rola_routed(q, k, v, h, Wr, Ww, D, b, norm=norm,
-                                         kappa=kap if norm == "kappa" else None, scale=1.0, Wg=Wg)
+                                         kappa=kap if norm == "kappa" else None, scale=1.0, Wg=Wg,
+                                         **routed_kwargs(h, Wr, Ww, Wg=Wg))
             fwd = _median_ms(fn, leaves, bwd=False)
             fb = _median_ms(fn, leaves, bwd=True)
             print(f"  {'GLA' if gla else 'RLA'}/{norm:7s}  fwd={fwd:.2f}ms  fwd+bwd={fb:.2f}ms")

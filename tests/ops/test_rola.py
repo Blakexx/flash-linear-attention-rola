@@ -61,6 +61,20 @@ def _relmax(a, b):
     return (a - b).abs().max().item() / (b.abs().max().item() + 1e-9)
 
 
+def _routed_kwargs(h, Wr, Ww, D, b, Wg=None, b_r=None, b_w=None):
+    """Build the production chunk_rola_routed side inputs: per-level logits, plus scalar GLA alpha."""
+    wl = torch.einsum('bthm,hdmc->bthdc', h, Ww.to(h.dtype))
+    rl = torch.einsum('bthm,hdmc->bthdc', h, Wr.to(h.dtype))
+    if b_w is not None:
+        wl = wl + b_w.to(h.dtype)[None, None]
+    if b_r is not None:
+        rl = rl + b_r.to(h.dtype)[None, None]
+    alpha = None
+    if Wg is not None:
+        alpha = torch.sigmoid(torch.einsum('bthm,hm->bth', h.float(), Wg.float()))
+    return dict(wl=wl.contiguous(), rl=rl.contiguous(), alpha=alpha)
+
+
 _GLA_BWD_TOL = 1.2e-1   # GLA decay fp32 floor (NOT a kernel bug): the gate/decay grads (drg,dwg,dld) flow
 #                       through the softmax-gate × exp(cumsum(ld)) product across the chunked recurrence,
 #                       whose fp32-vs-fp64 floor is ~9e-2 worst-case (the dwg grad; seed-driven, present
@@ -428,15 +442,16 @@ class TestIntraConfigEquivalence:
         lr, lw = rand(B, T, D, b) * 0.4, rand(B, T, D, b) * 0.4
         kap = torch.full((B, T), 0.5, device=device)
         Wg = torch.zeros(H, dm, device=device) if gla else None
+        alpha = torch.sigmoid(torch.einsum('btm,hm->bt', h.float(), Wg.float())) if gla else None
         sel = C._build_sel(D, b, b ** D, q.device)
         chunk = 64
 
         num_s, den_s, ckv_s, ckd_s, _ = C._kappa_routed_fwd(
-            q, k, v, h, lr, lw, kap, D, b, sel, chunk,
-            global_norm=False, per_state=False, eps=EPS, H=H, Wg=Wg, save_checkpoints=True)
+            q, k, v, alpha, lr, lw, kap, D, b, sel, chunk,
+            global_norm=False, per_state=False, eps=EPS, H=H, save_checkpoints=True)
         num_d, den_d, ckv_d, ckd_d, _ = C._kappa_routed_fwd(
-            q, k, v, h, lr, lw, kap, D, b, sel, chunk,
-            global_norm=False, per_state=False, eps=EPS, H=H, Wg=Wg, save_checkpoints=True,
+            q, k, v, alpha, lr, lw, kap, D, b, sel, chunk,
+            global_norm=False, per_state=False, eps=EPS, H=H, save_checkpoints=True,
             checkpoint_every_override=1)
         assert _relmax(num_s, num_d) < 1e-6
         assert _relmax(den_s, den_d) < 1e-6
@@ -452,10 +467,10 @@ class TestIntraConfigEquivalence:
         dnum_d = do / (den_d.unsqueeze(-1) + EPS)
         dden_d = -(do * out_d).sum(-1) / (den_d + EPS)
         gs = C._kappa_routed_bwd(
-            q, k, v, h, lr, lw, kap, ckv_s, ckd_s, out_s, dnum_s, dden_s, D, b, sel, chunk,
+            q, k, v, h, lr, lw, kap, alpha, ckv_s, ckd_s, out_s, dnum_s, dden_s, D, b, sel, chunk,
             global_norm=False, per_state=False, eps=EPS, H=H, Wg=Wg)
         gd = C._kappa_routed_bwd(
-            q, k, v, h, lr, lw, kap, ckv_d, ckd_d, out_d, dnum_d, dden_d, D, b, sel, chunk,
+            q, k, v, h, lr, lw, kap, alpha, ckv_d, ckd_d, out_d, dnum_d, dden_d, D, b, sel, chunk,
             global_norm=False, per_state=False, eps=EPS, H=H, Wg=Wg,
             checkpoint_window_override=1)
         names = ['dq', 'dk', 'dv', 'dh', 'dlr', 'dlw', 'dkap'] + (['dWg'] if gla else [])
@@ -505,7 +520,8 @@ class TestIntraConfigEquivalence:
                 Wg = Wg_seed.clone().requires_grad_() if gla else None
                 sel = [q, k, v, h, Wr, Ww] + ([Wg] if gla else [])
                 o = C.chunk_rola_routed(q, k, v, h, Wr, Ww, D, b, norm=norm,
-                                        kappa=kap, scale=1.0, Wg=Wg)
+                                        kappa=kap, scale=1.0, Wg=Wg,
+                                        **_routed_kwargs(h, Wr, Ww, D, b, Wg=Wg))
                 grads = torch.autograd.grad((o * go).sum(), sel)
                 return o.detach(), grads
             finally:
@@ -543,12 +559,13 @@ class TestIntraConfigEquivalence:
             full = kern.configs
             kern.cache.clear()
             try:
-                ref = C.chunk_rola_routed(q, k, v, h, Wr, Ww, D, b, **kw).float()   # autotuner's pick
+                route = _routed_kwargs(h, Wr, Ww, D, b)
+                ref = C.chunk_rola_routed(q, k, v, h, Wr, Ww, D, b, **kw, **route).float()   # autotuner's pick
                 for cfg in full:
                     kern.configs = [cfg]
                     kern.cache.clear()
                     try:
-                        out = C.chunk_rola_routed(q, k, v, h, Wr, Ww, D, b, **kw).float()
+                        out = C.chunk_rola_routed(q, k, v, h, Wr, Ww, D, b, **kw, **route).float()
                     except OutOfResources:
                         continue   # the autotuner scores OOR configs as inf and skips them on this card
                     worst = max(worst, _relmax(out, ref))
@@ -573,7 +590,8 @@ class TestIntraConfigEquivalence:
         for norm in ('raw', 'global', 'per_state'):
             q, k, v, h, Wr, Ww = self._mk(dv=dv, dqk=dqk, seed=2)
             kw = dict(norm=norm, scale=1.0)
-            of = C.chunk_rola_routed(q, k, v, h, Wr, Ww, D, b, **kw).float()
+            of = C.chunk_rola_routed(q, k, v, h, Wr, Ww, D, b, **kw,
+                                     **_routed_kwargs(h, Wr, Ww, D, b)).float()
             if norm == 'raw':
                 oe = _routed_raw_ref(q.float(), k.float(), v.float(), h.float(),
                                      Wr.float(), Ww.float(), D, b, 1.0).float()
@@ -596,8 +614,9 @@ class TestIntraConfigEquivalence:
             q, k, v, h, Wr, Ww = self._mk(D=D, b=b, dtype=dt, dv=16, seed=0)
             kappa = (torch.rand(2, 64, 2, 1, device=device, dtype=dt) * 0.5 + 0.5) if norm == 'kappa' else None
             kw = dict(norm=norm, kappa=kappa, scale=1.0)
-            o_implicit = C.chunk_rola_routed(q, k, v, h, Wr, Ww, D, b, **kw)
-            o_explicit = C.chunk_rola_routed(q, k, v, h, Wr, Ww, D, b, b_r=None, b_w=None, **kw)
+            route = _routed_kwargs(h, Wr, Ww, D, b)
+            o_implicit = C.chunk_rola_routed(q, k, v, h, Wr, Ww, D, b, **kw, **route)
+            o_explicit = C.chunk_rola_routed(q, k, v, h, Wr, Ww, D, b, b_r=None, b_w=None, **kw, **route)
             diff = (o_implicit.float() - o_explicit.float()).abs().max().item()
             assert diff == 0.0, f'{norm} {dt} bias=None not bit-identical: {diff}'
 
@@ -694,7 +713,8 @@ class TestInterCorrectness:
         prod_args = [qt, kt, vt, ht, Wrt, Wwt] + ([Wgt] if gla else []) + [kapt]
 
         out = C.chunk_rola_routed(
-            qt, kt, vt, ht, Wrt, Wwt, D, b, norm='kappa', kappa=kapt, scale=scale, Wg=Wgt)
+            qt, kt, vt, ht, Wrt, Wwt, D, b, norm='kappa', kappa=kapt, scale=scale, Wg=Wgt,
+            **_routed_kwargs(ht, Wrt, Wwt, D, b, Wg=Wgt))
         grads = torch.autograd.grad(out, prod_args, go.to(out.dtype))
         prod_chunk = C._kappa_fit_chunk(Kd, V, min(64, max(16, triton.next_power_of_2(T))), BC=16)
         if gla:
@@ -731,7 +751,7 @@ class TestInterCorrectness:
         Wg = torch.zeros(H, dm, device=device, dtype=torch.bfloat16, requires_grad=True) if gla else None
         kap = (torch.rand(B, T, H, 1, device=device, generator=g) * 0.4 + 0.4).to(torch.bfloat16).requires_grad_()
         out = C.chunk_rola_routed(q, k, v, h, Wr, Ww, D, b, norm='kappa', kappa=kap, scale=Kd ** -0.5,
-                                  Wg=Wg)
+                                  Wg=Wg, **_routed_kwargs(h, Wr, Ww, D, b, Wg=Wg))
         args = [q, k, v, h, Wr, Ww] + ([Wg] if gla else []) + [kap]
         grads = torch.autograd.grad(out, args, torch.randn(out.shape, device=device, dtype=out.dtype, generator=g))
         assert torch.isfinite(out.float()).all()
@@ -910,7 +930,11 @@ class TestInterCorrectness:
             q.float(), k.float(), v.float(), h.float(), Wr.float(), Ww.float(), D, b, norm=norm,
             kappa=(kappa.float() if norm == 'kappa' else None), scale=scale,
             Wg=(Wg.float() if gla else None),
-            b_r=(b_r.float() if bias else None), b_w=(b_w.float() if bias else None))
+            b_r=(b_r.float() if bias else None), b_w=(b_w.float() if bias else None),
+            **_routed_kwargs(h.float(), Wr.float(), Ww.float(), D, b,
+                             Wg=(Wg.float() if gla else None),
+                             b_r=(b_r.float() if bias else None),
+                             b_w=(b_w.float() if bias else None)))
         gf = torch.autograd.grad(of, sel, go.float())
         # the fp64 explicit-gate reference on the canonical per-head gates (the right ref per norm/gla/bias).
         if gla:
@@ -966,7 +990,8 @@ class TestInterCorrectness:
         Ww = (torch.randn(H, D, dm, b, device=device, generator=g) * 0.5).to(torch.bfloat16)
         kappa = (torch.rand(B, T, H, 1, device=device, generator=g) * 0.6).to(torch.bfloat16)
         of = C.chunk_rola_routed(q, k, v, h, Wr, Ww, D, b, norm=norm,
-                                 kappa=(kappa if norm == 'kappa' else None), scale=scale)
+                                 kappa=(kappa if norm == 'kappa' else None), scale=scale,
+                                 **_routed_kwargs(h, Wr, Ww, D, b))
         oe = _kappa_ref_chunked(q.float(), k.float(), v.float(), h.float(), Wr.float(), Ww.float(),
                                 kappa.float(), D, b, norm, scale,
                                 min(64, max(16, triton.next_power_of_2(T))))
@@ -1037,7 +1062,8 @@ class TestStructuralGates:
         Wr = torch.randn(H, D, dm, b, device=device, generator=g)        # DISTINCT per head
         Ww = torch.randn(H, D, dm, b, device=device, generator=g)
         kw = dict(norm=norm, kappa=kap, scale=1.0)
-        o = C.chunk_rola_routed(q, k, v, h, Wr, Ww, D, b, **kw)          # [B,T,H,V]
+        o = C.chunk_rola_routed(q, k, v, h, Wr, Ww, D, b, **kw,
+                                **_routed_kwargs(h, Wr, Ww, D, b))      # [B,T,H,V]
         diffs = [(o[:, :, i] - o[:, :, j]).abs().max().item() for i in range(H) for j in range(i + 1, H)]
         assert min(diffs) > 1e-3, \
             f'per-head routing collapsed: identical inputs + DISTINCT routers gave near-identical head ' \
@@ -1045,7 +1071,8 @@ class TestStructuralGates:
         # CONTROL: broadcast head-0's router to all heads ⇒ identical inputs + router ⇒ identical out.
         Wr_s = Wr[:1].expand(H, D, dm, b).contiguous()
         Ww_s = Ww[:1].expand(H, D, dm, b).contiguous()
-        o_s = C.chunk_rola_routed(q, k, v, h, Wr_s, Ww_s, D, b, **kw)
+        o_s = C.chunk_rola_routed(q, k, v, h, Wr_s, Ww_s, D, b, **kw,
+                                  **_routed_kwargs(h, Wr_s, Ww_s, D, b))
         same = max((o_s[:, :, i] - o_s[:, :, 0]).abs().max().item() for i in range(H))
         assert same < 1e-4, f'shared-router control: head outputs should be identical, got {same:.2e}'
 
@@ -1073,14 +1100,16 @@ class TestStructuralGates:
         Ww = (torch.randn(1, D, dm, b, device=device, generator=g) * 0.8).expand(H, D, dm, b).contiguous()
         Wg = torch.randn(H, dm, device=device, generator=g) * 0.6           # DISTINCT decay weight per head
         kw = dict(norm=norm, kappa=kap, scale=1.0, Wg=Wg)
-        o = C.chunk_rola_routed(q, k, v, h, Wr, Ww, D, b, **kw)             # [B,T,H,V]
+        o = C.chunk_rola_routed(q, k, v, h, Wr, Ww, D, b, **kw,
+                                **_routed_kwargs(h, Wr, Ww, D, b, Wg=Wg))  # [B,T,H,V]
         diffs = [(o[:, :, i] - o[:, :, j]).abs().max().item() for i in range(H) for j in range(i + 1, H)]
         assert min(diffs) > 1e-3, \
             f'per-head DECAY collapsed: identical inputs + shared routers + DISTINCT Wg gave near-identical ' \
             f'head outputs (min cross-head diff {min(diffs):.2e}) — the decay weight is being SHARED'
         # CONTROL: broadcast head-0's Wg ⇒ identical inputs + router + decay ⇒ identical out.
         Wg_s = Wg[:1].expand(H, dm).contiguous()
-        o_s = C.chunk_rola_routed(q, k, v, h, Wr, Ww, D, b, **dict(kw, Wg=Wg_s))
+        o_s = C.chunk_rola_routed(q, k, v, h, Wr, Ww, D, b, **dict(kw, Wg=Wg_s),
+                                  **_routed_kwargs(h, Wr, Ww, D, b, Wg=Wg_s))
         same = max((o_s[:, :, i] - o_s[:, :, 0]).abs().max().item() for i in range(H))
         assert same < 1e-4, f'shared-Wg control: head outputs should be identical, got {same:.2e}'
 
@@ -1114,7 +1143,8 @@ class TestStructuralGates:
         def run(norm, kap=None):
             c = dict(r=r, w=w, norm=norm, kappa=kap, scale=1.0)
             od = fused_recurrent_rola(q, k, v, **c, output_final_state=True)[0].float()
-            orr = C.chunk_rola_routed(q, k, v, h, Wr, Ww, D, b, norm=norm, kappa=kap, scale=1.0).float()
+            orr = C.chunk_rola_routed(q, k, v, h, Wr, Ww, D, b, norm=norm, kappa=kap, scale=1.0,
+                                      **_routed_kwargs(h, Wr, Ww, D, b)).float()
             return od, orr
 
         od, orr = run('global')
@@ -1196,7 +1226,8 @@ class TestStructuralGates:
         torch.zeros, torch.empty = watch(real_zeros), watch(real_empty)
         try:
             o = C.chunk_rola_routed(q, k, v, h, Wr, Ww, D, b, norm=norm,
-                                    kappa=(kappa if norm == 'kappa' else None), scale=scale)
+                                    kappa=(kappa if norm == 'kappa' else None), scale=scale,
+                                    **_routed_kwargs(h, Wr, Ww, D, b))
             o.sum().backward()
         finally:
             torch.zeros, torch.empty = real_zeros, real_empty
