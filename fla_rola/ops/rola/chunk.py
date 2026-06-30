@@ -1103,20 +1103,20 @@ def _kappa_rescale(r_tile, d_tile, kap, cmask, GLOBAL: tl.constexpr,
     return tl.where(cmask[None, :], rt, 0.0)
 
 @triton.jit
-def _kappa_fwd_chunk_cb_partial(alpha_ptr, q_ptr, k_ptr, v_ptr, lr_ptr, lw_ptr, sel_ptr, kap_ptr,
-                                sval_ptr, sden_ptr, pnum_ptr, pden_ptr,
-                                L, dqk, dv, nc, t_start,
-                                sa_b, sa_l, sq_b, sq_l, sq_d, sv_b, sv_l, sv_d, sk_b, sk_l,
-                                slo_b, slo_l, slo_lvl, slo_bb, ssel_lvl, ssel_b, ssel_c,
-                                ssv_b, ssv_c, ssv_k, ssv_v, ssd_b, ssd_c, ssd_k,
-                                spn_b, spn_c, spn_t, spn_v, spd_b, spd_c, spd_t,
-                                GLOBAL: tl.constexpr, PER_STATE: tl.constexpr, EPS: tl.constexpr,
-                                D: tl.constexpr, b: tl.constexpr, BB: tl.constexpr,
-                                BT: tl.constexpr, BK: tl.constexpr, BV: tl.constexpr,
-                                BC: tl.constexpr, NCBLK: tl.constexpr, ND: tl.constexpr,
-                                NDV: tl.constexpr, NDVP: tl.constexpr,
-                                USE_G: tl.constexpr, GLA_FLOOR: tl.constexpr):
-    """State-block parallel kappa forward with fixed-order reduction scratch."""
+def _kappa_fwd_chunk_cb_atomic(alpha_ptr, q_ptr, k_ptr, v_ptr, lr_ptr, lw_ptr, sel_ptr, kap_ptr,
+                               sval_ptr, sden_ptr, num_ptr, den_ptr,
+                               L, dqk, dv, nc, t_start,
+                               sa_b, sa_l, sq_b, sq_l, sq_d, sv_b, sv_l, sv_d, sk_b, sk_l,
+                               slo_b, slo_l, slo_lvl, slo_bb, ssel_lvl, ssel_b, ssel_c,
+                               ssv_b, ssv_c, ssv_k, ssv_v, ssd_b, ssd_c, ssd_k,
+                               snm_b, snm_l, snm_v, sdn_b, sdn_l,
+                               GLOBAL: tl.constexpr, PER_STATE: tl.constexpr, EPS: tl.constexpr,
+                               D: tl.constexpr, b: tl.constexpr, BB: tl.constexpr,
+                               BT: tl.constexpr, BK: tl.constexpr, BV: tl.constexpr,
+                               BC: tl.constexpr, NCBLK: tl.constexpr, ND: tl.constexpr,
+                               NDV: tl.constexpr, NDVP: tl.constexpr,
+                               USE_G: tl.constexpr, GLA_FLOOR: tl.constexpr):
+    """State-block parallel kappa forward with fp32 atomic output accumulation."""
     pid_b = tl.program_id(0)
     cb = tl.program_id(1)
     ND_V: tl.constexpr = NDV
@@ -1168,7 +1168,7 @@ def _kappa_fwd_chunk_cb_partial(alpha_ptr, q_ptr, k_ptr, v_ptr, lr_ptr, lw_ptr, 
                            BT, BK, BC, ND, USE_G)
     rt_tile = _kappa_rescale(r_tile, d_tile, kap, cmask, GLOBAL, PER_STATE, EPS)
     o_den = tl.sum(rt_tile * d_tile, axis=1)
-    tl.store(pden_ptr + pid_b*spd_b + cb*spd_c + offs_t*spd_t, o_den, mask=rmask)
+    tl.atomic_add(den_ptr + pid_b*sdn_b + rows*sdn_l, o_den, sem="relaxed", mask=rmask)
 
     rd_inter = (rt_tile * ea) if USE_G else rt_tile
     rd_gram = (rt_tile * ea_g) if USE_G else rt_tile
@@ -1207,8 +1207,9 @@ def _kappa_fwd_chunk_cb_partial(alpha_ptr, q_ptr, k_ptr, v_ptr, lr_ptr, lw_ptr, 
 
     offs_vf = tl.arange(0, NDVP * BV)
     vfmask = offs_vf < dv
-    tl.store(pnum_ptr + pid_b*spn_b + cb*spn_c + offs_t[:, None]*spn_t + offs_vf[None, :]*spn_v,
-             tl.reshape(o_num, [BT, NDVP * BV]), mask=rmask[:, None] & vfmask[None, :])
+    tl.atomic_add(num_ptr + pid_b*snm_b + rows[:, None]*snm_l + offs_vf[None, :]*snm_v,
+                  tl.reshape(o_num, [BT, NDVP * BV]), sem="relaxed",
+                  mask=rmask[:, None] & vfmask[None, :])
 
     for d0 in range(ND):
         offs_k = d0 * BK + tl.arange(0, BK)
@@ -1225,32 +1226,6 @@ def _kappa_fwd_chunk_cb_partial(alpha_ptr, q_ptr, k_ptr, v_ptr, lr_ptr, lw_ptr, 
             tl.store(sden_ptr + pid_b*ssd_b + ck*ssd_k, deckv * sden + dsden, mask=ckmask)
         else:
             tl.store(sden_ptr + pid_b*ssd_b + ck*ssd_k, sden + dsden, mask=ckmask)
-
-
-@triton.jit
-def _kappa_fwd_reduce_partials(pnum_ptr, pden_ptr, num_ptr, den_ptr,
-                               L, dv, t_start,
-                               spn_b, spn_c, spn_t, spn_v, spd_b, spd_c, spd_t,
-                               snm_b, snm_l, snm_v, sdn_b, sdn_l,
-                               BT: tl.constexpr, BV: tl.constexpr, NCBLK: tl.constexpr):
-    pid_b = tl.program_id(0)
-    pid_v = tl.program_id(1)
-    offs_t = tl.arange(0, BT)
-    offs_v = pid_v * BV + tl.arange(0, BV)
-    rows = t_start + offs_t
-    rmask = rows < L
-    vmask = offs_v < dv
-    acc = tl.zeros([BT, BV], dtype=tl.float32)
-    dacc = tl.zeros([BT], dtype=tl.float32)
-    for cb in range(NCBLK):
-        acc += tl.load(pnum_ptr + pid_b*spn_b + cb*spn_c + offs_t[:, None]*spn_t + offs_v[None, :]*spn_v,
-                       mask=rmask[:, None] & vmask[None, :], other=0.0)
-        if pid_v == 0:
-            dacc += tl.load(pden_ptr + pid_b*spd_b + cb*spd_c + offs_t*spd_t, mask=rmask, other=0.0)
-    tl.store(num_ptr + pid_b*snm_b + rows[:, None]*snm_l + offs_v[None, :]*snm_v,
-             acc, mask=rmask[:, None] & vmask[None, :])
-    if pid_v == 0:
-        tl.store(den_ptr + pid_b*sdn_b + rows*sdn_l, dacc, mask=rmask)
 
 
 def _kappa_fit_chunk(dqk, dv, chunk, BC=16):
@@ -1344,9 +1319,6 @@ def _kappa_routed_fwd(q, k, v, alpha, lr, lw, kap, D, b, sel, chunk, global_norm
                   BK=BK, BV=BV, BC=BC, NCBLK=NCBLK, ND=ND, NDV=triton.cdiv(dv, BV),
                   NDVP=triton.next_power_of_2(triton.cdiv(dv, BV)),
                   USE_G=use_g, GLA_FLOOR=_GLA_FLOOR, num_warps=4, num_stages=1)
-    NDV = triton.cdiv(dv, BV)
-    part_num = torch.empty(B, NCBLK, chunk, dv, device=q.device, dtype=torch.float32)
-    part_den = torch.empty(B, NCBLK, chunk, device=q.device, dtype=torch.float32)
     for c in range(c_lo, c_hi):
         if need_snapshots:
             snap_val[c - c_lo].copy_(Sval)
@@ -1354,8 +1326,8 @@ def _kappa_routed_fwd(q, k, v, alpha, lr, lw, kap, D, b, sel, chunk, global_norm
         elif checkpoint_every is not None and c % checkpoint_every == 0:
             snap_val[c // checkpoint_every].copy_(Sval)
             snap_den[c // checkpoint_every].copy_(Sden)
-        _kappa_fwd_chunk_cb_partial[(B, NCBLK)](
-            alpha, q, k, v, lr, lw, sel, kap, Sval, Sden, part_num, part_den,
+        _kappa_fwd_chunk_cb_atomic[(B, NCBLK)](
+            alpha, q, k, v, lr, lw, sel, kap, Sval, Sden, num, den,
             L, dqk, dv, nc, c * chunk,
             sa[0], sa[1], q.stride(0), q.stride(1), q.stride(2),
             v.stride(0), v.stride(1), v.stride(2), kap.stride(0), kap.stride(1),
@@ -1363,16 +1335,8 @@ def _kappa_routed_fwd(q, k, v, alpha, lr, lw, kap, D, b, sel, chunk, global_norm
             sel.stride(0), sel.stride(1), sel.stride(2),
             Sval.stride(0), Sval.stride(1), Sval.stride(2), Sval.stride(3),
             Sden.stride(0), Sden.stride(1), Sden.stride(2),
-            part_num.stride(0), part_num.stride(1), part_num.stride(2), part_num.stride(3),
-            part_den.stride(0), part_den.stride(1), part_den.stride(2),
-            **common)
-        _kappa_fwd_reduce_partials[(B, NDV)](
-            part_num, part_den, num, den,
-            L, dv, c * chunk,
-            part_num.stride(0), part_num.stride(1), part_num.stride(2), part_num.stride(3),
-            part_den.stride(0), part_den.stride(1), part_den.stride(2),
             num.stride(0), num.stride(1), num.stride(2), den.stride(0), den.stride(1),
-            BT=chunk, BV=BV, NCBLK=NCBLK, num_warps=4, num_stages=1)
+            **common)
     # Return the SMEM-fitted `chunk` actually used: the backward's reverse-scan must drive the SAME chunk
     # as this recompute (NCH / per-chunk snapshot alignment) — threading it out is the single source of
     # truth (no re-fit-must-match-the-fit coupling).
