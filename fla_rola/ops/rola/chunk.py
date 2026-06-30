@@ -1323,9 +1323,10 @@ def _kappa_routed_fwd(q, k, v, alpha, lr, lw, kap, D, b, sel, chunk, global_norm
     BV = _kappa_bv_tile(dqk, dv, BC)                     # value-tile (loop ND_V) so [BC*BK,BV] fits SRAM
     BB = max(16, triton.next_power_of_2(b))
     # The [BT,BC*BK] rq/wk tiles scale with BT → the chunk is SMEM-derived (one uniform formula, fwd+bwd):
-    # the largest pow2 BT whose dominant fp32 chunk-tile fits the device budget. On a 99KB card this lands
-    # at the full 64 (the design-point win: 64 launches → 16); a smaller card steps down. Chunk-invariant
-    # scan, so a bit-identical readout at any chunk. Idempotent (the Function already capped to the ceiling).
+    # the largest pow2 BT whose dominant fp32 chunk tile plus the backward BT² live set fits the device
+    # budget. On a 99KB card this derives 32; larger-SMEM cards can keep 64 if the same formula fits.
+    # Chunk-invariant scan, so a bit-identical readout at any chunk. Idempotent (the Function already
+    # capped to the ceiling).
     chunk = _kappa_fit_chunk(dqk, dv, chunk, BC)
     NCBLK = triton.cdiv(nc, BC)
     ND = triton.cdiv(dqk, BK)
