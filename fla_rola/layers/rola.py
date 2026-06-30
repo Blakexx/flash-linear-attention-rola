@@ -103,8 +103,8 @@ class RoLA(nn.Module):
         tie_routers (bool): share one router for read+write (symmetric). Default False.
         tie_router_init (bool): untied routers, but read STARTS == write. Default False.
         router_bias (bool): bias on the routing projections. Default False.
-        use_short_conv (bool): causal depthwise short conv on projected q/k/v, routing, kappa, and GLA
-                               gate streams. Default False.
+        use_short_conv (bool): causal depthwise short conv on projected q/k/v, pre-router hidden
+                               streams, kappa, and GLA gate streams. Default False.
         conv_size (int): short-conv kernel size. Default 4.
         conv_bias (bool): bias in the short conv. Default False.
         layer_idx (int): layer index (for the KV cache). Default None.
@@ -187,10 +187,9 @@ class RoLA(nn.Module):
             self.q_conv1d = ShortConvolution(self.key_dim, conv_size, bias=conv_bias, activation='silu')
             self.k_conv1d = ShortConvolution(self.key_dim, conv_size, bias=conv_bias, activation='silu')
             self.v_conv1d = ShortConvolution(self.value_dim, conv_size, bias=conv_bias, activation='silu')
-            route_dim = num_heads * self.route_D * self.route_b
-            self.write_route_conv1d = ShortConvolution(route_dim, conv_size, bias=conv_bias, activation=None)
+            self.write_route_conv1d = ShortConvolution(hidden_size, conv_size, bias=conv_bias, activation=None)
             if not tie_routers:
-                self.read_route_conv1d = ShortConvolution(route_dim, conv_size, bias=conv_bias, activation=None)
+                self.read_route_conv1d = ShortConvolution(hidden_size, conv_size, bias=conv_bias, activation=None)
             if state_norm == 'kappa':
                 self.kappa_conv1d = ShortConvolution(num_heads, conv_size, bias=conv_bias, activation=None)
             if kernel == 'gla_scalar':
@@ -270,13 +269,6 @@ class RoLA(nn.Module):
         if bias is not None:
             z = z + bias.to(x.dtype)[None, None]                  # [H,D,b] broadcast
         return z
-
-    def _conv_factor_logits(self, logits, conv, cache, use_cache, cu_seqlens):
-        flat = rearrange(logits, 'b l h d c -> b l (h d c)')
-        flat, cache = conv(flat, cache=cache, output_final_state=use_cache, cu_seqlens=cu_seqlens)
-        logits = rearrange(flat, 'b l (h d c) -> b l h d c',
-                           h=self.num_heads, d=self.route_D, c=self.route_b)
-        return logits, cache
 
     def _gates_from_logits(self, logits):
         """Fold per-level softmax factors into the explicit [B,L,H,nc] leaf gates (the DECODE/CPU
@@ -418,19 +410,25 @@ class RoLA(nn.Module):
         else:
             Wg = None
 
+        if self.use_short_conv:
+            wx, conv_state_wl = self.write_route_conv1d(
+                x, cache=conv_state_wl, output_final_state=use_cache, cu_seqlens=cu_seqlens)
+            if self.read_W is None:
+                rx = wx
+            else:
+                rx, conv_state_rl = self.read_route_conv1d(
+                    x, cache=conv_state_rl, output_final_state=use_cache, cu_seqlens=cu_seqlens)
+        else:
+            wx = x
+            rx = x
+
         # Router z-loss is stashed from the (cheap, [L,nc]-free) per-level FACTOR logits on BOTH paths —
         # the chunk kernel never materializes the gates, so the layer computes the logits here purely for
-        # the auxiliary loss + (decode) gate folding.
-        wl = self._factor_logits(x, self.write_W, self.write_b)
-        rl = self._factor_logits(x, self.read_W, self.read_b) if self.read_W is not None else wl
-        if self.use_short_conv:
-            wl, conv_state_wl = self._conv_factor_logits(
-                wl, self.write_route_conv1d, conv_state_wl, use_cache, cu_seqlens)
-            if self.read_W is None:
-                rl = wl
-            else:
-                rl, conv_state_rl = self._conv_factor_logits(
-                    rl, self.read_route_conv1d, conv_state_rl, use_cache, cu_seqlens)
+        # the auxiliary loss + (decode) gate folding. With short conv enabled, the temporal filter is
+        # applied before the state-count-dependent router projection so route conv cost does not grow
+        # with H * D * b.
+        wl = self._factor_logits(wx, self.write_W, self.write_b)
+        rl = self._factor_logits(rx, self.read_W, self.read_b) if self.read_W is not None else wl
         self._stash_zloss(wl, rl)
 
         # The ops own dtype/autocast (their Triton autograd Functions carry @input_guard +
@@ -504,10 +502,9 @@ class RoLA(nn.Module):
         per_entry = self.feat_dim * self.head_v_dim + (self.feat_dim if self.uses_v_plus_one else 0)
         conv_state = 0
         if self.use_short_conv:
-            route_dim = self.num_heads * self.route_D * self.route_b
-            conv_state = self.conv_size * (self.key_dim + self.key_dim + self.value_dim + route_dim)
+            conv_state = self.conv_size * (self.key_dim + self.key_dim + self.value_dim + self.hidden_size)
             if self.read_W is not None:
-                conv_state += self.conv_size * route_dim
+                conv_state += self.conv_size * self.hidden_size
             if self.state_norm == 'kappa':
                 conv_state += self.conv_size * self.num_heads
             if self.kernel == 'gla_scalar':

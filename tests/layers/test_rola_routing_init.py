@@ -71,3 +71,16 @@ def test_tie_init_copies_and_bias_zero():
                  tie_router_init=True, router_bias=True)
     assert torch.equal(layer.read_W.data, layer.write_W.data)
     assert torch.count_nonzero(layer.write_b) == 0 and torch.count_nonzero(layer.read_b) == 0
+
+
+@pytest.mark.parametrize('nc', [8, 64])
+def test_short_conv_router_state_is_nc_independent(nc):
+    """Router short-conv state lives on hidden streams before the state-count-dependent projection."""
+    kwargs = dict(hidden_size=64, num_heads=2, head_k_dim=8, head_v_dim=8,
+                  states_per_head=nc, kernel='rla', state_norm='global',
+                  routing='flat', tie_routers=False, conv_size=3)
+    base = RoLA(**kwargs)
+    short = RoLA(**kwargs, use_short_conv=True)
+    delta = short.get_stats()['state_floats'] - base.get_stats()['state_floats']
+    expected = 3 * (short.key_dim + short.key_dim + short.value_dim + 2 * short.hidden_size)
+    assert delta == expected
