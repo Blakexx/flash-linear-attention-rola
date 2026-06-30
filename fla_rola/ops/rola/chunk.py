@@ -468,6 +468,27 @@ def _build_rw_tile_logits(lr_ptr, lw_ptr, sel_ptr, offs_c, cmask,
     return r_tile, w_tile
 
 
+@triton.jit
+def _build_rw_tile_probs(lr_ptr, lw_ptr, offs_c, cmask,
+                         bn, rows, rmask,
+                         slr_b, slr_l, slr_lvl, slr_bb, slw_b, slw_l, slw_lvl, slw_bb,
+                         BT: tl.constexpr, BG: tl.constexpr, BUILD_R: tl.constexpr = True):
+    """Load an already-normalized flat-router probability tile.
+
+    The progressive flat path computes the full softmax denominator over nc in torch, then streams
+    [BT,BC] probability tiles into the scan kernel. That removes the [B,L,H,nc] logit allocation while
+    preserving the exact flat softmax over all states.
+    """
+    w_tile = tl.load(lw_ptr + bn * slw_b + rows[:, None] * slw_l + offs_c[None, :] * slw_bb,
+                     mask=rmask[:, None] & cmask[None, :], other=0.0).to(tl.float32)
+    if BUILD_R:
+        r_tile = tl.load(lr_ptr + bn * slr_b + rows[:, None] * slr_l + offs_c[None, :] * slr_bb,
+                         mask=rmask[:, None] & cmask[None, :], other=0.0).to(tl.float32)
+    else:
+        r_tile = tl.full([BT, BG], 1.0, dtype=tl.float32)
+    return r_tile, w_tile
+
+
 @triton.autotune(configs=_AT_CFGS, key=_SCAN_KEY, **autotune_cache_kwargs)  # _SCAN_KEY: +USE_G (RLA/GLA split)
 @triton.jit
 def _rola_routed_fwd_intra(q_ptr, k_ptr, v_ptr, h_ptr, lr_ptr, lw_ptr, sel_ptr, wg_ptr, outa_ptr,
@@ -1120,7 +1141,7 @@ def _kappa_fwd_scan_cb_atomic(alpha_ptr, q_ptr, k_ptr, v_ptr, lr_ptr, lw_ptr, se
                               USE_G: tl.constexpr, GLA_FLOOR: tl.constexpr,
                               C_LO: tl.constexpr, NCH_LOOP: tl.constexpr,
                               NEED_SNAPSHOTS: tl.constexpr, SAVE_CHECKPOINTS: tl.constexpr,
-                              CHECKPOINT_EVERY: tl.constexpr):
+                              CHECKPOINT_EVERY: tl.constexpr, FLAT_PROBS: tl.constexpr):
     """State-block kappa forward scan: one launch loops over chunks inside each program."""
     pid_b = tl.program_id(0)
     cb = tl.program_id(1)
@@ -1178,10 +1199,17 @@ def _kappa_fwd_scan_cb_atomic(alpha_ptr, q_ptr, k_ptr, v_ptr, lr_ptr, lw_ptr, se
             G += tl.dot(qc, tl.trans(kc))
         Gc = G * causal
 
-        r_tile, w_tile = _build_rw_tile_logits(lr_ptr, lw_ptr, sel_ptr, cols, cmask,
-                                               pid_b, rows, rmask, offs_bb, bmask,
-                                               slo_b, slo_l, slo_lvl, slo_bb, slo_b, slo_l, slo_lvl, slo_bb,
-                                               ssel_lvl, ssel_b, ssel_c, D, BT, BB, BC)
+        if FLAT_PROBS:
+            r_tile, w_tile = _build_rw_tile_probs(lr_ptr, lw_ptr, offs_c, cmask,
+                                                  pid_b, rows, rmask,
+                                                  slo_b, slo_l, slo_lvl, slo_bb,
+                                                  slo_b, slo_l, slo_lvl, slo_bb,
+                                                  BT, BC)
+        else:
+            r_tile, w_tile = _build_rw_tile_logits(lr_ptr, lw_ptr, sel_ptr, cols, cmask,
+                                                   pid_b, rows, rmask, offs_bb, bmask,
+                                                   slo_b, slo_l, slo_lvl, slo_bb, slo_b, slo_l, slo_lvl, slo_bb,
+                                                   ssel_lvl, ssel_b, ssel_c, D, BT, BB, BC)
         if USE_G:
             ldc = _ld_from_w(w_tile, alpha, cmask, GLA_FLOOR)
             a = tl.cumsum(ldc, axis=0)
@@ -1281,7 +1309,7 @@ def _kappa_ckpt_window(NCH):
 
 def _kappa_routed_fwd(q, k, v, alpha, lr, lw, kap, D, b, sel, chunk, global_norm, per_state, eps,
                       H, need_snapshots=False, state_in=None, c_lo=0, c_hi=None,
-                      save_checkpoints=False, checkpoint_every_override=None):
+                      save_checkpoints=False, checkpoint_every_override=None, flat_probs=False):
     """Fused global/kappa/per_state tree-routed forward. Returns (num[B,L,BV], den[B,L], snap_val, snap_den).
     #55 snapshot modes (at most one): need_snapshots=True stores the DENSE per-chunk pre-states for chunks
     [c_lo,c_hi) (the backward's per-segment recompute); save_checkpoints=True stores only the SPARSE √NCH
@@ -1372,6 +1400,7 @@ def _kappa_routed_fwd(q, k, v, alpha, lr, lw, kap, D, b, sel, chunk, global_norm
         C_LO=c_lo, NCH_LOOP=c_hi - c_lo,
         NEED_SNAPSHOTS=need_snapshots, SAVE_CHECKPOINTS=checkpoint_every is not None,
         CHECKPOINT_EVERY=checkpoint_every or 1,
+        FLAT_PROBS=flat_probs,
         **common)
     # Return the SMEM-fitted `chunk` actually used: the backward's reverse-scan must drive the SAME chunk
     # as this recompute (NCH / per-chunk snapshot alignment) — threading it out is the single source of
@@ -2008,6 +2037,104 @@ def _kappa_routed_readout(qf, kf, vf, hf, Wr, Ww, kapf, alpha, D, b, chunk_size,
     return _RoLARoutedKappaFn.apply(qf, kf, vf, hf, lr, lw, kap, alpha, D, b, chunk_size,
                                     global_norm, per_state, eps,
                                     H if H is not None else Wr.shape[0], save_checkpoints, Wg)
+
+
+def _stream_factor_lse(x, W, bias, level, branch_block=16):
+    """logsumexp over one factor level without materializing [B,L,H,b]."""
+    B, L, _dm = x.shape
+    H, _D, _hidden, b = W.shape
+    lse = torch.full((B, L, H), -float("inf"), device=x.device, dtype=torch.float32)
+    for lo in range(0, b, branch_block):
+        hi = min(lo + branch_block, b)
+        logits = torch.einsum('bld,hdc->blhc', x, W[:, level, :, lo:hi].to(x.dtype))
+        if bias is not None:
+            logits = logits + bias[:, level, lo:hi].to(x.dtype)[None, None]
+        lse = torch.logaddexp(lse, torch.logsumexp(logits.float(), dim=-1))
+        del logits
+    return lse
+
+
+def _route_tile_probs(x, W, bias, lse_levels, cols, D, b):
+    """Leaf probability tile [B,L,H,BC] from streamed per-level normalizers."""
+    probs = None
+    for level in range(D):
+        div = b ** (D - 1 - level)
+        digits = ((cols // div) % b).to(torch.long)
+        W_sel = W[:, level, :, digits].to(x.dtype)
+        logits = torch.einsum('bld,hdc->blhc', x, W_sel)
+        if bias is not None:
+            logits = logits + bias[:, level, digits].to(x.dtype)[None, None]
+        factor = torch.exp(logits.float() - lse_levels[level].unsqueeze(-1))
+        probs = factor if probs is None else probs * factor
+    return probs
+
+
+def _fold_probs(p):
+    B, L, H, C = p.shape
+    return p.permute(0, 2, 1, 3).reshape(B * H, L, 1, C).contiguous()
+
+
+def chunk_rola_routed_tiled(q, k, v, x_write, x_read, Wr, Ww, D, b, norm='kappa',
+                            kappa=None, scale=None, eps=1e-5, b_r=None, b_w=None,
+                            Wg=None, alpha=None, branch_block=16, state_block=64):
+    """Generic progressive-router normalized chunk forward.
+
+    This streams router factors instead of materializing [B,L,H,D,b] logits. It is currently the
+    forward/prefill provider; training backward needs the matching streamed router-gradient fold.
+    """
+    if norm not in ('global', 'kappa', 'per_state'):
+        raise ValueError("chunk_rola_routed_tiled currently supports normalized CUDA norms only")
+    if norm == 'kappa' and kappa is None:
+        raise ValueError("norm='kappa' requires kappa")
+    if (b_r is None) != (b_w is None):
+        raise ValueError("routing bias: pass both b_r and b_w, or neither")
+    if (Wg is None) != (alpha is None):
+        raise ValueError("GLA tiled path requires both Wg and alpha; RLA passes neither")
+    B, T, H, K = q.shape
+    if scale is None:
+        scale = K ** -0.5
+    chunk_size = min(64, max(16, triton.next_power_of_2(T)))
+    compute_dtype = torch.get_autocast_dtype('cuda') if torch.is_autocast_enabled() else q.dtype
+
+    def fold(t):
+        return t.permute(0, 2, 1, 3).reshape(B * H, T, t.shape[-1])
+
+    def unfold(t):
+        return t.view(B, H, T, -1).permute(0, 2, 1, 3).contiguous()
+
+    qf = fold(q).to(compute_dtype) * scale
+    kf = fold(k).to(compute_dtype)
+    vf = fold(v).to(compute_dtype)
+    kapf = fold(kappa).reshape(B * H, T).contiguous() if norm == 'kappa' else qf.new_ones(B * H, T)
+    alphaf = alpha.permute(0, 2, 1).reshape(B * H, T).float().contiguous() if alpha is not None else None
+    nc = b ** D
+    Wr = Wr.to(compute_dtype)
+    Ww = Ww.to(compute_dtype)
+    if b_r is not None:
+        b_r, b_w = b_r.to(compute_dtype), b_w.to(compute_dtype)
+
+    read_lse = [_stream_factor_lse(x_read, Wr, b_r, level, branch_block) for level in range(D)]
+    write_lse = [_stream_factor_lse(x_write, Ww, b_w, level, branch_block) for level in range(D)]
+    num_acc = den_acc = None
+    for c0 in range(0, nc, state_block):
+        c1 = min(c0 + state_block, nc)
+        group = c1 - c0
+        sel = _build_sel(1, group, group, q.device)
+        cols = torch.arange(c0, c1, device=q.device)
+        rt = _route_tile_probs(x_read, Wr, b_r, read_lse, cols, D, b)
+        wt = _route_tile_probs(x_write, Ww, b_w, write_lse, cols, D, b)
+        lr_tile = _fold_probs(rt).to(compute_dtype)
+        lw_tile = _fold_probs(wt).to(compute_dtype)
+        num, den, _sv, _sd, _ck = _kappa_routed_fwd(
+            qf, kf, vf, alphaf, lr_tile, lw_tile, kapf, 1, group, sel, chunk_size,
+            norm == 'global', norm == 'per_state', eps, H, flat_probs=True)
+        num_acc = num if num_acc is None else num_acc + num
+        den_acc = den if den_acc is None else den_acc + den
+        del rt, wt, lr_tile, lw_tile, num, den
+    out = num_acc.float() / (den_acc.float().unsqueeze(-1) + eps)
+    if out.shape[1] > 0:
+        out[:, 0].copy_(vf[:, 0].float() * (den_acc.float()[:, 0] / (den_acc.float()[:, 0] + eps))[:, None])
+    return unfold(out).to(v.dtype)
 
 
 # --- GLA per-token log-decay floor — a GENUINE fp32 limit, NOT a tuning artifact (#33) ---------------

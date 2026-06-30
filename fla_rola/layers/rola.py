@@ -47,7 +47,7 @@ from einops import rearrange
 from fla_rola.layers.utils import get_layer_cache, update_layer_cache
 from fla_rola.modules import RMSNorm, ShortConvolution
 from fla_rola.ops.rola import chunk_rola_routed, fused_recurrent_rola
-from fla_rola.ops.rola.chunk import _GLA_FLOOR
+from fla_rola.ops.rola.chunk import _GLA_FLOOR, chunk_rola_routed_tiled
 
 
 def _routing_factors(routing: str, nc: int) -> tuple[int, int]:
@@ -422,14 +422,22 @@ class RoLA(nn.Module):
             wx = x
             rx = x
 
-        # Router z-loss is stashed from the (cheap, [L,nc]-free) per-level FACTOR logits on BOTH paths —
-        # the chunk kernel never materializes the gates, so the layer computes the logits here purely for
-        # the auxiliary loss + (decode) gate folding. With short conv enabled, the temporal filter is
-        # applied before the state-count-dependent router projection so route conv cost does not grow
-        # with H * D * b.
-        wl = self._factor_logits(wx, self.write_W, self.write_b)
-        rl = self._factor_logits(rx, self.read_W, self.read_b) if self.read_W is not None else wl
-        self._stash_zloss(wl, rl)
+        tiled_chunk = (
+            mode == 'chunk' and hidden_states.is_cuda and self.state_norm in ('global', 'kappa', 'per_state')
+            and not torch.is_grad_enabled() and not use_cache and self.router_zloss_coef <= 0.0
+        )
+        if tiled_chunk:
+            wl = rl = None
+            self._router_aux = None
+        else:
+            # Router z-loss is stashed from the (cheap, [L,nc]-free) per-level FACTOR logits on BOTH paths —
+            # the chunk kernel never materializes the gates, so the layer computes the logits here purely for
+            # the auxiliary loss + (decode) gate folding. With short conv enabled, the temporal filter is
+            # applied before the state-count-dependent router projection so route conv cost does not grow
+            # with H * D * b.
+            wl = self._factor_logits(wx, self.write_W, self.write_b)
+            rl = self._factor_logits(rx, self.read_W, self.read_b) if self.read_W is not None else wl
+            self._stash_zloss(wl, rl)
 
         # The ops own dtype/autocast (their Triton autograd Functions carry @input_guard +
         # @autocast_custom_fwd/bwd), so the layer no longer hand-rolls the cast. `output_final_state`
@@ -450,23 +458,31 @@ class RoLA(nn.Module):
                 raise NotImplementedError(
                     "chunk_rola_routed has no carried initial_state yet; continuation decode uses the "
                     "fused_recurrent path (auto-selected for L<=64).")
-            # CHUNK: routing logits wl/rl and scalar alpha are precomputed above. The normalized CUDA
-            # forward consumes those directly, so only raw/CPU or GLA training backward needs the full
-            # routing hidden. Keep the no-grad/inference argument compact so input guards cannot clone the
-            # expanded [B,L,H,hidden] view before the kernel wrapper sees it.
-            needs_h = (not x.is_cuda) or self.state_norm == 'raw' or (
-                torch.is_grad_enabled() and self.kernel == 'gla_scalar')
-            if needs_h:
-                h = (alpha_logits.view(B, L, H, 1) if (self.kernel == 'gla_scalar' and self.use_short_conv)
-                     else x.unsqueeze(2).expand(B, L, H, self.hidden_size))
+            if tiled_chunk:
+                out = chunk_rola_routed_tiled(
+                    qf, kf, v, wx, rx, self.write_W if self.read_W is None else self.read_W, self.write_W,
+                    D, b, norm=self.state_norm, kappa=kap, scale=1.0,
+                    b_r=(self.write_b if self.read_W is None else self.read_b), b_w=self.write_b, Wg=Wg,
+                    alpha=alpha)
+                recurrent_state = None
             else:
-                h = x.new_empty(B, L, H, 1)
-            out = chunk_rola_routed(
-                qf, kf, v, h, self.write_W if self.read_W is None else self.read_W, self.write_W,
-                D, b, norm=self.state_norm, kappa=kap, scale=1.0,
-                b_r=(self.write_b if self.read_W is None else self.read_b), b_w=self.write_b, Wg=Wg,
-                wl=wl, rl=rl, alpha=alpha)
-            recurrent_state = None
+                # CHUNK: routing logits wl/rl and scalar alpha are precomputed above. The normalized CUDA
+                # forward consumes those directly, so only raw/CPU or GLA training backward needs the full
+                # routing hidden. Keep the no-grad/inference argument compact so input guards cannot clone the
+                # expanded [B,L,H,hidden] view before the kernel wrapper sees it.
+                needs_h = (not x.is_cuda) or self.state_norm == 'raw' or (
+                    torch.is_grad_enabled() and self.kernel == 'gla_scalar')
+                if needs_h:
+                    h = (alpha_logits.view(B, L, H, 1) if (self.kernel == 'gla_scalar' and self.use_short_conv)
+                         else x.unsqueeze(2).expand(B, L, H, self.hidden_size))
+                else:
+                    h = x.new_empty(B, L, H, 1)
+                out = chunk_rola_routed(
+                    qf, kf, v, h, self.write_W if self.read_W is None else self.read_W, self.write_W,
+                    D, b, norm=self.state_norm, kappa=kap, scale=1.0,
+                    b_r=(self.write_b if self.read_W is None else self.read_b), b_w=self.write_b, Wg=Wg,
+                    wl=wl, rl=rl, alpha=alpha)
+                recurrent_state = None
             if use_cache:
                 # Prefill→decode handoff (inference only): the routed readout stays [L,nc]-free, but the
                 # FINAL recurrent state (a small [H*nc,K,V(+1)] tensor, independent of L) inherently needs
