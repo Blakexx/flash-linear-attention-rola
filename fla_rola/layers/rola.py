@@ -460,13 +460,15 @@ class RoLA(nn.Module):
                 raise NotImplementedError(
                     "chunk_rola_routed has no carried initial_state yet; continuation decode uses the "
                     "fused_recurrent path (auto-selected for L<=64).")
-            h = (alpha_logits.view(B, L, H, 1) if (self.kernel == 'gla_scalar' and self.use_short_conv)
-                 else x.unsqueeze(2).expand(B, L, H, self.hidden_size))
+            h_read = rx.unsqueeze(2).expand(B, L, H, self.hidden_size)
+            h_write = wx.unsqueeze(2).expand(B, L, H, self.hidden_size)
+            h_decay = (alpha_logits.view(B, L, H, 1) if (self.kernel == 'gla_scalar' and self.use_short_conv)
+                       else x.unsqueeze(2).expand(B, L, H, self.hidden_size))
             out = chunk_rola_routed(
-                qf, kf, v, h, self.write_W if self.read_W is None else self.read_W, self.write_W,
+                qf, kf, v, h_read, self.write_W if self.read_W is None else self.read_W, self.write_W,
                 D, b, norm=self.state_norm, kappa=kap, scale=1.0,
                 b_r=(self.write_b if self.read_W is None else self.read_b), b_w=self.write_b, Wg=Wg,
-                wl=wl, rl=rl, alpha=alpha)
+                wl=wl, rl=rl, alpha=alpha, h_w=h_write, h_g=h_decay)
             recurrent_state = None
             if use_cache:
                 # Prefill→decode handoff (inference only): the routed readout stays [L,nc]-free, but the

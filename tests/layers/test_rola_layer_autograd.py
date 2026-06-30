@@ -69,6 +69,20 @@ def test_layer_fwd_bwd_grads_flow_gla_threshold():
     _assert_grads_flow(m, x, o)
 
 
+def test_layer_fwd_bwd_grads_flow_gla_short_conv_streamed_routing():
+    """GLA + short-conv must route on the convolved read/write streams while decaying from alpha."""
+    if device != 'cuda':
+        pytest.skip('RoLA Triton kernels require CUDA')
+    torch.manual_seed(0)
+    m = RoLA(hidden_size=64, num_heads=2, head_k_dim=16, head_v_dim=16,
+             states_per_head=8, kernel='gla_scalar', state_norm='kappa',
+             routing='tree', use_short_conv=True, router_bias=True).to(device)
+    x = torch.randn(2, 96, 64, device=device, requires_grad=True)
+    out = m(x)
+    o = out[0] if isinstance(out, tuple) else out
+    _assert_grads_flow(m, x, o)
+
+
 @pytest.mark.parametrize('routing', ['square', 'tree'])   # 'flat' covered by the threshold sweep
 def test_layer_fwd_bwd_grads_flow_routings(routing):
     """The dispatch gate holds for every per-head routing topology at L=64 (RLA)."""

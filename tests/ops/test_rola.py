@@ -439,7 +439,7 @@ class TestIntraConfigEquivalence:
 
         q, k = rand(B, T, Kd, positive=True), rand(B, T, Kd, positive=True)
         v, h = rand(B, T, V), rand(B, T, dm)
-        lr, lw = rand(B, T, D, b) * 0.4, rand(B, T, D, b) * 0.4
+        Wr, Ww = rand(H, D, dm, b) * 0.4, rand(H, D, dm, b) * 0.4
         kap = torch.full((B, T), 0.5, device=device)
         Wg = torch.zeros(H, dm, device=device) if gla else None
         alpha = torch.sigmoid(torch.einsum('btm,hm->bt', h.float(), Wg.float())) if gla else None
@@ -447,11 +447,11 @@ class TestIntraConfigEquivalence:
         chunk = 64
 
         num_s, den_s, ckv_s, ckd_s, _ = C._kappa_routed_fwd(
-            q, k, v, alpha, lr, lw, kap, D, b, sel, chunk,
-            global_norm=False, per_state=False, eps=EPS, H=H, save_checkpoints=True)
+            q, k, v, h, h, Wr, Ww, alpha, kap, D, b, sel, chunk,
+            global_norm=False, per_state=False, eps=EPS, Wg=Wg, save_checkpoints=True)
         num_d, den_d, ckv_d, ckd_d, _ = C._kappa_routed_fwd(
-            q, k, v, alpha, lr, lw, kap, D, b, sel, chunk,
-            global_norm=False, per_state=False, eps=EPS, H=H, save_checkpoints=True,
+            q, k, v, h, h, Wr, Ww, alpha, kap, D, b, sel, chunk,
+            global_norm=False, per_state=False, eps=EPS, Wg=Wg, save_checkpoints=True,
             checkpoint_every_override=1)
         assert _relmax(num_s, num_d) < 1e-6
         assert _relmax(den_s, den_d) < 1e-6
@@ -467,13 +467,13 @@ class TestIntraConfigEquivalence:
         dnum_d = do / (den_d.unsqueeze(-1) + EPS)
         dden_d = -(do * out_d).sum(-1) / (den_d + EPS)
         gs = C._kappa_routed_bwd(
-            q, k, v, h, lr, lw, kap, alpha, ckv_s, ckd_s, out_s, dnum_s, dden_s, D, b, sel, chunk,
-            global_norm=False, per_state=False, eps=EPS, H=H, Wg=Wg)
+            q, k, v, h, h, h, Wr, Ww, kap, alpha, ckv_s, ckd_s, out_s, dnum_s, dden_s, D, b, sel, chunk,
+            global_norm=False, per_state=False, eps=EPS, Wg=Wg)
         gd = C._kappa_routed_bwd(
-            q, k, v, h, lr, lw, kap, alpha, ckv_d, ckd_d, out_d, dnum_d, dden_d, D, b, sel, chunk,
-            global_norm=False, per_state=False, eps=EPS, H=H, Wg=Wg,
+            q, k, v, h, h, h, Wr, Ww, kap, alpha, ckv_d, ckd_d, out_d, dnum_d, dden_d, D, b, sel, chunk,
+            global_norm=False, per_state=False, eps=EPS, Wg=Wg,
             checkpoint_window_override=1)
-        names = ['dq', 'dk', 'dv', 'dh', 'dlr', 'dlw', 'dkap'] + (['dWg'] if gla else [])
+        names = ['dq', 'dk', 'dv', 'dhr', 'dhw', 'dhg', 'dWr', 'dWw', 'dkap'] + (['dWg'] if gla else [])
         for name, sparse, dense in zip(names, gs, gd):
             assert _relmax(sparse, dense) < 2e-4, f'{name}: sparse vs dense checkpoint rel {_relmax(sparse, dense):.2e}'
 

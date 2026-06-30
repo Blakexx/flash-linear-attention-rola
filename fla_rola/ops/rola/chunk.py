@@ -406,9 +406,10 @@ def _router_head_strides(Wr, Ww, br, bw, has_bias):
 
 
 @triton.jit
-def _build_rw_tile(h_ptr, wr_ptr, ww_ptr, sel_ptr, offs_c, cmask,
+def _build_rw_tile(hr_ptr, hw_ptr, wr_ptr, ww_ptr, sel_ptr, offs_c, cmask,
                    bn, rows, rmask, offs_bb, bmask, d_model,
-                   sh_b, sh_l, sh_d, swr_lvl, swr_d, swr_b, sww_lvl, sww_d, sww_b,
+                   shr_b, shr_l, shr_d, shw_b, shw_l, shw_d,
+                   swr_lvl, swr_d, swr_b, sww_lvl, sww_d, sww_b,
                    ssel_lvl, ssel_b, ssel_c,
                    br_ptr, bw_ptr, sbr_lvl, sbr_b, sbw_lvl, sbw_b,
                    D: tl.constexpr, BT: tl.constexpr, BB: tl.constexpr,
@@ -422,15 +423,17 @@ def _build_rw_tile(h_ptr, wr_ptr, ww_ptr, sel_ptr, offs_c, cmask,
         for dm in range(NDM):
             offs_dm = dm * BD + tl.arange(0, BD)
             mmask = offs_dm < d_model
-            hc = tl.load(h_ptr + bn * sh_b + rows[:, None] * sh_l + offs_dm[None, :] * sh_d,
-                         mask=rmask[:, None] & mmask[None, :], other=0.0)
+            hwc = tl.load(hw_ptr + bn * shw_b + rows[:, None] * shw_l + offs_dm[None, :] * shw_d,
+                          mask=rmask[:, None] & mmask[None, :], other=0.0)
             ww = tl.load(ww_ptr + lvl * sww_lvl + offs_dm[:, None] * sww_d + offs_bb[None, :] * sww_b,
                          mask=mmask[:, None] & bmask[None, :], other=0.0)
-            lw += tl.dot(hc, ww)
+            lw += tl.dot(hwc, ww)
             if BUILD_R:
+                hrc = tl.load(hr_ptr + bn * shr_b + rows[:, None] * shr_l + offs_dm[None, :] * shr_d,
+                              mask=rmask[:, None] & mmask[None, :], other=0.0)
                 wr = tl.load(wr_ptr + lvl * swr_lvl + offs_dm[:, None] * swr_d + offs_bb[None, :] * swr_b,
                              mask=mmask[:, None] & bmask[None, :], other=0.0)
-                lr += tl.dot(hc, wr)
+                lr += tl.dot(hrc, wr)
         if HAS_BIAS:
             bwc = tl.load(bw_ptr + lvl * sbw_lvl + offs_bb * sbw_b, mask=bmask, other=0.0)
             lw += bwc[None, :]
@@ -1194,13 +1197,13 @@ def _kappa_rescale(r_tile, d_tile, kap, cmask, GLOBAL: tl.constexpr,
     return tl.where(cmask[None, :], rt, 0.0)
 
 @triton.jit
-def _kappa_fwd_scan_cb_atomic(alpha_ptr, q_ptr, k_ptr, v_ptr, h_ptr, wr_ptr, ww_ptr, sel_ptr, kap_ptr,
+def _kappa_fwd_scan_cb_atomic(alpha_ptr, q_ptr, k_ptr, v_ptr, hr_ptr, hw_ptr, wr_ptr, ww_ptr, sel_ptr, kap_ptr,
                               sval_ptr, sden_ptr, num_ptr, den_ptr,
                               snap_val_ptr, snap_den_ptr, br_ptr, bw_ptr,
                               L, d_model, dqk, dv, nc,
                               H, swr_head, sww_head, sbr_head, sbw_head,
                               sa_b, sa_l, sq_b, sq_l, sq_d, sv_b, sv_l, sv_d, sk_b, sk_l,
-                              sh_b, sh_l, sh_d,
+                              shr_b, shr_l, shr_d, shw_b, shw_l, shw_d,
                               swr_lvl, swr_d, swr_b, sww_lvl, sww_d, sww_b, ssel_lvl, ssel_b, ssel_c,
                               ssv_b, ssv_c, ssv_k, ssv_v, ssd_b, ssd_c, ssd_k,
                               snm_b, snm_l, snm_v, sdn_b, sdn_l,
@@ -1277,9 +1280,10 @@ def _kappa_fwd_scan_cb_atomic(alpha_ptr, q_ptr, k_ptr, v_ptr, h_ptr, wr_ptr, ww_
             G += tl.dot(qc, tl.trans(kc))
         Gc = G * causal
 
-        r_tile, w_tile = _build_rw_tile(h_ptr, wr_ptr, ww_ptr, sel_ptr, cols, cmask,
+        r_tile, w_tile = _build_rw_tile(hr_ptr, hw_ptr, wr_ptr, ww_ptr, sel_ptr, cols, cmask,
                                         pid_b, rows, rmask, offs_bb, bmask, d_model,
-                                        sh_b, sh_l, sh_d, swr_lvl, swr_d, swr_b, sww_lvl, sww_d, sww_b,
+                                        shr_b, shr_l, shr_d, shw_b, shw_l, shw_d,
+                                        swr_lvl, swr_d, swr_b, sww_lvl, sww_d, sww_b,
                                         ssel_lvl, ssel_b, ssel_c,
                                         br_ptr, bw_ptr, sbr_lvl, sbr_b, sbw_lvl, sbw_b,
                                         D, BT, BB, BC, BD, NDM, HAS_BIAS)
@@ -1380,7 +1384,7 @@ def _kappa_ckpt_window(NCH):
     return max(1, math.ceil(math.sqrt(NCH)))
 
 
-def _kappa_routed_fwd(q, k, v, h, Wr, Ww, alpha, kap, D, b, sel, chunk, global_norm, per_state, eps,
+def _kappa_routed_fwd(q, k, v, h, h_w, Wr, Ww, alpha, kap, D, b, sel, chunk, global_norm, per_state, eps,
                       b_r=None, b_w=None, Wg=None, need_snapshots=False, state_in=None, c_lo=0, c_hi=None,
                       save_checkpoints=False, checkpoint_every_override=None):
     """Fused global/kappa/per_state tree-routed forward. Returns (num[B,L,BV], den[B,L], snap_val, snap_den).
@@ -1455,7 +1459,8 @@ def _kappa_routed_fwd(q, k, v, h, Wr, Ww, alpha, kap, D, b, sel, chunk, global_n
     head = _router_head_strides(Wr, Ww, br, bw, has_bias)
     sWr = (Wr.stride(1), Wr.stride(2), Wr.stride(3))
     sWw = (Ww.stride(1), Ww.stride(2), Ww.stride(3))
-    sH = (h.stride(0), h.stride(1), h.stride(2))
+    sHr = (h.stride(0), h.stride(1), h.stride(2))
+    sHw = (h_w.stride(0), h_w.stride(1), h_w.stride(2))
     common = dict(GLOBAL=global_norm, PER_STATE=per_state, EPS=eps, D=D, b=b, BB=BB, BT=chunk,
                   BK=BK, BV=BV, BD=BD, BC=BC, NCBLK=NCBLK, ND=ND, NDV=triton.cdiv(dv, BV),
                   NDVP=triton.next_power_of_2(triton.cdiv(dv, BV)),
@@ -1470,11 +1475,11 @@ def _kappa_routed_fwd(q, k, v, h, Wr, Ww, alpha, kap, D, b, sel, chunk, global_n
         snv = (0, 0, 0, 0, 0)
         snd = (0, 0, 0, 0)
     _kappa_fwd_scan_cb_atomic[(B, NCBLK)](
-        alpha, q, k, v, h, Wr, Ww, sel, kap, Sval, Sden, num, den, snap_val_arg, snap_den_arg, br, bw,
+        alpha, q, k, v, h, h_w, Wr, Ww, sel, kap, Sval, Sden, num, den, snap_val_arg, snap_den_arg, br, bw,
         L, d_model, dqk, dv, nc, *head,
         sa[0], sa[1], q.stride(0), q.stride(1), q.stride(2),
         v.stride(0), v.stride(1), v.stride(2), kap.stride(0), kap.stride(1),
-        *sH, *sWr, *sWw,
+        *sHr, *sHw, *sWr, *sWw,
         sel.stride(0), sel.stride(1), sel.stride(2),
         Sval.stride(0), Sval.stride(1), Sval.stride(2), Sval.stride(3),
         Sden.stride(0), Sden.stride(1), Sden.stride(2),
@@ -1521,10 +1526,11 @@ def _kappa_rescale_bwd(drt_tile, r_tile, d_tile, kap, cmask,
 
 @triton.jit
 def _kappa_fold_level_weight(dr_tile, dw_tile, r_tile, w_tile, fr, fw, sel,
-                             h_ptr, wr_ptr, ww_ptr, dwr_ptr, dww_ptr, dh_ptr,
+                             hr_ptr, hw_ptr, wr_ptr, ww_ptr, dwr_ptr, dww_ptr, dhr_ptr, dhw_ptr,
                              pid_b, rows, rmask, offs_bb, bmask, d_model,
-                             sh_b, sh_l, sh_d, swr_lvl, swr_d, swr_b, sww_lvl, sww_d, sww_b,
-                             sdh_b, sdh_l, sdh_d,
+                             shr_b, shr_l, shr_d, shw_b, shw_l, shw_d,
+                             swr_lvl, swr_d, swr_b, sww_lvl, sww_d, sww_b,
+                             sdhr_b, sdhr_l, sdhr_d, sdhw_b, sdhw_l, sdhw_d,
                              sbr_lvl, sbr_b, sbw_lvl, sbw_b, dbr_ptr, dbw_ptr,
                              lvl, BT: tl.constexpr, BB: tl.constexpr,
                              BD: tl.constexpr, NDM: tl.constexpr,
@@ -1540,19 +1546,24 @@ def _kappa_fold_level_weight(dr_tile, dw_tile, r_tile, w_tile, fr, fw, sel,
     for dm in range(NDM):
         offs_dm = dm * BD + tl.arange(0, BD)
         mmask = offs_dm < d_model
-        hc = tl.load(h_ptr + pid_b * sh_b + rows[:, None] * sh_l + offs_dm[None, :] * sh_d,
-                     mask=rmask[:, None] & mmask[None, :], other=0.0)
+        hrc = tl.load(hr_ptr + pid_b * shr_b + rows[:, None] * shr_l + offs_dm[None, :] * shr_d,
+                      mask=rmask[:, None] & mmask[None, :], other=0.0)
+        hwc = tl.load(hw_ptr + pid_b * shw_b + rows[:, None] * shw_l + offs_dm[None, :] * shw_d,
+                      mask=rmask[:, None] & mmask[None, :], other=0.0)
         wr = tl.load(wr_ptr + lvl * swr_lvl + offs_dm[:, None] * swr_d + offs_bb[None, :] * swr_b,
                      mask=mmask[:, None] & bmask[None, :], other=0.0)
         ww = tl.load(ww_ptr + lvl * sww_lvl + offs_dm[:, None] * sww_d + offs_bb[None, :] * sww_b,
                      mask=mmask[:, None] & bmask[None, :], other=0.0)
         tl.atomic_add(dwr_ptr + lvl * swr_lvl + offs_dm[:, None] * swr_d + offs_bb[None, :] * swr_b,
-                      tl.dot(tl.trans(hc), dlr.to(hc.dtype)), mask=mmask[:, None] & bmask[None, :])
+                      tl.dot(tl.trans(hrc), dlr.to(hrc.dtype)), mask=mmask[:, None] & bmask[None, :])
         tl.atomic_add(dww_ptr + lvl * sww_lvl + offs_dm[:, None] * sww_d + offs_bb[None, :] * sww_b,
-                      tl.dot(tl.trans(hc), dlw.to(hc.dtype)), mask=mmask[:, None] & bmask[None, :])
-        dh_blk = tl.dot(dlr.to(wr.dtype), tl.trans(wr)) + tl.dot(dlw.to(ww.dtype), tl.trans(ww))
-        tl.atomic_add(dh_ptr + pid_b * sdh_b + rows[:, None] * sdh_l + offs_dm[None, :] * sdh_d,
-                      dh_blk, mask=rmask[:, None] & mmask[None, :])
+                      tl.dot(tl.trans(hwc), dlw.to(hwc.dtype)), mask=mmask[:, None] & bmask[None, :])
+        dhr_blk = tl.dot(dlr.to(wr.dtype), tl.trans(wr))
+        dhw_blk = tl.dot(dlw.to(ww.dtype), tl.trans(ww))
+        tl.atomic_add(dhr_ptr + pid_b * sdhr_b + rows[:, None] * sdhr_l + offs_dm[None, :] * sdhr_d,
+                      dhr_blk, mask=rmask[:, None] & mmask[None, :])
+        tl.atomic_add(dhw_ptr + pid_b * sdhw_b + rows[:, None] * sdhw_l + offs_dm[None, :] * sdhw_d,
+                      dhw_blk, mask=rmask[:, None] & mmask[None, :])
     if HAS_BIAS:
         dbr = tl.sum(tl.where(rmask[:, None], dlr, 0.0), axis=0)
         dbw = tl.sum(tl.where(rmask[:, None], dlw, 0.0), axis=0)
@@ -1561,9 +1572,10 @@ def _kappa_fold_level_weight(dr_tile, dw_tile, r_tile, w_tile, fr, fw, sel,
 
 
 @triton.jit
-def _kappa_build_factors_weight(h_ptr, wr_ptr, ww_ptr, sel_ptr, cols, cmask,
+def _kappa_build_factors_weight(hr_ptr, hw_ptr, wr_ptr, ww_ptr, sel_ptr, cols, cmask,
                                 pid_b, rows, rmask, offs_bb, bmask, d_model,
-                                sh_b, sh_l, sh_d, swr_lvl, swr_d, swr_b, sww_lvl, sww_d, sww_b,
+                                shr_b, shr_l, shr_d, shw_b, shw_l, shw_d,
+                                swr_lvl, swr_d, swr_b, sww_lvl, sww_d, sww_b,
                                 ssel_lvl, ssel_b, ssel_c,
                                 br_ptr, bw_ptr, sbr_lvl, sbr_b, sbw_lvl, sbw_b,
                                 D: tl.constexpr, BT: tl.constexpr, BB: tl.constexpr, BC: tl.constexpr,
@@ -1576,14 +1588,16 @@ def _kappa_build_factors_weight(h_ptr, wr_ptr, ww_ptr, sel_ptr, cols, cmask,
         for dm in range(NDM):
             offs_dm = dm * BD + tl.arange(0, BD)
             mmask = offs_dm < d_model
-            hc = tl.load(h_ptr + pid_b * sh_b + rows[:, None] * sh_l + offs_dm[None, :] * sh_d,
-                         mask=rmask[:, None] & mmask[None, :], other=0.0)
+            hrc = tl.load(hr_ptr + pid_b * shr_b + rows[:, None] * shr_l + offs_dm[None, :] * shr_d,
+                          mask=rmask[:, None] & mmask[None, :], other=0.0)
+            hwc = tl.load(hw_ptr + pid_b * shw_b + rows[:, None] * shw_l + offs_dm[None, :] * shw_d,
+                          mask=rmask[:, None] & mmask[None, :], other=0.0)
             wr = tl.load(wr_ptr + lvl * swr_lvl + offs_dm[:, None] * swr_d + offs_bb[None, :] * swr_b,
                          mask=mmask[:, None] & bmask[None, :], other=0.0)
             ww = tl.load(ww_ptr + lvl * sww_lvl + offs_dm[:, None] * sww_d + offs_bb[None, :] * sww_b,
                          mask=mmask[:, None] & bmask[None, :], other=0.0)
-            lr += tl.dot(hc, wr)
-            lw += tl.dot(hc, ww)
+            lr += tl.dot(hrc, wr)
+            lw += tl.dot(hwc, ww)
         if HAS_BIAS:
             brc = tl.load(br_ptr + lvl * sbr_lvl + offs_bb * sbr_b, mask=bmask, other=0.0)
             bwc = tl.load(bw_ptr + lvl * sbw_lvl + offs_bb * sbw_b, mask=bmask, other=0.0)
@@ -1606,9 +1620,10 @@ def _kappa_build_factors_weight(h_ptr, wr_ptr, ww_ptr, sel_ptr, cols, cmask,
 
 
 @triton.jit
-def _kappa_build_level_weight(h_ptr, wr_ptr, ww_ptr, sel_ptr, cols, cmask,
+def _kappa_build_level_weight(hr_ptr, hw_ptr, wr_ptr, ww_ptr, sel_ptr, cols, cmask,
                               pid_b, rows, rmask, offs_bb, bmask, d_model,
-                              sh_b, sh_l, sh_d, swr_lvl, swr_d, swr_b, sww_lvl, sww_d, sww_b,
+                              shr_b, shr_l, shr_d, shw_b, shw_l, shw_d,
+                              swr_lvl, swr_d, swr_b, sww_lvl, sww_d, sww_b,
                               ssel_lvl, ssel_b, ssel_c,
                               br_ptr, bw_ptr, sbr_lvl, sbr_b, sbw_lvl, sbw_b,
                               lvl: tl.constexpr, BT: tl.constexpr, BB: tl.constexpr,
@@ -1618,14 +1633,16 @@ def _kappa_build_level_weight(h_ptr, wr_ptr, ww_ptr, sel_ptr, cols, cmask,
     for dm in range(NDM):
         offs_dm = dm * BD + tl.arange(0, BD)
         mmask = offs_dm < d_model
-        hc = tl.load(h_ptr + pid_b * sh_b + rows[:, None] * sh_l + offs_dm[None, :] * sh_d,
-                     mask=rmask[:, None] & mmask[None, :], other=0.0)
+        hrc = tl.load(hr_ptr + pid_b * shr_b + rows[:, None] * shr_l + offs_dm[None, :] * shr_d,
+                      mask=rmask[:, None] & mmask[None, :], other=0.0)
+        hwc = tl.load(hw_ptr + pid_b * shw_b + rows[:, None] * shw_l + offs_dm[None, :] * shw_d,
+                      mask=rmask[:, None] & mmask[None, :], other=0.0)
         wr = tl.load(wr_ptr + lvl * swr_lvl + offs_dm[:, None] * swr_d + offs_bb[None, :] * swr_b,
                      mask=mmask[:, None] & bmask[None, :], other=0.0)
         ww = tl.load(ww_ptr + lvl * sww_lvl + offs_dm[:, None] * sww_d + offs_bb[None, :] * sww_b,
                      mask=mmask[:, None] & bmask[None, :], other=0.0)
-        lr += tl.dot(hc, wr)
-        lw += tl.dot(hc, ww)
+        lr += tl.dot(hrc, wr)
+        lw += tl.dot(hwc, ww)
     if HAS_BIAS:
         brc = tl.load(br_ptr + lvl * sbr_lvl + offs_bb * sbr_b, mask=bmask, other=0.0)
         bwc = tl.load(bw_ptr + lvl * sbw_lvl + offs_bb * sbw_b, mask=bmask, other=0.0)
@@ -1644,13 +1661,15 @@ def _kappa_build_level_weight(h_ptr, wr_ptr, ww_ptr, sel_ptr, cols, cmask,
 
 
 @triton.jit
-def _kappa_router_bwd_fold(h_ptr, wr_ptr, ww_ptr, sel_ptr, gdr_ptr, gdw_ptr,
-                           dh_ptr, dwr_ptr, dww_ptr, br_ptr, bw_ptr, dbr_ptr, dbw_ptr,
+def _kappa_router_bwd_fold(hr_ptr, hw_ptr, hg_ptr, wr_ptr, ww_ptr, sel_ptr, gdr_ptr, gdw_ptr,
+                           dhr_ptr, dhw_ptr, dhg_ptr, dwr_ptr, dww_ptr, br_ptr, bw_ptr, dbr_ptr, dbw_ptr,
                            wg_ptr, dwg_ptr, dld_ptr,
-                           L, d_model, nc, t_start,
+                           L, d_model, d_model_g, nc, t_start,
                            H, swr_head, sww_head, sbr_head, sbw_head,
-                           sh_b, sh_l, sh_d, swr_lvl, swr_d, swr_b, sww_lvl, sww_d, sww_b,
-                           ssel_lvl, ssel_b, ssel_c, sg_b, sg_t, sg_c, sdh_b, sdh_l, sdh_d,
+                           shr_b, shr_l, shr_d, shw_b, shw_l, shw_d, shg_b, shg_l, shg_d,
+                           swr_lvl, swr_d, swr_b, sww_lvl, sww_d, sww_b,
+                           ssel_lvl, ssel_b, ssel_c, sg_b, sg_t, sg_c,
+                           sdhr_b, sdhr_l, sdhr_d, sdhw_b, sdhw_l, sdhw_d, sdhg_b, sdhg_l, sdhg_d,
                            swg_head, swg_d, sdld_b, sdld_t, sdld_c,
                            sbr_lvl, sbr_b, sbw_lvl, sbw_b,
                            D: tl.constexpr, b: tl.constexpr, BB: tl.constexpr,
@@ -1678,15 +1697,16 @@ def _kappa_router_bwd_fold(h_ptr, wr_ptr, ww_ptr, sel_ptr, gdr_ptr, gdw_ptr,
     rows = t_start + offs_t
     rmask = rows < L
     if USE_G:
-        alpha = _build_alpha(h_ptr, wg_ptr, pid_b, rows, rmask, d_model,
-                             sh_b, sh_l, sh_d, swg_d, BT, BD, NDM)
+        alpha = _build_alpha(hg_ptr, wg_ptr, pid_b, rows, rmask, d_model_g,
+                             shg_b, shg_l, shg_d, swg_d, BT, BD, NDM)
         dz = tl.zeros([BT], dtype=tl.float32)
     cols = cb * BC + offs_c
     cmask = cols < nc
     r_tile, w_tile = _kappa_build_factors_weight(
-        h_ptr, wr_ptr, ww_ptr, sel_ptr, cols, cmask,
+        hr_ptr, hw_ptr, wr_ptr, ww_ptr, sel_ptr, cols, cmask,
         pid_b, rows, rmask, offs_bb, bmask, d_model,
-        sh_b, sh_l, sh_d, swr_lvl, swr_d, swr_b, sww_lvl, sww_d, sww_b,
+        shr_b, shr_l, shr_d, shw_b, shw_l, shw_d,
+        swr_lvl, swr_d, swr_b, sww_lvl, sww_d, sww_b,
         ssel_lvl, ssel_b, ssel_c,
         br_ptr, bw_ptr, sbr_lvl, sbr_b, sbw_lvl, sbw_b,
         D, BT, BB, BC, BD, NDM, HAS_BIAS)
@@ -1710,39 +1730,42 @@ def _kappa_router_bwd_fold(h_ptr, wr_ptr, ww_ptr, sel_ptr, gdr_ptr, gdw_ptr,
         dz += tl.sum(dld * (w_tile / m), axis=1) * (alpha * (1.0 - alpha))
     for lvl in tl.static_range(0, D):
         fr, fw, sel = _kappa_build_level_weight(
-            h_ptr, wr_ptr, ww_ptr, sel_ptr, cols, cmask,
+            hr_ptr, hw_ptr, wr_ptr, ww_ptr, sel_ptr, cols, cmask,
             pid_b, rows, rmask, offs_bb, bmask, d_model,
-            sh_b, sh_l, sh_d, swr_lvl, swr_d, swr_b, sww_lvl, sww_d, sww_b,
+            shr_b, shr_l, shr_d, shw_b, shw_l, shw_d,
+            swr_lvl, swr_d, swr_b, sww_lvl, sww_d, sww_b,
             ssel_lvl, ssel_b, ssel_c,
             br_ptr, bw_ptr, sbr_lvl, sbr_b, sbw_lvl, sbw_b,
             lvl, BT, BB, BD, NDM, HAS_BIAS)
         _kappa_fold_level_weight(
             dr_tile, dw_tile, r_tile, w_tile, fr, fw, sel,
-            h_ptr, wr_ptr, ww_ptr, dwr_ptr, dww_ptr, dh_ptr,
+            hr_ptr, hw_ptr, wr_ptr, ww_ptr, dwr_ptr, dww_ptr, dhr_ptr, dhw_ptr,
             pid_b, rows, rmask, offs_bb, bmask, d_model,
-            sh_b, sh_l, sh_d, swr_lvl, swr_d, swr_b, sww_lvl, sww_d, sww_b,
-            sdh_b, sdh_l, sdh_d,
+            shr_b, shr_l, shr_d, shw_b, shw_l, shw_d,
+            swr_lvl, swr_d, swr_b, sww_lvl, sww_d, sww_b,
+            sdhr_b, sdhr_l, sdhr_d, sdhw_b, sdhw_l, sdhw_d,
             sbr_lvl, sbr_b, sbw_lvl, sbw_b, dbr_ptr, dbw_ptr,
             lvl, BT, BB, BD, NDM, HAS_BIAS)
     if USE_G:
         for dm in range(NDM):
             offs_dm = dm * BD + tl.arange(0, BD)
             mmask = offs_dm < d_model
-            hc = tl.load(h_ptr + pid_b * sh_b + rows[:, None] * sh_l + offs_dm[None, :] * sh_d,
+            hc = tl.load(hg_ptr + pid_b * shg_b + rows[:, None] * shg_l + offs_dm[None, :] * shg_d,
                          mask=rmask[:, None] & mmask[None, :], other=0.0)
             wgc = tl.load(wg_ptr + offs_dm * swg_d, mask=mmask, other=0.0)
             dzc = tl.where(rmask, dz, 0.0)
             tl.atomic_add(dwg_ptr + offs_dm * swg_d, tl.sum(hc * dzc[:, None], axis=0), mask=mmask)
-            tl.atomic_add(dh_ptr + pid_b * sdh_b + rows[:, None] * sdh_l + offs_dm[None, :] * sdh_d,
+            tl.atomic_add(dhg_ptr + pid_b * sdhg_b + rows[:, None] * sdhg_l + offs_dm[None, :] * sdhg_d,
                           dzc[:, None] * wgc[None, :], mask=rmask[:, None] & mmask[None, :])
 
 
 @triton.jit
-def _kappa_bwd_state(h_ptr, k_ptr, v_ptr, wr_ptr, ww_ptr, sel_ptr, wg_ptr, sval_ptr, sden_ptr,
+def _kappa_bwd_state(hr_ptr, hw_ptr, hg_ptr, k_ptr, v_ptr, wr_ptr, ww_ptr, sel_ptr, wg_ptr, sval_ptr, sden_ptr,
                      dsval_ptr, dsden_ptr, dk_ptr, dv_ptr, gdw_ptr, gda_ptr, br_ptr, bw_ptr,
-                     L, d_model, dqk, dv, nc, t_start,
+                     L, d_model, d_model_g, dqk, dv, nc, t_start,
                      H, swr_head, sww_head, sbr_head, sbw_head,
-                     sh_b, sh_l, sh_d, sq_b, sq_l, sq_d, sv_b, sv_l, sv_d,
+                     shr_b, shr_l, shr_d, shw_b, shw_l, shw_d, shg_b, shg_l, shg_d,
+                     sq_b, sq_l, sq_d, sv_b, sv_l, sv_d,
                      swr_lvl, swr_d, swr_b, sww_lvl, sww_d, sww_b, ssel_lvl, ssel_b, ssel_c,
                      swg_head, swg_d,
                      ssv_b, ssv_k, ssv_v, ssd_b, ssd_k, sgd_b, sgd_t, sgd_c, sga_b, sga_l, sga_c,
@@ -1778,14 +1801,15 @@ def _kappa_bwd_state(h_ptr, k_ptr, v_ptr, wr_ptr, ww_ptr, sel_ptr, wg_ptr, sval_
     bw_ptr = bw_ptr + _hd * sbw_head
     wg_ptr = wg_ptr + _hd * swg_head            # per-head decay weight (read-only here; #45)
     if USE_G:                                   # per-head decay gate alpha[BT], once (in-kernel ld, #45)
-        alpha = _build_alpha(h_ptr, wg_ptr, pid_b, rows, rmask, d_model,
-                             sh_b, sh_l, sh_d, swg_d, BT, BD, NDM)
+        alpha = _build_alpha(hg_ptr, wg_ptr, pid_b, rows, rmask, d_model_g,
+                             shg_b, shg_l, shg_d, swg_d, BT, BD, NDM)
     cb = tl.program_id(1)
     cols = cb * BC + offs_c
     cmask = cols < nc
-    _r, w_tile = _build_rw_tile(h_ptr, wr_ptr, ww_ptr, sel_ptr, cols, cmask,
+    _r, w_tile = _build_rw_tile(hr_ptr, hw_ptr, wr_ptr, ww_ptr, sel_ptr, cols, cmask,
                                 pid_b, rows, rmask, offs_bb, bmask, d_model,
-                                sh_b, sh_l, sh_d, swr_lvl, swr_d, swr_b, sww_lvl, sww_d, sww_b,
+                                shr_b, shr_l, shr_d, shw_b, shw_l, shw_d,
+                                swr_lvl, swr_d, swr_b, sww_lvl, sww_d, sww_b,
                                 ssel_lvl, ssel_b, ssel_c,
                                 br_ptr, bw_ptr, sbr_lvl, sbr_b, sbw_lvl, sbw_b,
                                 D, BT, BB, BC, BD, NDM, HAS_BIAS, BUILD_R=False)
@@ -1863,13 +1887,14 @@ def _kappa_bwd_state(h_ptr, k_ptr, v_ptr, wr_ptr, ww_ptr, sel_ptr, wg_ptr, sval_
 
 
 @triton.jit
-def _kappa_bwd_read(h_ptr, q_ptr, k_ptr, v_ptr, wr_ptr, ww_ptr, sel_ptr, kap_ptr, wg_ptr,
+def _kappa_bwd_read(hr_ptr, hw_ptr, hg_ptr, q_ptr, k_ptr, v_ptr, wr_ptr, ww_ptr, sel_ptr, kap_ptr, wg_ptr,
                     sval_ptr, sden_ptr, dnum_ptr, dden_ptr,
                     dsval_ptr, dsden_ptr, dq_ptr, dk_ptr, dv_ptr, dkap_ptr, gdr_ptr, gdw_ptr, gda_ptr,
                     br_ptr, bw_ptr,
-                    L, d_model, dqk, dv, nc, t_start,
+                    L, d_model, d_model_g, dqk, dv, nc, t_start,
                     H, swr_head, sww_head, sbr_head, sbw_head,
-                    sh_b, sh_l, sh_d, sq_b, sq_l, sq_d, sv_b, sv_l, sv_d, sk_b, sk_l,
+                    shr_b, shr_l, shr_d, shw_b, shw_l, shw_d, shg_b, shg_l, shg_d,
+                    sq_b, sq_l, sq_d, sv_b, sv_l, sv_d, sk_b, sk_l,
                     swr_lvl, swr_d, swr_b, sww_lvl, sww_d, sww_b, ssel_lvl, ssel_b, ssel_c,
                     swg_head, swg_d,
                     ssv_b, ssv_k, ssv_v, ssd_b, ssd_k,
@@ -1910,8 +1935,8 @@ def _kappa_bwd_read(h_ptr, q_ptr, k_ptr, v_ptr, wr_ptr, ww_ptr, sel_ptr, kap_ptr
     bw_ptr = bw_ptr + _hd * sbw_head
     wg_ptr = wg_ptr + _hd * swg_head            # per-head decay weight (read-only here; #45)
     if USE_G:                                   # per-head decay gate alpha[BT], once (in-kernel ld, #45)
-        alpha = _build_alpha(h_ptr, wg_ptr, pid_b, rows, rmask, d_model,
-                             sh_b, sh_l, sh_d, swg_d, BT, BD, NDM)
+        alpha = _build_alpha(hg_ptr, wg_ptr, pid_b, rows, rmask, d_model_g,
+                             shg_b, shg_l, shg_d, swg_d, BT, BD, NDM)
     kap = tl.load(kap_ptr + pid_b*sk_b + rows*sk_l, mask=rmask, other=0.0)
     dden = tl.load(dden_ptr + pid_b*sdd_b + rows*sdd_l, mask=rmask, other=0.0)
     causal = ((offs_t[:, None] >= offs_t[None, :]) & rmask[:, None] & rmask[None, :]).to(tl.float32)
@@ -1933,9 +1958,10 @@ def _kappa_bwd_read(h_ptr, q_ptr, k_ptr, v_ptr, wr_ptr, ww_ptr, sel_ptr, kap_ptr
     cb = tl.program_id(1)
     cols = cb * BC + offs_c
     cmask = cols < nc
-    r_tile, w_tile = _build_rw_tile(h_ptr, wr_ptr, ww_ptr, sel_ptr, cols, cmask,
+    r_tile, w_tile = _build_rw_tile(hr_ptr, hw_ptr, wr_ptr, ww_ptr, sel_ptr, cols, cmask,
                                     pid_b, rows, rmask, offs_bb, bmask, d_model,
-                                    sh_b, sh_l, sh_d, swr_lvl, swr_d, swr_b, sww_lvl, sww_d, sww_b,
+                                    shr_b, shr_l, shr_d, shw_b, shw_l, shw_d,
+                                    swr_lvl, swr_d, swr_b, sww_lvl, sww_d, sww_b,
                                     ssel_lvl, ssel_b, ssel_c,
                                     br_ptr, bw_ptr, sbr_lvl, sbr_b, sbw_lvl, sbw_b,
                                     D, BT, BB, BC, BD, NDM, HAS_BIAS)
@@ -2087,7 +2113,7 @@ def _kappa_bwd_read(h_ptr, q_ptr, k_ptr, v_ptr, wr_ptr, ww_ptr, sel_ptr, kap_ptr
     tl.atomic_add(dkap_ptr + pid_b*sk_b + rows*sk_l, dkap_acc, mask=rmask)
 
 
-def _kappa_routed_bwd(q, k, v, h, Wr, Ww, kap, alpha, ckpt_val, ckpt_den, out, dnum, dden,
+def _kappa_routed_bwd(q, k, v, h, h_w, h_g, Wr, Ww, kap, alpha, ckpt_val, ckpt_den, out, dnum, dden,
                       D, b, sel, chunk, global_norm, per_state, eps, b_r=None, b_w=None, Wg=None,
                       checkpoint_window_override=None):
     """Reverse chunk-scan backward for the fused global/kappa/per_state path. Carries dSval,dSden
@@ -2104,6 +2130,7 @@ def _kappa_routed_bwd(q, k, v, h, Wr, Ww, kap, alpha, ckpt_val, ckpt_den, out, d
     the decay's write-gate grad. Wg=None is RLA (byte-identical; gda/dld unused)."""
     use_g = Wg is not None
     B, L, d_model = h.shape
+    d_model_g = h_g.shape[-1]
     dqk = q.shape[-1]
     dv = v.shape[-1]
     nc = b ** D
@@ -2127,6 +2154,8 @@ def _kappa_routed_bwd(q, k, v, h, Wr, Ww, kap, alpha, ckpt_val, ckpt_den, out, d
     dk = torch.zeros(B, L, dqk, device=q.device, dtype=torch.float32)
     dvv = torch.zeros(B, L, dv, device=q.device, dtype=torch.float32)
     dh = torch.zeros(B, L, d_model, device=q.device, dtype=torch.float32)
+    dhw = torch.zeros(B, L, d_model, device=q.device, dtype=torch.float32)
+    dhg = torch.zeros(B, L, d_model_g, device=q.device, dtype=torch.float32)
     dWr = torch.zeros(H, D, d_model, b, device=q.device, dtype=torch.float32)
     dWw = torch.zeros(H, D, d_model, b, device=q.device, dtype=torch.float32)
     dWg = torch.zeros(H, d_model, device=q.device, dtype=torch.float32)   # per-head decay-weight grad (#45)
@@ -2153,6 +2182,8 @@ def _kappa_routed_bwd(q, k, v, h, Wr, Ww, kap, alpha, ckpt_val, ckpt_den, out, d
     sB = (q.stride(0), q.stride(1), q.stride(2))
     sV = (v.stride(0), v.stride(1), v.stride(2))
     sH = (h.stride(0), h.stride(1), h.stride(2))
+    sHw = (h_w.stride(0), h_w.stride(1), h_w.stride(2))
+    sHg = (h_g.stride(0), h_g.stride(1), h_g.stride(2))
     sWr = (Wr.stride(1), Wr.stride(2), Wr.stride(3))
     sWw = (Ww.stride(1), Ww.stride(2), Ww.stride(3))
     sSel = (sel.stride(0), sel.stride(1), sel.stride(2))
@@ -2185,7 +2216,7 @@ def _kappa_routed_bwd(q, k, v, h, Wr, Ww, kap, alpha, ckpt_val, ckpt_den, out, d
             seg = c // W
             seg_lo, seg_hi = seg * W, min(seg * W + W, NCH)
             _sn, _sd, seg_val, seg_den, _sc = _kappa_routed_fwd(
-                q, k, v, h, Wr, Ww, alpha if use_g else None, kap, D, b, sel, chunk,
+                q, k, v, h, h_w, Wr, Ww, alpha if use_g else None, kap, D, b, sel, chunk,
                 global_norm, per_state, eps,
                 b_r=br if has_bias else None, b_w=bw if has_bias else None, Wg=Wg if use_g else None,
                 need_snapshots=True,
@@ -2196,16 +2227,16 @@ def _kappa_routed_bwd(q, k, v, h, Wr, Ww, kap, alpha, ckpt_val, ckpt_den, out, d
         # K1: state-update bwd (reads adjoint of Sval_{j+1}/Sden_{j+1}; produces dk,dv + state half of dw +
         # the USE_G carry/w_end da-pieces, using the chunk-start snapshot Sval_j/Sden_j for the Λ-coupling).
         _kappa_bwd_state[(B, NCBLK)](
-            h, k, v, Wr, Ww, sel, Wg, Sval, Sden, dSval, dSden, dk, dvv, gdw, gda, br, bw,
-            L, d_model, dqk, dv, nc, c * chunk, *head,
-            *sH, *sB, *sV, *sWr, *sWw, *sSel, swg[0], swg[1], *sSV, *sSD, *sGD, *sga, *sBias,
+            h, h_w, h_g, k, v, Wr, Ww, sel, Wg, Sval, Sden, dSval, dSden, dk, dvv, gdw, gda, br, bw,
+            L, d_model, d_model_g, dqk, dv, nc, c * chunk, *head,
+            *sH, *sHw, *sHg, *sB, *sV, *sWr, *sWw, *sSel, swg[0], swg[1], *sSV, *sSD, *sGD, *sga, *sBias,
             **state_common)
         # K2: readout/den/d bwd (adds dw, produces dr,dq,dv-intra,dkappa; folds dSval/dSden adjoints).
         _kappa_bwd_read[(B, NCBLK)](
-            h, q, k, v, Wr, Ww, sel, kap, Wg, Sval, Sden, dnum, dden,
+            h, h_w, h_g, q, k, v, Wr, Ww, sel, kap, Wg, Sval, Sden, dnum, dden,
             dSval, dSden, dq, dk, dvv, dkap, gdr, gdw, gda, br, bw,
-            L, d_model, dqk, dv, nc, c * chunk, *head,
-            *sH, *sB, *sV, kap.stride(0), kap.stride(1), *sWr, *sWw, *sSel, swg[0], swg[1], *sSV, *sSD,
+            L, d_model, d_model_g, dqk, dv, nc, c * chunk, *head,
+            *sH, *sHw, *sHg, *sB, *sV, kap.stride(0), kap.stride(1), *sWr, *sWw, *sSel, swg[0], swg[1], *sSV, *sSD,
             dnum.stride(0), dnum.stride(1), dnum.stride(2), dden.stride(0), dden.stride(1), *sGD, *sga,
             *sBias,
             **read_common)
@@ -2213,10 +2244,13 @@ def _kappa_routed_bwd(q, k, v, h, Wr, Ww, kap, alpha, ckpt_val, ckpt_den, out, d
         # the cuBLAS GEMM-backward in torch. USE_G reverse-cumsums gda in-kernel, then splits dld → dWg +
         # decay dh + decay write-grad.
         _kappa_router_bwd_fold[(B, NCBLK)](
-            h, Wr, Ww, sel, gdr, gdw, dh, dWr, dWw, br, bw, dbr, dbw,
+            h, h_w, h_g, Wr, Ww, sel, gdr, gdw, dh, dhw, dhg, dWr, dWw, br, bw, dbr, dbw,
             Wg, dWg, gda,
-            L, d_model, nc, c * chunk, *head, *sH, *sWr, *sWw, *sSel,
-            gdr.stride(0), gdr.stride(1), gdr.stride(2), dh.stride(0), dh.stride(1), dh.stride(2),
+            L, d_model, d_model_g, nc, c * chunk, *head, *sH, *sHw, *sHg, *sWr, *sWw, *sSel,
+            gdr.stride(0), gdr.stride(1), gdr.stride(2),
+            dh.stride(0), dh.stride(1), dh.stride(2),
+            dhw.stride(0), dhw.stride(1), dhw.stride(2),
+            dhg.stride(0), dhg.stride(1), dhg.stride(2),
             swg[0], swg[1], *sga, *sBias,
             D=D, b=b, BB=BB, BT=chunk, BC=BC, BD=BD, NDM=NDM,
             HAS_BIAS=has_bias, USE_G=use_g, GLA_FLOOR=_GLA_FLOOR, DLD_FROM_GDA=use_g,
@@ -2227,8 +2261,8 @@ def _kappa_routed_bwd(q, k, v, h, Wr, Ww, kap, alpha, ckpt_val, ckpt_den, out, d
         # residual d_0^c * <dnum_0, v_0 - out_0>, instead of relying on fp32 cancellation between the
         # numerator and denominator contributions. This touches only [B,nc] token-0 gates, never [L,nc].
         with torch.no_grad():
-            def first_token_gates(W, bias):
-                h0 = h[:, 0].to(W.dtype).reshape(B // H, H, h.shape[-1])
+            def first_token_gates(h_src, W, bias):
+                h0 = h_src[:, 0].to(W.dtype).reshape(B // H, H, h_src.shape[-1])
                 logits = torch.einsum('bhd,hkdc->bhkc', h0, W)
                 if bias is not None:
                     logits = logits + bias[None]
@@ -2243,19 +2277,19 @@ def _kappa_routed_bwd(q, k, v, h, Wr, Ww, kap, alpha, ckpt_val, ckpt_den, out, d
                     leaves.append(g_leaf)
                 return torch.stack(leaves, dim=-1)
 
-            r0 = first_token_gates(Wr, br if has_bias else None)
-            w0 = first_token_gates(Ww, bw if has_bias else None)
+            r0 = first_token_gates(h, Wr, br if has_bias else None)
+            w0 = first_token_gates(h_w, Ww, bw if has_bias else None)
             d0 = (q[:, 0].float() * k[:, 0].float()).sum(-1, keepdim=True) * w0
             rt0 = r0 * (d0 + eps).pow(-kap[:, 0, None].float())
             z0 = (dnum[:, 0].float() * (v[:, 0].float() - out[:, 0].float())).sum(-1)
             dkap[:, 0].copy_(((-rt0 * d0 * (d0 + eps).log()).sum(-1) * z0).to(dkap.dtype))
     if has_bias:
         if use_g:
-            return (dq[..., :dqk], dk[..., :dqk], dvv[..., :dv], dh, dWr, dWw, dkap, dWg, dbr, dbw)
-        return (dq[..., :dqk], dk[..., :dqk], dvv[..., :dv], dh, dWr, dWw, dkap, dbr, dbw)
+            return (dq[..., :dqk], dk[..., :dqk], dvv[..., :dv], dh, dhw, dhg, dWr, dWw, dkap, dWg, dbr, dbw)
+        return (dq[..., :dqk], dk[..., :dqk], dvv[..., :dv], dh, dhw, dhg, dWr, dWw, dkap, dbr, dbw)
     if use_g:
-        return (dq[..., :dqk], dk[..., :dqk], dvv[..., :dv], dh, dWr, dWw, dkap, dWg)
-    return (dq[..., :dqk], dk[..., :dqk], dvv[..., :dv], dh, dWr, dWw, dkap)
+        return (dq[..., :dqk], dk[..., :dqk], dvv[..., :dv], dh, dhw, dhg, dWr, dWw, dkap, dWg)
+    return (dq[..., :dqk], dk[..., :dqk], dvv[..., :dv], dh, dhw, dhg, dWr, dWw, dkap)
 
 
 class _RoLARoutedKappaFn(torch.autograd.Function):
@@ -2266,7 +2300,7 @@ class _RoLARoutedKappaFn(torch.autograd.Function):
     @staticmethod
     @input_guard
     @autocast_custom_fwd
-    def forward(ctx, q, k, v, h, Wr, Ww, kap, alpha, D, b, chunk, global_norm, per_state, eps,
+    def forward(ctx, q, k, v, h, h_w, h_g, Wr, Ww, kap, alpha, D, b, chunk, global_norm, per_state, eps,
                 save_checkpoints=False, b_r=None, b_w=None, Wg=None):
         cap = _CHUNK if Wg is not None else _CHUNK_FWD
         chunk = cap if chunk is None else min(chunk, cap)
@@ -2277,7 +2311,7 @@ class _RoLARoutedKappaFn(torch.autograd.Function):
         use_g = alpha is not None
         if use_g != (Wg is not None):
             raise ValueError("GLA kappa requires both precomputed `alpha` and `Wg`; RLA passes neither.")
-        q, k, v, h, Wr, Ww, kap = (x.contiguous() for x in (q, k, v, h, Wr, Ww, kap))
+        q, k, v, h, h_w, h_g, Wr, Ww, kap = (x.contiguous() for x in (q, k, v, h, h_w, h_g, Wr, Ww, kap))
         br, bw, has_bias = _routing_bias(b_r, b_w, Wr.shape[0], D, b, q.device, dtype=q.dtype)
         alphac = alpha.contiguous() if use_g else q.new_empty(1, 1)
         Wgc = Wg.contiguous() if Wg is not None else None
@@ -2291,13 +2325,13 @@ class _RoLARoutedKappaFn(torch.autograd.Function):
             q, k, v, kap = (x.float().contiguous() for x in (q, k, v, kap))
             alphaf = alphac.float().contiguous() if use_g else None
             Wgc = Wgc.float().contiguous() if Wgc is not None else None
-            num, den, ckv, ckd, _ck = _kappa_routed_fwd(q, k, v, h, Wr, Ww, alphaf, kap, D, b, sel, chunk,
+            num, den, ckv, ckd, _ck = _kappa_routed_fwd(q, k, v, h, h_w, Wr, Ww, alphaf, kap, D, b, sel, chunk,
                                                         global_norm, per_state, eps,
                                                         b_r=br if has_bias else None,
                                                         b_w=bw if has_bias else None, Wg=Wgc,
                                                         save_checkpoints=True)
         else:
-            num, den, _sv, _sd, _ck = _kappa_routed_fwd(q, k, v, h, Wr, Ww, alphac if use_g else None, kap,
+            num, den, _sv, _sd, _ck = _kappa_routed_fwd(q, k, v, h, h_w, Wr, Ww, alphac if use_g else None, kap,
                                                         D, b, sel, chunk, global_norm, per_state, eps,
                                                         b_r=br if has_bias else None,
                                                         b_w=bw if has_bias else None, Wg=Wgc)
@@ -2314,7 +2348,7 @@ class _RoLARoutedKappaFn(torch.autograd.Function):
         # #45: the GLA decay's saved activation is the [H,d_model] Wg (NOT a [L,nc] ld) — the saved-act win.
         # Save fp32 out/den so backward owns the normalization and can avoid the worst dκ num/den
         # cancellation at the custom autograd boundary.
-        ctx.save_for_backward(q, k, v, h, Wr, Ww, kap, alphac, br, bw, Wgc, ckv, ckd, out, den_f)
+        ctx.save_for_backward(q, k, v, h, h_w, h_g, Wr, Ww, kap, alphac, br, bw, Wgc, ckv, ckd, out, den_f)
         ctx.D, ctx.b, ctx.chunk = D, b, chunk
         ctx.global_norm, ctx.per_state, ctx.eps = global_norm, per_state, eps
         ctx.q_dtype = q_dtype
@@ -2327,7 +2361,7 @@ class _RoLARoutedKappaFn(torch.autograd.Function):
     @input_guard
     @autocast_custom_bwd
     def backward(ctx, do):
-        q, k, v, h, Wr, Ww, kap, alpha, br, bw, Wg, ckpt_val, ckpt_den, out, den = ctx.saved_tensors
+        q, k, v, h, h_w, h_g, Wr, Ww, kap, alpha, br, bw, Wg, ckpt_val, ckpt_den, out, den = ctx.saved_tensors
         use_g = ctx.use_g
         D, b, chunk = ctx.D, ctx.b, ctx.chunk
         global_norm, per_state, eps = ctx.global_norm, ctx.per_state, ctx.eps
@@ -2337,7 +2371,7 @@ class _RoLARoutedKappaFn(torch.autograd.Function):
         # F4: the routing LOGITS lr/lw stay in their input dtype (bf16) — the router build is a bounded
         # softmax (the kernels upcast to fp32 internally). q/k/v/kap keep fp32 (den/decay-sensitive path).
         q, k, v, kap = (x.float().contiguous() for x in (q, k, v, kap))
-        h, Wr, Ww = (x.contiguous() for x in (h, Wr, Ww))
+        h, h_w, h_g, Wr, Ww = (x.contiguous() for x in (h, h_w, h_g, Wr, Ww))
         Wgf = Wg.float().contiguous() if use_g else None
         # #55: _kappa_routed_bwd re-fits the chunk from the ctx ceiling via the shared _kappa_fit_chunk
         # (idempotent → same chunk + NCH + window as the forward), then recomputes each segment's snapshots
@@ -2348,19 +2382,20 @@ class _RoLARoutedKappaFn(torch.autograd.Function):
         dnum = do / den_e
         dden = -(do * out).sum(-1) / (den + eps)
         grads = _kappa_routed_bwd(
-            q, k, v, h, Wr, Ww, kap, alpha.float().contiguous() if use_g else None,
+            q, k, v, h, h_w, h_g, Wr, Ww, kap, alpha.float().contiguous() if use_g else None,
             ckpt_val, ckpt_den, out.float(), dnum, dden,
             D, b, sel, chunk, global_norm, per_state, eps,
             b_r=br if ctx.has_bias else None, b_w=bw if ctx.has_bias else None, Wg=Wgf)
-        dq, dk, dv, dh, dWr, dWw, dkap = grads[:7]
-        dWg = grads[7] if use_g else None
-        bias_offset = 8 if use_g else 7
+        dq, dk, dv, dh, dhw, dhg, dWr, dWw, dkap = grads[:9]
+        dWg = grads[9] if use_g else None
+        bias_offset = 10 if use_g else 9
         dbr = grads[bias_offset] if ctx.has_bias else None
         dbw = grads[bias_offset + 1] if ctx.has_bias else None
         q_dtype = ctx.q_dtype
         h_dtype = ctx.h_dtype
-        # forward arg order: q,k,v,h,Wr,Ww,kap,alpha,D,b,chunk,global_norm,per_state,eps,save_checkpoints,b_r,b_w,Wg
+        # forward arg order: q,k,v,h,h_w,h_g,Wr,Ww,kap,alpha,D,b,chunk,global_norm,per_state,eps,save_checkpoints,b_r,b_w,Wg
         return (dq.to(q_dtype), dk.to(q_dtype), dv.to(q_dtype), dh.to(h_dtype),
+                dhw.to(h_w.dtype), dhg.to(h_g.dtype),
                 dWr.to(Wr.dtype), dWw.to(Ww.dtype), dkap.to(q_dtype), None,
                 None, None, None, None, None, None,
                 None,
@@ -2369,7 +2404,7 @@ class _RoLARoutedKappaFn(torch.autograd.Function):
                 None if dWg is None else dWg.to(Wg.dtype))
 
 
-def _kappa_routed_readout(qf, kf, vf, hf, Wr, Ww, kapf, alpha, D, b, chunk_size,
+def _kappa_routed_readout(qf, kf, vf, hf, hfw, hfg, Wr, Ww, kapf, alpha, D, b, chunk_size,
                           global_norm, per_state, eps, b_r=None, b_w=None, Wg=None,
                           lr=None, lw=None, H=None):
     """Fused global/kappa/per_state tree-routed readout returning normalized out[BH,L,V],
@@ -2380,10 +2415,10 @@ def _kappa_routed_readout(qf, kf, vf, hf, Wr, Ww, kapf, alpha, D, b, chunk_size,
     kap = kapf.reshape(qf.shape[0], qf.shape[1]).contiguous()    # [BH,L]
     if (alpha is None) != (Wg is None):
         raise ValueError("GLA kappa path requires both precomputed `alpha` and `Wg`; RLA passes neither.")
-    ckpt_inputs = (qf, kf, vf, hf, Wr, Ww, kap, alpha, b_r, b_w, Wg)
+    ckpt_inputs = (qf, kf, vf, hf, hfw, hfg, Wr, Ww, kap, alpha, b_r, b_w, Wg)
     save_checkpoints = torch.is_grad_enabled() and any(
         t is not None and t.requires_grad for t in ckpt_inputs)
-    return _RoLARoutedKappaFn.apply(qf, kf, vf, hf, Wr, Ww, kap, alpha, D, b, chunk_size,
+    return _RoLARoutedKappaFn.apply(qf, kf, vf, hf, hfw, hfg, Wr, Ww, kap, alpha, D, b, chunk_size,
                                     global_norm, per_state, eps, save_checkpoints, b_r, b_w, Wg)
 
 
@@ -2634,7 +2669,7 @@ def _rola_routed_readout(qf, kf, vf, hf, Wr, Ww, D, b, chunk_size, b_r=None, b_w
 
 @input_guard
 def chunk_rola_routed(q, k, v, h, Wr, Ww, D, b, norm='kappa', kappa=None, scale=None, eps=1e-5,
-                      b_r=None, b_w=None, Wg=None, wl=None, rl=None, alpha=None):
+                      b_r=None, b_w=None, Wg=None, wl=None, rl=None, alpha=None, h_w=None, h_g=None):
     """TREE-ROUTED RoLA (in-kernel routing) readout with built-in normalization. DIFFERENTIABLE
     end-to-end. ALL norms (incl. the production 'kappa'/'per_state') are fully fused — the [L,nc]
     gates, the per-state den d, the rescaled read gate r̃, AND (GLA) the per-state log-decay ld are
@@ -2689,6 +2724,8 @@ def chunk_rola_routed(q, k, v, h, Wr, Ww, D, b, norm='kappa', kappa=None, scale=
     def foldc(t):
         return fold(t).to(compute_dtype)
 
+    h_w = h if h_w is None else h_w
+    h_g = h if h_g is None else h_g
     qf, kf, vf = foldc(q) * scale, foldc(k), foldc(v)
     Wr = Wr.to(compute_dtype)
     Ww = Ww.to(compute_dtype)
@@ -2704,6 +2741,8 @@ def chunk_rola_routed(q, k, v, h, Wr, Ww, D, b, norm='kappa', kappa=None, scale=
     alphaf = fold3(alpha) if alpha is not None else None
 
     hf = foldc(h)
+    hfw = foldc(h_w)
+    hfg = foldc(h_g)
 
     def folded_logits():
         if wl is None or rl is None:
@@ -2728,7 +2767,7 @@ def chunk_rola_routed(q, k, v, h, Wr, Ww, D, b, norm='kappa', kappa=None, scale=
         # `global` is `kappa` with the rescale skipped (r̃=r): same in-kernel den machinery (the carried
         # Sden^c den state + transient [BT,nc] d), den D_i=Σ_c r^c d^c, never a [L,nc] gate/den/r̃ buffer.
         kapf = fold(kappa) if norm == 'kappa' else qf.new_ones(qf.shape[0], qf.shape[1], 1)
-        out = _kappa_routed_readout(qf, kf, vf, hf, Wr, Ww, kapf.to(compute_dtype), alphaf, D, b,
+        out = _kappa_routed_readout(qf, kf, vf, hf, hfw, hfg, Wr, Ww, kapf.to(compute_dtype), alphaf, D, b,
                                     chunk_size, global_norm=(norm == 'global'),
                                     per_state=(norm == 'per_state'), eps=eps,
                                     b_r=b_r, b_w=b_w, Wg=Wgf, H=H)
