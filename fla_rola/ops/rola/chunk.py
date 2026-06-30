@@ -458,7 +458,17 @@ def _build_rw_tile(hr_ptr, hw_ptr, wr_ptr, ww_ptr, sel_ptr, offs_c, cmask,
     return r_tile, w_tile
 
 
-def _router_logits(h, Wr, Ww, b_r, b_w, H, build_r=True):
+def _router_logits_one(h, W, bias, H):
+    BH, L, dm = h.shape
+    Bb = BH // H
+    hr = h.reshape(Bb, H, L, dm)
+    z = torch.einsum('bhld,hkdc->bhlkc', hr, W.to(h.dtype))        # [B,H,L,D,b]
+    if bias is not None:
+        z = z + bias.to(h.dtype)[None, :, None]                    # [H,D,b] -> [1,H,1,D,b]
+    return z.reshape(BH, L, W.shape[1], W.shape[3]).contiguous()   # [BH,L,D,b]
+
+
+def _router_logits(h, Wr, Ww, b_r, b_w, H, build_r=True, h_w=None):
     """F2b: the per-level routing logits lr,lw ∈ [BH, L, D, b] = (h·Wr+b_r, h·Ww+b_w) — the cuBLAS GEMM
     that REPLACES the in-kernel h·W d_model-contraction (the design-point kernel's 72%). h is the folded
     [BH, L, d_model] (BH=(B,H)); Wr,Ww ∈ [H,D,d_model,b] per-head; bias ∈ [H,D,b] or None. Returns the
@@ -468,17 +478,9 @@ def _router_logits(h, Wr, Ww, b_r, b_w, H, build_r=True):
     h/Wr/Ww require grad (F2b backward routes dWr/dWw/dh through this GEMM).
     For tree/square the logits are tiny ([L, 2·logₙc] / [L, 2√nc]); flat's are [L,1,nc] (=[L,nc], flat's
     inherent routing cost — a topology/config choice, not a kernel branch)."""
-    BH, L, dm = h.shape
-    Bb = BH // H
-    hr = h.reshape(Bb, H, L, dm)
-
-    def _lg(W, bias):
-        z = torch.einsum('bhld,hkdc->bhlkc', hr, W.to(h.dtype))        # [B,H,L,D,b]
-        if bias is not None:
-            z = z + bias.to(h.dtype)[None, :, None]                    # [H,D,b] -> [1,H,1,D,b]
-        return z.reshape(BH, L, W.shape[1], W.shape[3]).contiguous()   # [BH,L,D,b]
-    lw = _lg(Ww, b_w)
-    lr = _lg(Wr, b_r) if build_r else None
+    hw = h if h_w is None else h_w
+    lw = _router_logits_one(hw, Ww, b_w, H)
+    lr = _router_logits_one(h, Wr, b_r, H) if build_r else None
     return lr, lw
 
 
@@ -2648,14 +2650,15 @@ def _ld_from_Wg_torch(hf, wf, Wg, H):
 
 
 def _rola_routed_readout(qf, kf, vf, hf, Wr, Ww, D, b, chunk_size, b_r=None, b_w=None, Wg=None,
-                         lr=None, lw=None, H=None):
+                         lr=None, lw=None, H=None, h_gf=None):
     """Folded tree-routed numerator-only readout. CUDA → in-kernel routed Triton kernels (gates AND the
     GLA decay ld never materialized); else → eager core on explicit gates (CPU reference path). Optional
     bias b_r/b_w. Optional per-head decay weight Wg:[H,d_model] (GLA) → the decayed routed readout; Wg=None
     is RLA. lr,lw:[BH,L,D,b] may be passed precomputed (the layer dedup)."""
+    h_decay = hf if h_gf is None else h_gf
     if qf.is_cuda:
         if Wg is not None:
-            return rola_gla_routed_triton(qf, kf, vf, hf, Wr, Ww, Wg, D, b, chunk=chunk_size,
+            return rola_gla_routed_triton(qf, kf, vf, h_decay, Wr, Ww, Wg, D, b, chunk=chunk_size,
                                           b_r=b_r, b_w=b_w, lr=lr, lw=lw, H=H)
         return rola_rla_routed_triton(qf, kf, vf, hf, Wr, Ww, D, b, chunk=chunk_size, b_r=b_r, b_w=b_w,
                                       lr=lr, lw=lw, H=H)
@@ -2663,7 +2666,7 @@ def _rola_routed_readout(qf, kf, vf, hf, Wr, Ww, D, b, chunk_size, b_r=None, b_w
         raise ValueError("chunk_rola_routed raw CPU path requires precomputed `rl` and `wl` logits.")
     r = _gates_from_factor_logits(lr, D, b)
     w = _gates_from_factor_logits(lw, D, b)
-    ld = _ld_from_Wg_torch(hf, w, Wg, Wr.shape[0]) if Wg is not None else None
+    ld = _ld_from_Wg_torch(h_decay, w, Wg, Wr.shape[0]) if Wg is not None else None
     return _rola_chunk_core(qf, kf, vf, w, r, ld, chunk_size)
 
 
@@ -2746,7 +2749,7 @@ def chunk_rola_routed(q, k, v, h, Wr, Ww, D, b, norm='kappa', kappa=None, scale=
 
     def folded_logits():
         if wl is None or rl is None:
-            return _router_logits(hf, Wr, Ww, b_r, b_w, H, build_r=True)
+            return _router_logits(hf, Wr, Ww, b_r, b_w, H, build_r=True, h_w=hfw)
 
         def fold5(t):   # [B,T,H,D,b] -> [B*H,T,D,b]
             return t.permute(0, 2, 1, 3, 4).reshape(B * H, T, t.shape[-2], t.shape[-1]).to(compute_dtype)
@@ -2755,7 +2758,8 @@ def chunk_rola_routed(q, k, v, h, Wr, Ww, D, b, norm='kappa', kappa=None, scale=
     if norm == 'raw':
         lr, lw = folded_logits()
         return unfold(_rola_routed_readout(qf, kf, vf, hf, Wr, Ww, D, b, chunk_size,
-                                           b_r=b_r, b_w=b_w, Wg=Wgf, lr=lr, lw=lw, H=H)).to(v.dtype)
+                                           b_r=b_r, b_w=b_w, Wg=Wgf, lr=lr, lw=lw, H=H,
+                                           h_gf=hfg)).to(v.dtype)
 
     # 'kappa'/'per_state': the production read-gate rescale r̃ = r·(d+ε)^{−κ} | r/(d+ε), where the
     # per-state den d_i^c = Σ_{j≤i} (φq_i·φk_j) w_j^c. The FUSED path (`_kappa_routed_readout`) computes

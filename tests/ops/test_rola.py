@@ -1195,6 +1195,33 @@ class TestStructuralGates:
             'clamp-mode must warn'
 
     # ---- no-[*,L,nc]-materialization allocation watches (the saved-activation win) -------------------
+    def test_raw_split_streams_match_precomputed_logits(self):
+        """Raw GLA must use separate read, write, and decay streams when logits are built internally."""
+        if device != 'cuda':
+            pytest.skip('RoLA Triton kernels require CUDA')
+        torch.manual_seed(0)
+        B, T, H, Kd, V, dm, D, b = 1, 24, 2, 16, 16, 5, 2, 3
+        q = (torch.nn.functional.elu(torch.randn(B, T, H, Kd, device=device)) + 1.0).to(torch.bfloat16)
+        k = (torch.nn.functional.elu(torch.randn(B, T, H, Kd, device=device)) + 1.0).to(torch.bfloat16)
+        v = torch.randn(B, T, H, V, device=device, dtype=torch.bfloat16)
+        h_read = torch.randn(B, T, H, dm, device=device, dtype=torch.bfloat16)
+        h_write = torch.randn(B, T, H, dm, device=device, dtype=torch.bfloat16)
+        h_decay = torch.randn(B, T, H, dm, device=device, dtype=torch.bfloat16)
+        Wr = (torch.randn(H, D, dm, b, device=device) * 0.2).to(torch.bfloat16)
+        Ww = (torch.randn(H, D, dm, b, device=device) * 0.2).to(torch.bfloat16)
+        Wg = (torch.randn(H, dm, device=device) * 0.2).to(torch.float32)
+
+        rl = torch.einsum('bthm,hdmc->bthdc', h_read, Wr)
+        wl = torch.einsum('bthm,hdmc->bthdc', h_write, Ww)
+        alpha = torch.sigmoid(torch.einsum('bthm,hm->bth', h_decay.float(), Wg))
+        streamed = C.chunk_rola_routed(q, k, v, h_read, Wr, Ww, D, b, norm='raw',
+                                       scale=1.0, Wg=Wg, alpha=alpha,
+                                       h_w=h_write, h_g=h_decay)
+        explicit = C.chunk_rola_routed(q, k, v, h_read, Wr, Ww, D, b, norm='raw',
+                                       scale=1.0, Wg=Wg, wl=wl, rl=rl, alpha=alpha,
+                                       h_w=h_write, h_g=h_decay)
+        assert _relmax(streamed, explicit) < 2e-4
+
     @pytest.mark.parametrize('norm', ['global', 'kappa', 'per_state'])
     def test_kappa_routed_no_LNC_materialization(self, norm):
         """No [*,L,nc] d / r̃ / gate buffer is ever allocated in the fused global/kappa/per_state path
