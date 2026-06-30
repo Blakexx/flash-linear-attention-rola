@@ -1200,7 +1200,7 @@ def _kappa_fwd_scan_cb_atomic(alpha_ptr, q_ptr, k_ptr, v_ptr, lr_ptr, lw_ptr, se
         Gc = G * causal
 
         if FLAT_PROBS:
-            r_tile, w_tile = _build_rw_tile_probs(lr_ptr, lw_ptr, offs_c, cmask,
+            r_tile, w_tile = _build_rw_tile_probs(lr_ptr, lw_ptr, cols, cmask,
                                                   pid_b, rows, rmask,
                                                   slo_b, slo_l, slo_lvl, slo_bb,
                                                   slo_b, slo_l, slo_lvl, slo_bb,
