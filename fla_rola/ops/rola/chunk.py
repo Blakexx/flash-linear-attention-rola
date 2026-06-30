@@ -1102,43 +1102,39 @@ def _kappa_rescale(r_tile, d_tile, kap, cmask, GLOBAL: tl.constexpr,
             rt = r_tile * tl.exp(-kap[:, None] * tl.log(de))
     return tl.where(cmask[None, :], rt, 0.0)
 
-
 @triton.jit
-def _kappa_fwd_chunk(alpha_ptr, q_ptr, k_ptr, v_ptr, lr_ptr, lw_ptr, sel_ptr, kap_ptr,
-                     sval_ptr, sden_ptr, num_ptr, den_ptr,
-                     L, dqk, dv, nc, t_start,
-                     sa_b, sa_l, sq_b, sq_l, sq_d, sv_b, sv_l, sv_d, sk_b, sk_l,
-                     slo_b, slo_l, slo_lvl, slo_bb, ssel_lvl, ssel_b, ssel_c,
-                     ssv_b, ssv_c, ssv_k, ssv_v, ssd_b, ssd_c, ssd_k,
-                     snm_b, snm_l, snm_v, sdn_b, sdn_l,
-                     GLOBAL: tl.constexpr, PER_STATE: tl.constexpr, EPS: tl.constexpr,
-                     D: tl.constexpr, b: tl.constexpr, BB: tl.constexpr,
-                     BT: tl.constexpr, BK: tl.constexpr, BV: tl.constexpr,
-                     BC: tl.constexpr, NCBLK: tl.constexpr, ND: tl.constexpr,
-                     NDV: tl.constexpr, NDVP: tl.constexpr,
-                     USE_G: tl.constexpr, GLA_FLOOR: tl.constexpr):
-    """Fused global/kappa/per_state chunk: builds r,w,d,r_tilde transiently per nc-block, accumulates num +
-    den, carries Sval[k,v] AND Sden[k] across chunks. One program per batch. Mirrors the proto chunk
-    kernel + the den pre-pass, with the read gate rescaled by the transient per-state den.
-    USE_G (GLA): per-state log-decay ld → the DECAYED scan (mirrors `_rola_routed_fwd_inter` USE_G +
-    `naive_rola_gla_perstate_den`): per nc-block a=cumsum(ld), Λ=chunk-total; the readout rt=r̃·e^a, the
-    intra gram wt=w·e^{-a}, the state writes w_end=w·e^{Λ-a}, the Sval AND Sden carries decay by e^Λ, and
-    the per-state den d carries decay via `_kappa_d_tile`. The kap rescale wraps the UNDECAYED r (its d is
-    already decayed); the den reduction o_den=Σ_c r̃^c d^c uses that UNDECAYED r̃ (e^a is readout-only)."""
+def _kappa_fwd_chunk_cb_group(alpha_ptr, q_ptr, k_ptr, v_ptr, lr_ptr, lw_ptr, sel_ptr, kap_ptr,
+                              sval_ptr, sden_ptr, pnum_ptr, pden_ptr,
+                              L, dqk, dv, nc, t_start,
+                              sa_b, sa_l, sq_b, sq_l, sq_d, sv_b, sv_l, sv_d, sk_b, sk_l,
+                              slo_b, slo_l, slo_lvl, slo_bb, ssel_lvl, ssel_b, ssel_c,
+                              ssv_b, ssv_c, ssv_k, ssv_v, ssd_b, ssd_c, ssd_k,
+                              spn_b, spn_g, spn_t, spn_v, spd_b, spd_g, spd_t,
+                              GLOBAL: tl.constexpr, PER_STATE: tl.constexpr, EPS: tl.constexpr,
+                              D: tl.constexpr, b: tl.constexpr, BB: tl.constexpr,
+                              BT: tl.constexpr, BK: tl.constexpr, BV: tl.constexpr,
+                              BC: tl.constexpr, NCBLK: tl.constexpr, ND: tl.constexpr,
+                              NDV: tl.constexpr, NDVP: tl.constexpr, GCB: tl.constexpr,
+                              USE_G: tl.constexpr, GLA_FLOOR: tl.constexpr):
+    """Grouped state-block forward.
+
+    One program owns GCB consecutive nc-blocks. This reuses the same G=qk^T across the group and locally
+    reduces those blocks before writing one group partial. A second small kernel reduces group partials.
+    """
     pid_b = tl.program_id(0)
-    ND_V: tl.constexpr = NDV         # value-blocks (BV is the value TILE; ND_V==1 ⇒ the un-tiled kernel) —
-    #                                  a constexpr (F2a) so the cb-outer value accumulators can be unrolled.
+    pid_g = tl.program_id(1)
+    ND_V: tl.constexpr = NDV
     offs_t = tl.arange(0, BT)
     offs_bb = tl.arange(0, BB)
     offs_c = tl.arange(0, BC)
     bmask = offs_bb < b
     rows = t_start + offs_t
     rmask = rows < L
-    if USE_G:                                    # precomputed per-head scalar decay gate alpha[BT]
+    if USE_G:
         alpha = tl.load(alpha_ptr + pid_b * sa_b + rows * sa_l, mask=rmask, other=1.0)
     kap = tl.load(kap_ptr + pid_b*sk_b + rows*sk_l, mask=rmask, other=0.0)
     causal = (offs_t[:, None] >= offs_t[None, :]) & rmask[:, None] & rmask[None, :]
-    # content gram G = q·kᵀ accumulated over BK-feature-blocks (so the [BT,BK] q/k tiles stay <=64).
+
     G = tl.zeros([BT, BT], dtype=tl.float32)
     for d0 in range(ND):
         offs_k = d0 * BK + tl.arange(0, BK)
@@ -1149,10 +1145,13 @@ def _kappa_fwd_chunk(alpha_ptr, q_ptr, k_ptr, v_ptr, lr_ptr, lw_ptr, sel_ptr, ka
                      mask=rmask[:, None] & kmask[None, :], other=0.0)
         G += tl.dot(qc, tl.trans(kc))
     Gc = G * causal
-    # ---- Pass 1 (value-free): global den o_den = Σ_c r̃^c d^c (read carried-in Sden; do NOT update it
-    # yet — Pass 2 re-reads it for the same d). The [BC*BK,*] / [BT,BC*BK] tiles avoid the BV axis here.
+
     o_den = tl.zeros([BT], dtype=tl.float32)
-    for cb in range(NCBLK):
+    o_num = tl.zeros([BT, NDVP, BV], dtype=tl.float32)
+    vbidx = tl.arange(0, NDVP)
+
+    for gi in range(GCB):
+        cb = pid_g * GCB + gi
         cols = cb * BC + offs_c
         cmask = cols < nc
         r_tile, w_tile = _build_rw_tile_logits(lr_ptr, lw_ptr, sel_ptr, cols, cmask,
@@ -1162,43 +1161,11 @@ def _kappa_fwd_chunk(alpha_ptr, q_ptr, k_ptr, v_ptr, lr_ptr, lw_ptr, sel_ptr, ka
         if USE_G:
             ldc = _ld_from_w(w_tile, alpha, cmask, GLA_FLOOR)
             a = tl.cumsum(ldc, axis=0)
+            Lam = tl.sum(tl.where(offs_t[:, None] == (BT - 1), a, 0.0), axis=0)
             ea, ea_g, ena_g = _decay_factors(a)
-        else:
-            ea = w_tile * 0.0 + 1.0
-            ea_g = ea
-            ena_g = ea
-        d_tile = _kappa_d_tile(q_ptr, sden_ptr, Gc, w_tile, ea, ea_g, ena_g, cols, cmask,
-                               pid_b, rows, rmask, dqk, sq_b, sq_l, sq_d, ssd_b, ssd_k,
-                               BT, BK, BC, ND, USE_G)
-        rt_tile = _kappa_rescale(r_tile, d_tile, kap, cmask, GLOBAL, PER_STATE, EPS)
-        o_den += tl.sum(rt_tile * d_tile, axis=1)
-    # ---- Pass 2 (value-tiled): numerator num = intra (A·v) + inter (Σ_c r̃^c q·Sval^c), AND the Sval
-    # state write — value-tiled over ND_V blocks so the [BC*BK,BV] state slice stays bounded by BK·BV.
-    # F2a: state-block OUTER / value-block INNER (mirrors the backward's cb-outer/vb-inner structure). The
-    # router build + d/rescale/A — ALL value-FREE — are computed ONCE per state-block (cb) and reused across
-    # the value-blocks, instead of being rebuilt ×ND_V inside the vb loop. Each value-block keeps its OWN
-    # running num accumulator: a SINGLE [BT, ND_V, BV] tile (value-block on the middle axis) persisted across
-    # the unrolled cb loop. Each intra/inter term for value-block vb is added to slice vb via a masked
-    # `tl.where`, in the SAME per-token order as the old vb-outer fold (per vb: cb0-intra, cb0-inter…,
-    # cb1-intra, … — independent of vb's loop position) → byte-identical output. A fixed-shape 3D tile is
-    # used because Triton's jit rejects Python list/tuple/append containers of per-vb accumulators.
-    o_num = tl.zeros([BT, NDVP, BV], dtype=tl.float32)   # NDVP=next_pow2(ND_V) — Triton block dims pow2;
-    vbidx = tl.arange(0, NDVP)                            # the pad slices [ND_V,NDVP) stay 0, never stored.
-    for cb in range(NCBLK):
-        cols = cb * BC + offs_c
-        cmask = cols < nc
-        r_tile, w_tile = _build_rw_tile_logits(lr_ptr, lw_ptr, sel_ptr, cols, cmask,
-                                               pid_b, rows, rmask, offs_bb, bmask,
-                                               slo_b, slo_l, slo_lvl, slo_bb, slo_b, slo_l, slo_lvl, slo_bb,
-                                               ssel_lvl, ssel_b, ssel_c, D, BT, BB, BC)
-        if USE_G:
-            ldc = _ld_from_w(w_tile, alpha, cmask, GLA_FLOOR)
-            a = tl.cumsum(ldc, axis=0)
-            Lam = tl.sum(tl.where(offs_t[:, None] == (BT - 1), a, 0.0), axis=0)   # [BC] chunk-total
-            ea, ea_g, ena_g = _decay_factors(a)
-            wt = w_tile * ena_g                        # intra gram write, ANCHORED (no e^{-a} overflow)
-            w_end = w_tile * tl.exp(Lam[None, :] - a)   # state write w·e^{Λ-a} (e^{Λ-a}≤1, already bounded)
-            dec_c = tl.exp(Lam)                         # [BC] per-c carry e^Λ (≤1, bounded)
+            wt = w_tile * ena_g
+            w_end = w_tile * tl.exp(Lam[None, :] - a)
+            dec_c = tl.exp(Lam)
         else:
             ea = w_tile * 0.0 + 1.0
             ea_g = ea
@@ -1209,24 +1176,19 @@ def _kappa_fwd_chunk(alpha_ptr, q_ptr, k_ptr, v_ptr, lr_ptr, lw_ptr, sel_ptr, ka
                                pid_b, rows, rmask, dqk, sq_b, sq_l, sq_d, ssd_b, ssd_k,
                                BT, BK, BC, ND, USE_G)
         rt_tile = _kappa_rescale(r_tile, d_tile, kap, cmask, GLOBAL, PER_STATE, EPS)
-        rd_inter = (rt_tile * ea) if USE_G else rt_tile     # readout vs abs-decayed Sval carry: TRUE e^a (≤1)
-        rd_gram = (rt_tile * ea_g) if USE_G else rt_tile     # intra gram read: ANCHORED (pairs with wt's ena_g)
-        # numerator intra: A = G⊙(r̃·wᵀ)⊙causal; o_num += A·v. (GLA: decayed rd_gram·wtᵀ.) Value-free → once/cb.
-        # The decayed gram Rg has finite causal entries but +inf in its (masked-out) anti-causal triangle
-        # (e^{a_i-a_j}, i<j, overflows fp32 for large BT) → `tl.where(causal, Rg, 0)` SELECTS the zero (never
-        # forms inf·0=NaN); bit-identical to `Rg*causal` whenever Rg is finite.
+        o_den += tl.sum(rt_tile * d_tile, axis=1)
+
+        rd_inter = (rt_tile * ea) if USE_G else rt_tile
+        rd_gram = (rt_tile * ea_g) if USE_G else rt_tile
         Rg = tl.dot(rd_gram, tl.trans(wt))
         A = G * tl.where(causal, Rg, 0.0)
         for vb in range(ND_V):
             offs_v = vb * BV + tl.arange(0, BV)
             vmask = offs_v < dv
-            sel_vb = (vbidx[None, :, None] == vb)        # [1,ND_V,1] one-hot select of slice vb
+            sel_vb = (vbidx[None, :, None] == vb)
             vc = tl.load(v_ptr + pid_b*sv_b + rows[:, None]*sv_l + offs_v[None, :]*sv_d,
                          mask=rmask[:, None] & vmask[None, :], other=0.0)
-            # intra: A·v added to o_num's value-block vb (each term added in the old fold order → bit-exact).
             o_num += tl.where(sel_vb, tl.dot(A.to(vc.dtype), vc)[:, None, :], 0.0)
-            # numerator inter Σ_c r̃^c (q·Sval^c) + the Sval write (Sval^c += Σ wᶜ k⊗v); both index dqk →
-            # loop BK-blocks. rt_tile/w_tile [BT,BC] dqk-free, reused; the [BC*BK,BV] sval slice fits.
             for d0 in range(ND):
                 offs_k = d0 * BK + tl.arange(0, BK)
                 kmask = offs_k < dqk
@@ -1237,41 +1199,18 @@ def _kappa_fwd_chunk(alpha_ptr, q_ptr, k_ptr, v_ptr, lr_ptr, lw_ptr, sel_ptr, ka
                 ck = tl.reshape(cols[:, None] * dqk + offs_k[None, :], [BC * BK])
                 ckmask = tl.reshape(cmask[:, None] & kmask[None, :], [BC * BK])
                 sflat = tl.load(sval_ptr + pid_b*ssv_b + ck[:, None]*ssv_k + offs_v[None, :]*ssv_v,
-                                mask=ckmask[:, None] & vmask[None, :], other=0.0)        # [BC*BK,BV]
+                                mask=ckmask[:, None] & vmask[None, :], other=0.0)
                 rq = tl.reshape(rd_inter[:, :, None] * qc[:, None, :], [BT, BC * BK])
                 o_num += tl.where(sel_vb, tl.dot(rq.to(sflat.dtype), sflat)[:, None, :], 0.0)
                 wk = tl.reshape(w_end[:, :, None] * kc[:, None, :], [BT, BC * BK])
                 if USE_G:
-                    # per-(c,k) carry: broadcast dec_c[BC] over BK feature rows of each c → [BC*BK].
                     deckv = tl.reshape(dec_c[:, None] * tl.full([BC, BK], 1.0, tl.float32), [BC * BK])
                     snew = deckv[:, None] * sflat + tl.dot(tl.trans(wk).to(vc.dtype), vc)
                 else:
                     snew = sflat + tl.dot(tl.trans(wk).to(vc.dtype), vc)
                 tl.store(sval_ptr + pid_b*ssv_b + ck[:, None]*ssv_k + offs_v[None, :]*ssv_v,
                          snew, mask=ckmask[:, None] & vmask[None, :])
-    # store the [BT, NDVP, BV] accumulator as the [BT, NDVP*BV] num row (column vb*BV+j ≡ slice [vb,j];
-    # NDVP*BV == BVO, the num buffer width). The pad columns (≥ ND_V*BV ≥ dv) are masked off by vfmask.
-    offs_vf = tl.arange(0, NDVP * BV)
-    vfmask = offs_vf < dv
-    tl.store(num_ptr + pid_b*snm_b + rows[:, None]*snm_l + offs_vf[None, :]*snm_v,
-             tl.reshape(o_num, [BT, NDVP * BV]), mask=rmask[:, None] & vfmask[None, :])
-    # ---- Pass 3 (value-free): Sden state write (Sden^c += Σ wᶜ k). Done LAST so Pass 1/2's d-recompute
-    # read the carried-in Sden. Loops BK-blocks; the [BC*BK] tiles are tiny.
-    for cb in range(NCBLK):
-        cols = cb * BC + offs_c
-        cmask = cols < nc
-        _r, w_tile = _build_rw_tile_logits(lr_ptr, lw_ptr, sel_ptr, cols, cmask,
-                                           pid_b, rows, rmask, offs_bb, bmask,
-                                           slo_b, slo_l, slo_lvl, slo_bb, slo_b, slo_l, slo_lvl, slo_bb,
-                                           ssel_lvl, ssel_b, ssel_c, D, BT, BB, BC, BUILD_R=False)
-        if USE_G:
-            ldc = _ld_from_w(w_tile, alpha, cmask, GLA_FLOOR)
-            a = tl.cumsum(ldc, axis=0)
-            Lam = tl.sum(tl.where(offs_t[:, None] == (BT - 1), a, 0.0), axis=0)   # [BC]
-            wsd = w_tile * tl.exp(Lam[None, :] - a)        # w_end for the den state write
-            dec_c = tl.exp(Lam)                            # [BC] per-c carry
-        else:
-            wsd = w_tile
+
         for d0 in range(ND):
             offs_k = d0 * BK + tl.arange(0, BK)
             kmask = offs_k < dqk
@@ -1279,15 +1218,46 @@ def _kappa_fwd_chunk(alpha_ptr, q_ptr, k_ptr, v_ptr, lr_ptr, lw_ptr, sel_ptr, ka
                          mask=rmask[:, None] & kmask[None, :], other=0.0)
             ck = tl.reshape(cols[:, None] * dqk + offs_k[None, :], [BC * BK])
             ckmask = tl.reshape(cmask[:, None] & kmask[None, :], [BC * BK])
-            wk = tl.reshape(wsd[:, :, None] * kc[:, None, :], [BT, BC * BK])
-            dsden = tl.sum(wk, axis=0)                                                  # [BC*BK]
-            sden = tl.load(sden_ptr + pid_b*ssd_b + ck*ssd_k, mask=ckmask, other=0.0)   # [BC*BK]
+            wk = tl.reshape(w_end[:, :, None] * kc[:, None, :], [BT, BC * BK])
+            dsden = tl.sum(wk, axis=0)
+            sden = tl.load(sden_ptr + pid_b*ssd_b + ck*ssd_k, mask=ckmask, other=0.0)
             if USE_G:
                 deckv = tl.reshape(dec_c[:, None] * tl.full([BC, BK], 1.0, tl.float32), [BC * BK])
                 tl.store(sden_ptr + pid_b*ssd_b + ck*ssd_k, deckv * sden + dsden, mask=ckmask)
             else:
                 tl.store(sden_ptr + pid_b*ssd_b + ck*ssd_k, sden + dsden, mask=ckmask)
-    tl.store(den_ptr + pid_b*sdn_b + rows*sdn_l, o_den, mask=rmask)
+
+    offs_vf = tl.arange(0, NDVP * BV)
+    vfmask = offs_vf < dv
+    tl.store(pnum_ptr + pid_b*spn_b + pid_g*spn_g + offs_t[:, None]*spn_t + offs_vf[None, :]*spn_v,
+             tl.reshape(o_num, [BT, NDVP * BV]), mask=rmask[:, None] & vfmask[None, :])
+    tl.store(pden_ptr + pid_b*spd_b + pid_g*spd_g + offs_t*spd_t, o_den, mask=rmask)
+
+
+@triton.jit
+def _kappa_fwd_reduce_groups(pnum_ptr, pden_ptr, num_ptr, den_ptr,
+                             L, dv, t_start,
+                             spn_b, spn_g, spn_t, spn_v, spd_b, spd_g, spd_t,
+                             snm_b, snm_l, snm_v, sdn_b, sdn_l,
+                             BT: tl.constexpr, BV: tl.constexpr, NGBLK: tl.constexpr):
+    pid_b = tl.program_id(0)
+    pid_v = tl.program_id(1)
+    offs_t = tl.arange(0, BT)
+    offs_v = pid_v * BV + tl.arange(0, BV)
+    rows = t_start + offs_t
+    rmask = rows < L
+    vmask = offs_v < dv
+    acc = tl.zeros([BT, BV], dtype=tl.float32)
+    dacc = tl.zeros([BT], dtype=tl.float32)
+    for g in range(NGBLK):
+        acc += tl.load(pnum_ptr + pid_b*spn_b + g*spn_g + offs_t[:, None]*spn_t + offs_v[None, :]*spn_v,
+                       mask=rmask[:, None] & vmask[None, :], other=0.0)
+        if pid_v == 0:
+            dacc += tl.load(pden_ptr + pid_b*spd_b + g*spd_g + offs_t*spd_t, mask=rmask, other=0.0)
+    tl.store(num_ptr + pid_b*snm_b + rows[:, None]*snm_l + offs_v[None, :]*snm_v,
+             acc, mask=rmask[:, None] & vmask[None, :])
+    if pid_v == 0:
+        tl.store(den_ptr + pid_b*sdn_b + rows*sdn_l, dacc, mask=rmask)
 
 
 def _kappa_fit_chunk(dqk, dv, chunk, BC=16):
@@ -1381,6 +1351,11 @@ def _kappa_routed_fwd(q, k, v, alpha, lr, lw, kap, D, b, sel, chunk, global_norm
                   BK=BK, BV=BV, BC=BC, NCBLK=NCBLK, ND=ND, NDV=triton.cdiv(dv, BV),
                   NDVP=triton.next_power_of_2(triton.cdiv(dv, BV)),
                   USE_G=use_g, GLA_FLOOR=_GLA_FLOOR, num_warps=4, num_stages=1)
+    GCB = 2
+    NGBLK = triton.cdiv(NCBLK, GCB)
+    NDV = triton.cdiv(dv, BV)
+    part_num = torch.empty(B, NGBLK, chunk, dv, device=q.device, dtype=torch.float32)
+    part_den = torch.empty(B, NGBLK, chunk, device=q.device, dtype=torch.float32)
     for c in range(c_lo, c_hi):
         if need_snapshots:
             snap_val[c - c_lo].copy_(Sval)
@@ -1388,8 +1363,8 @@ def _kappa_routed_fwd(q, k, v, alpha, lr, lw, kap, D, b, sel, chunk, global_norm
         elif checkpoint_every is not None and c % checkpoint_every == 0:
             snap_val[c // checkpoint_every].copy_(Sval)
             snap_den[c // checkpoint_every].copy_(Sden)
-        _kappa_fwd_chunk[(B,)](
-            alpha, q, k, v, lr, lw, sel, kap, Sval, Sden, num, den,
+        _kappa_fwd_chunk_cb_group[(B, NGBLK)](
+            alpha, q, k, v, lr, lw, sel, kap, Sval, Sden, part_num, part_den,
             L, dqk, dv, nc, c * chunk,
             sa[0], sa[1], q.stride(0), q.stride(1), q.stride(2),
             v.stride(0), v.stride(1), v.stride(2), kap.stride(0), kap.stride(1),
@@ -1397,8 +1372,16 @@ def _kappa_routed_fwd(q, k, v, alpha, lr, lw, kap, D, b, sel, chunk, global_norm
             sel.stride(0), sel.stride(1), sel.stride(2),
             Sval.stride(0), Sval.stride(1), Sval.stride(2), Sval.stride(3),
             Sden.stride(0), Sden.stride(1), Sden.stride(2),
+            part_num.stride(0), part_num.stride(1), part_num.stride(2), part_num.stride(3),
+            part_den.stride(0), part_den.stride(1), part_den.stride(2),
+            **dict(common, GCB=GCB))
+        _kappa_fwd_reduce_groups[(B, NDV)](
+            part_num, part_den, num, den,
+            L, dv, c * chunk,
+            part_num.stride(0), part_num.stride(1), part_num.stride(2), part_num.stride(3),
+            part_den.stride(0), part_den.stride(1), part_den.stride(2),
             num.stride(0), num.stride(1), num.stride(2), den.stride(0), den.stride(1),
-            **common)
+            BT=chunk, BV=BV, NGBLK=NGBLK, num_warps=4, num_stages=1)
     # Return the SMEM-fitted `chunk` actually used: the backward's reverse-scan must drive the SAME chunk
     # as this recompute (NCH / per-chunk snapshot alignment) — threading it out is the single source of
     # truth (no re-fit-must-match-the-fit coupling).
