@@ -1959,7 +1959,8 @@ class _RoLARoutedKappaFn(torch.autograd.Function):
                                                         D, b, sel, chunk, global_norm, per_state, eps, H)
             ckv = ckd = None
         den_f = den.float()
-        out = num.float() / (den_f.unsqueeze(-1) + eps)
+        out = num.float()
+        out.div_(den_f.unsqueeze(-1) + eps)
         if out.shape[1] > 0:
             # At the first token there is no prior state and the causal block contains only the diagonal,
             # so num_0 = den_0 * v_0 for every normalized mode. Use that identity directly; the generic
@@ -2158,9 +2159,11 @@ def chunk_rola_routed_tiled(q, k, v, x_write, x_read, Wr, Ww, D, b, norm='kappa'
         num_acc = num if num_acc is None else num_acc + num
         den_acc = den if den_acc is None else den_acc + den
         del rt, wt, lr_tile, lw_tile, num, den
-    out = num_acc.float() / (den_acc.float().unsqueeze(-1) + eps)
+    den_f = den_acc.float()
+    out = num_acc.float()
+    out.div_(den_f.unsqueeze(-1) + eps)
     if out.shape[1] > 0:
-        out[:, 0].copy_(vf[:, 0].float() * (den_acc.float()[:, 0] / (den_acc.float()[:, 0] + eps))[:, None])
+        out[:, 0].copy_(vf[:, 0].float() * (den_f[:, 0] / (den_f[:, 0] + eps))[:, None])
     return unfold(out).to(v.dtype)
 
 
