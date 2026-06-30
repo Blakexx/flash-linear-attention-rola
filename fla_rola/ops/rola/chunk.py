@@ -1103,20 +1103,25 @@ def _kappa_rescale(r_tile, d_tile, kap, cmask, GLOBAL: tl.constexpr,
     return tl.where(cmask[None, :], rt, 0.0)
 
 @triton.jit
-def _kappa_fwd_chunk_cb_atomic(alpha_ptr, q_ptr, k_ptr, v_ptr, lr_ptr, lw_ptr, sel_ptr, kap_ptr,
-                               sval_ptr, sden_ptr, num_ptr, den_ptr,
-                               L, dqk, dv, nc, t_start,
-                               sa_b, sa_l, sq_b, sq_l, sq_d, sv_b, sv_l, sv_d, sk_b, sk_l,
-                               slo_b, slo_l, slo_lvl, slo_bb, ssel_lvl, ssel_b, ssel_c,
-                               ssv_b, ssv_c, ssv_k, ssv_v, ssd_b, ssd_c, ssd_k,
-                               snm_b, snm_l, snm_v, sdn_b, sdn_l,
-                               GLOBAL: tl.constexpr, PER_STATE: tl.constexpr, EPS: tl.constexpr,
-                               D: tl.constexpr, b: tl.constexpr, BB: tl.constexpr,
-                               BT: tl.constexpr, BK: tl.constexpr, BV: tl.constexpr,
-                               BC: tl.constexpr, NCBLK: tl.constexpr, ND: tl.constexpr,
-                               NDV: tl.constexpr, NDVP: tl.constexpr,
-                               USE_G: tl.constexpr, GLA_FLOOR: tl.constexpr):
-    """State-block parallel kappa forward with fp32 atomic output accumulation."""
+def _kappa_fwd_scan_cb_atomic(alpha_ptr, q_ptr, k_ptr, v_ptr, lr_ptr, lw_ptr, sel_ptr, kap_ptr,
+                              sval_ptr, sden_ptr, num_ptr, den_ptr,
+                              snap_val_ptr, snap_den_ptr,
+                              L, dqk, dv, nc,
+                              sa_b, sa_l, sq_b, sq_l, sq_d, sv_b, sv_l, sv_d, sk_b, sk_l,
+                              slo_b, slo_l, slo_lvl, slo_bb, ssel_lvl, ssel_b, ssel_c,
+                              ssv_b, ssv_c, ssv_k, ssv_v, ssd_b, ssd_c, ssd_k,
+                              snm_b, snm_l, snm_v, sdn_b, sdn_l,
+                              snv_n, snv_b, snv_c, snv_k, snv_v, snd_n, snd_b, snd_c, snd_k,
+                              GLOBAL: tl.constexpr, PER_STATE: tl.constexpr, EPS: tl.constexpr,
+                              D: tl.constexpr, b: tl.constexpr, BB: tl.constexpr,
+                              BT: tl.constexpr, BK: tl.constexpr, BV: tl.constexpr,
+                              BC: tl.constexpr, NCBLK: tl.constexpr, ND: tl.constexpr,
+                              NDV: tl.constexpr, NDVP: tl.constexpr,
+                              USE_G: tl.constexpr, GLA_FLOOR: tl.constexpr,
+                              C_LO: tl.constexpr, NCH_LOOP: tl.constexpr,
+                              NEED_SNAPSHOTS: tl.constexpr, SAVE_CHECKPOINTS: tl.constexpr,
+                              CHECKPOINT_EVERY: tl.constexpr):
+    """State-block kappa forward scan: one launch loops over chunks inside each program."""
     pid_b = tl.program_id(0)
     cb = tl.program_id(1)
     ND_V: tl.constexpr = NDV
@@ -1124,65 +1129,45 @@ def _kappa_fwd_chunk_cb_atomic(alpha_ptr, q_ptr, k_ptr, v_ptr, lr_ptr, lw_ptr, s
     offs_bb = tl.arange(0, BB)
     offs_c = tl.arange(0, BC)
     bmask = offs_bb < b
-    rows = t_start + offs_t
-    rmask = rows < L
     cols = cb * BC + offs_c
     cmask = cols < nc
-    if USE_G:
-        alpha = tl.load(alpha_ptr + pid_b * sa_b + rows * sa_l, mask=rmask, other=1.0)
-    kap = tl.load(kap_ptr + pid_b*sk_b + rows*sk_l, mask=rmask, other=0.0)
-    causal = (offs_t[:, None] >= offs_t[None, :]) & rmask[:, None] & rmask[None, :]
-
-    G = tl.zeros([BT, BT], dtype=tl.float32)
-    for d0 in range(ND):
-        offs_k = d0 * BK + tl.arange(0, BK)
-        kmask = offs_k < dqk
-        qc = tl.load(q_ptr + pid_b*sq_b + rows[:, None]*sq_l + offs_k[None, :]*sq_d,
-                     mask=rmask[:, None] & kmask[None, :], other=0.0)
-        kc = tl.load(k_ptr + pid_b*sq_b + rows[:, None]*sq_l + offs_k[None, :]*sq_d,
-                     mask=rmask[:, None] & kmask[None, :], other=0.0)
-        G += tl.dot(qc, tl.trans(kc))
-    Gc = G * causal
-
-    r_tile, w_tile = _build_rw_tile_logits(lr_ptr, lw_ptr, sel_ptr, cols, cmask,
-                                           pid_b, rows, rmask, offs_bb, bmask,
-                                           slo_b, slo_l, slo_lvl, slo_bb, slo_b, slo_l, slo_lvl, slo_bb,
-                                           ssel_lvl, ssel_b, ssel_c, D, BT, BB, BC)
-    if USE_G:
-        ldc = _ld_from_w(w_tile, alpha, cmask, GLA_FLOOR)
-        a = tl.cumsum(ldc, axis=0)
-        Lam = tl.sum(tl.where(offs_t[:, None] == (BT - 1), a, 0.0), axis=0)
-        ea, ea_g, ena_g = _decay_factors(a)
-        wt = w_tile * ena_g
-        w_end = w_tile * tl.exp(Lam[None, :] - a)
-        dec_c = tl.exp(Lam)
-    else:
-        ea = w_tile * 0.0 + 1.0
-        ea_g = ea
-        ena_g = ea
-        wt = w_tile
-        w_end = w_tile
-
-    d_tile = _kappa_d_tile(q_ptr, sden_ptr, Gc, w_tile, ea, ea_g, ena_g, cols, cmask,
-                           pid_b, rows, rmask, dqk, sq_b, sq_l, sq_d, ssd_b, ssd_k,
-                           BT, BK, BC, ND, USE_G)
-    rt_tile = _kappa_rescale(r_tile, d_tile, kap, cmask, GLOBAL, PER_STATE, EPS)
-    o_den = tl.sum(rt_tile * d_tile, axis=1)
-    tl.atomic_add(den_ptr + pid_b*sdn_b + rows*sdn_l, o_den, sem="relaxed", mask=rmask)
-
-    rd_inter = (rt_tile * ea) if USE_G else rt_tile
-    rd_gram = (rt_tile * ea_g) if USE_G else rt_tile
-    Rg = tl.dot(rd_gram, tl.trans(wt))
-    A = G * tl.where(causal, Rg, 0.0)
-    o_num = tl.zeros([BT, NDVP, BV], dtype=tl.float32)
     vbidx = tl.arange(0, NDVP)
-    for vb in range(ND_V):
-        offs_v = vb * BV + tl.arange(0, BV)
-        vmask = offs_v < dv
-        sel_vb = (vbidx[None, :, None] == vb)
-        vc = tl.load(v_ptr + pid_b*sv_b + rows[:, None]*sv_l + offs_v[None, :]*sv_d,
-                     mask=rmask[:, None] & vmask[None, :], other=0.0)
-        o_num += tl.where(sel_vb, tl.dot(A.to(vc.dtype), vc)[:, None, :], 0.0)
+    offs_vf = tl.arange(0, NDVP * BV)
+    vfmask = offs_vf < dv
+
+    for ci in tl.range(0, NCH_LOOP):
+        c_abs = C_LO + ci
+        rows = c_abs * BT + offs_t
+        rmask = rows < L
+
+        if NEED_SNAPSHOTS or SAVE_CHECKPOINTS:
+            write_snap = True
+            snap_i = ci
+            if SAVE_CHECKPOINTS:
+                write_snap = (c_abs % CHECKPOINT_EVERY) == 0
+                snap_i = c_abs // CHECKPOINT_EVERY
+            for d0s in range(ND):
+                offs_ks = d0s * BK + tl.arange(0, BK)
+                kmasks = offs_ks < dqk
+                cks = tl.reshape(cols[:, None] * dqk + offs_ks[None, :], [BC * BK])
+                ckmasks = tl.reshape(cmask[:, None] & kmasks[None, :], [BC * BK])
+                sd = tl.load(sden_ptr + pid_b*ssd_b + cks*ssd_k, mask=ckmasks, other=0.0)
+                tl.store(snap_den_ptr + snap_i*snd_n + pid_b*snd_b + cks*snd_k,
+                         sd, mask=write_snap & ckmasks)
+                for vbs in range(ND_V):
+                    offs_vs = vbs * BV + tl.arange(0, BV)
+                    vmasks = offs_vs < dv
+                    sf = tl.load(sval_ptr + pid_b*ssv_b + cks[:, None]*ssv_k + offs_vs[None, :]*ssv_v,
+                                 mask=ckmasks[:, None] & vmasks[None, :], other=0.0)
+                    tl.store(snap_val_ptr + snap_i*snv_n + pid_b*snv_b + cks[:, None]*snv_k + offs_vs[None, :]*snv_v,
+                             sf, mask=write_snap & ckmasks[:, None] & vmasks[None, :])
+
+        if USE_G:
+            alpha = tl.load(alpha_ptr + pid_b * sa_b + rows * sa_l, mask=rmask, other=1.0)
+        kap = tl.load(kap_ptr + pid_b*sk_b + rows*sk_l, mask=rmask, other=0.0)
+        causal = (offs_t[:, None] >= offs_t[None, :]) & rmask[:, None] & rmask[None, :]
+
+        G = tl.zeros([BT, BT], dtype=tl.float32)
         for d0 in range(ND):
             offs_k = d0 * BK + tl.arange(0, BK)
             kmask = offs_k < dqk
@@ -1190,42 +1175,88 @@ def _kappa_fwd_chunk_cb_atomic(alpha_ptr, q_ptr, k_ptr, v_ptr, lr_ptr, lw_ptr, s
                          mask=rmask[:, None] & kmask[None, :], other=0.0)
             kc = tl.load(k_ptr + pid_b*sq_b + rows[:, None]*sq_l + offs_k[None, :]*sq_d,
                          mask=rmask[:, None] & kmask[None, :], other=0.0)
+            G += tl.dot(qc, tl.trans(kc))
+        Gc = G * causal
+
+        r_tile, w_tile = _build_rw_tile_logits(lr_ptr, lw_ptr, sel_ptr, cols, cmask,
+                                               pid_b, rows, rmask, offs_bb, bmask,
+                                               slo_b, slo_l, slo_lvl, slo_bb, slo_b, slo_l, slo_lvl, slo_bb,
+                                               ssel_lvl, ssel_b, ssel_c, D, BT, BB, BC)
+        if USE_G:
+            ldc = _ld_from_w(w_tile, alpha, cmask, GLA_FLOOR)
+            a = tl.cumsum(ldc, axis=0)
+            Lam = tl.sum(tl.where(offs_t[:, None] == (BT - 1), a, 0.0), axis=0)
+            ea, ea_g, ena_g = _decay_factors(a)
+            wt = w_tile * ena_g
+            w_end = w_tile * tl.exp(Lam[None, :] - a)
+            dec_c = tl.exp(Lam)
+        else:
+            ea = w_tile * 0.0 + 1.0
+            ea_g = ea
+            ena_g = ea
+            wt = w_tile
+            w_end = w_tile
+
+        d_tile = _kappa_d_tile(q_ptr, sden_ptr, Gc, w_tile, ea, ea_g, ena_g, cols, cmask,
+                               pid_b, rows, rmask, dqk, sq_b, sq_l, sq_d, ssd_b, ssd_k,
+                               BT, BK, BC, ND, USE_G)
+        rt_tile = _kappa_rescale(r_tile, d_tile, kap, cmask, GLOBAL, PER_STATE, EPS)
+        o_den = tl.sum(rt_tile * d_tile, axis=1)
+        tl.atomic_add(den_ptr + pid_b*sdn_b + rows*sdn_l, o_den, sem="relaxed", mask=rmask)
+
+        rd_inter = (rt_tile * ea) if USE_G else rt_tile
+        rd_gram = (rt_tile * ea_g) if USE_G else rt_tile
+        Rg = tl.dot(rd_gram, tl.trans(wt))
+        A = G * tl.where(causal, Rg, 0.0)
+        o_num = tl.zeros([BT, NDVP, BV], dtype=tl.float32)
+        for vb in range(ND_V):
+            offs_v = vb * BV + tl.arange(0, BV)
+            vmask = offs_v < dv
+            sel_vb = (vbidx[None, :, None] == vb)
+            vc = tl.load(v_ptr + pid_b*sv_b + rows[:, None]*sv_l + offs_v[None, :]*sv_d,
+                         mask=rmask[:, None] & vmask[None, :], other=0.0)
+            o_num += tl.where(sel_vb, tl.dot(A.to(vc.dtype), vc)[:, None, :], 0.0)
+            for d0 in range(ND):
+                offs_k = d0 * BK + tl.arange(0, BK)
+                kmask = offs_k < dqk
+                qc = tl.load(q_ptr + pid_b*sq_b + rows[:, None]*sq_l + offs_k[None, :]*sq_d,
+                             mask=rmask[:, None] & kmask[None, :], other=0.0)
+                kc = tl.load(k_ptr + pid_b*sq_b + rows[:, None]*sq_l + offs_k[None, :]*sq_d,
+                             mask=rmask[:, None] & kmask[None, :], other=0.0)
+                ck = tl.reshape(cols[:, None] * dqk + offs_k[None, :], [BC * BK])
+                ckmask = tl.reshape(cmask[:, None] & kmask[None, :], [BC * BK])
+                sflat = tl.load(sval_ptr + pid_b*ssv_b + ck[:, None]*ssv_k + offs_v[None, :]*ssv_v,
+                                mask=ckmask[:, None] & vmask[None, :], other=0.0)
+                rq = tl.reshape(rd_inter[:, :, None] * qc[:, None, :], [BT, BC * BK])
+                o_num += tl.where(sel_vb, tl.dot(rq.to(sflat.dtype), sflat)[:, None, :], 0.0)
+                wk = tl.reshape(w_end[:, :, None] * kc[:, None, :], [BT, BC * BK])
+                if USE_G:
+                    deckv = tl.reshape(dec_c[:, None] * tl.full([BC, BK], 1.0, tl.float32), [BC * BK])
+                    snew = deckv[:, None] * sflat + tl.dot(tl.trans(wk).to(vc.dtype), vc)
+                else:
+                    snew = sflat + tl.dot(tl.trans(wk).to(vc.dtype), vc)
+                tl.store(sval_ptr + pid_b*ssv_b + ck[:, None]*ssv_k + offs_v[None, :]*ssv_v,
+                         snew, mask=ckmask[:, None] & vmask[None, :])
+
+        tl.atomic_add(num_ptr + pid_b*snm_b + rows[:, None]*snm_l + offs_vf[None, :]*snm_v,
+                      tl.reshape(o_num, [BT, NDVP * BV]), sem="relaxed",
+                      mask=rmask[:, None] & vfmask[None, :])
+
+        for d0 in range(ND):
+            offs_k = d0 * BK + tl.arange(0, BK)
+            kmask = offs_k < dqk
+            kc = tl.load(k_ptr + pid_b*sq_b + rows[:, None]*sq_l + offs_k[None, :]*sq_d,
+                         mask=rmask[:, None] & kmask[None, :], other=0.0)
             ck = tl.reshape(cols[:, None] * dqk + offs_k[None, :], [BC * BK])
             ckmask = tl.reshape(cmask[:, None] & kmask[None, :], [BC * BK])
-            sflat = tl.load(sval_ptr + pid_b*ssv_b + ck[:, None]*ssv_k + offs_v[None, :]*ssv_v,
-                            mask=ckmask[:, None] & vmask[None, :], other=0.0)
-            rq = tl.reshape(rd_inter[:, :, None] * qc[:, None, :], [BT, BC * BK])
-            o_num += tl.where(sel_vb, tl.dot(rq.to(sflat.dtype), sflat)[:, None, :], 0.0)
             wk = tl.reshape(w_end[:, :, None] * kc[:, None, :], [BT, BC * BK])
+            dsden = tl.sum(wk, axis=0)
+            sden = tl.load(sden_ptr + pid_b*ssd_b + ck*ssd_k, mask=ckmask, other=0.0)
             if USE_G:
                 deckv = tl.reshape(dec_c[:, None] * tl.full([BC, BK], 1.0, tl.float32), [BC * BK])
-                snew = deckv[:, None] * sflat + tl.dot(tl.trans(wk).to(vc.dtype), vc)
+                tl.store(sden_ptr + pid_b*ssd_b + ck*ssd_k, deckv * sden + dsden, mask=ckmask)
             else:
-                snew = sflat + tl.dot(tl.trans(wk).to(vc.dtype), vc)
-            tl.store(sval_ptr + pid_b*ssv_b + ck[:, None]*ssv_k + offs_v[None, :]*ssv_v,
-                     snew, mask=ckmask[:, None] & vmask[None, :])
-
-    offs_vf = tl.arange(0, NDVP * BV)
-    vfmask = offs_vf < dv
-    tl.atomic_add(num_ptr + pid_b*snm_b + rows[:, None]*snm_l + offs_vf[None, :]*snm_v,
-                  tl.reshape(o_num, [BT, NDVP * BV]), sem="relaxed",
-                  mask=rmask[:, None] & vfmask[None, :])
-
-    for d0 in range(ND):
-        offs_k = d0 * BK + tl.arange(0, BK)
-        kmask = offs_k < dqk
-        kc = tl.load(k_ptr + pid_b*sq_b + rows[:, None]*sq_l + offs_k[None, :]*sq_d,
-                     mask=rmask[:, None] & kmask[None, :], other=0.0)
-        ck = tl.reshape(cols[:, None] * dqk + offs_k[None, :], [BC * BK])
-        ckmask = tl.reshape(cmask[:, None] & kmask[None, :], [BC * BK])
-        wk = tl.reshape(w_end[:, :, None] * kc[:, None, :], [BT, BC * BK])
-        dsden = tl.sum(wk, axis=0)
-        sden = tl.load(sden_ptr + pid_b*ssd_b + ck*ssd_k, mask=ckmask, other=0.0)
-        if USE_G:
-            deckv = tl.reshape(dec_c[:, None] * tl.full([BC, BK], 1.0, tl.float32), [BC * BK])
-            tl.store(sden_ptr + pid_b*ssd_b + ck*ssd_k, deckv * sden + dsden, mask=ckmask)
-        else:
-            tl.store(sden_ptr + pid_b*ssd_b + ck*ssd_k, sden + dsden, mask=ckmask)
+                tl.store(sden_ptr + pid_b*ssd_b + ck*ssd_k, sden + dsden, mask=ckmask)
 
 
 def _kappa_fit_chunk(dqk, dv, chunk, BC=16):
@@ -1319,24 +1350,29 @@ def _kappa_routed_fwd(q, k, v, alpha, lr, lw, kap, D, b, sel, chunk, global_norm
                   BK=BK, BV=BV, BC=BC, NCBLK=NCBLK, ND=ND, NDV=triton.cdiv(dv, BV),
                   NDVP=triton.next_power_of_2(triton.cdiv(dv, BV)),
                   USE_G=use_g, GLA_FLOOR=_GLA_FLOOR, num_warps=4, num_stages=1)
-    for c in range(c_lo, c_hi):
-        if need_snapshots:
-            snap_val[c - c_lo].copy_(Sval)
-            snap_den[c - c_lo].copy_(Sden)
-        elif checkpoint_every is not None and c % checkpoint_every == 0:
-            snap_val[c // checkpoint_every].copy_(Sval)
-            snap_den[c // checkpoint_every].copy_(Sden)
-        _kappa_fwd_chunk_cb_atomic[(B, NCBLK)](
-            alpha, q, k, v, lr, lw, sel, kap, Sval, Sden, num, den,
-            L, dqk, dv, nc, c * chunk,
-            sa[0], sa[1], q.stride(0), q.stride(1), q.stride(2),
-            v.stride(0), v.stride(1), v.stride(2), kap.stride(0), kap.stride(1),
-            *slo,
-            sel.stride(0), sel.stride(1), sel.stride(2),
-            Sval.stride(0), Sval.stride(1), Sval.stride(2), Sval.stride(3),
-            Sden.stride(0), Sden.stride(1), Sden.stride(2),
-            num.stride(0), num.stride(1), num.stride(2), den.stride(0), den.stride(1),
-            **common)
+    snap_val_arg = snap_val if snap_val is not None else Sval
+    snap_den_arg = snap_den if snap_den is not None else Sden
+    if snap_val is not None:
+        snv = snap_val.stride()
+        snd = snap_den.stride()
+    else:
+        snv = (0, 0, 0, 0, 0)
+        snd = (0, 0, 0, 0)
+    _kappa_fwd_scan_cb_atomic[(B, NCBLK)](
+        alpha, q, k, v, lr, lw, sel, kap, Sval, Sden, num, den, snap_val_arg, snap_den_arg,
+        L, dqk, dv, nc,
+        sa[0], sa[1], q.stride(0), q.stride(1), q.stride(2),
+        v.stride(0), v.stride(1), v.stride(2), kap.stride(0), kap.stride(1),
+        *slo,
+        sel.stride(0), sel.stride(1), sel.stride(2),
+        Sval.stride(0), Sval.stride(1), Sval.stride(2), Sval.stride(3),
+        Sden.stride(0), Sden.stride(1), Sden.stride(2),
+        num.stride(0), num.stride(1), num.stride(2), den.stride(0), den.stride(1),
+        *snv, *snd,
+        C_LO=c_lo, NCH_LOOP=c_hi - c_lo,
+        NEED_SNAPSHOTS=need_snapshots, SAVE_CHECKPOINTS=checkpoint_every is not None,
+        CHECKPOINT_EVERY=checkpoint_every or 1,
+        **common)
     # Return the SMEM-fitted `chunk` actually used: the backward's reverse-scan must drive the SAME chunk
     # as this recompute (NCH / per-chunk snapshot alignment) — threading it out is the single source of
     # truth (no re-fit-must-match-the-fit coupling).
