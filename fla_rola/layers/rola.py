@@ -422,11 +422,12 @@ class RoLA(nn.Module):
             wx = x
             rx = x
 
-        tiled_chunk = (
+        stream_router_chunk = (
             mode == 'chunk' and hidden_states.is_cuda and self.state_norm in ('global', 'kappa', 'per_state')
             and not torch.is_grad_enabled() and not use_cache and self.router_zloss_coef <= 0.0
+            and D == 1
         )
-        if tiled_chunk:
+        if stream_router_chunk:
             wl = rl = None
             self._router_aux = None
         else:
@@ -458,7 +459,7 @@ class RoLA(nn.Module):
                 raise NotImplementedError(
                     "chunk_rola_routed has no carried initial_state yet; continuation decode uses the "
                     "fused_recurrent path (auto-selected for L<=64).")
-            if tiled_chunk:
+            if stream_router_chunk:
                 out = chunk_rola_routed_tiled(
                     qf, kf, v, wx, rx, self.write_W if self.read_W is None else self.read_W, self.write_W,
                     D, b, norm=self.state_norm, kappa=kap, scale=1.0,
