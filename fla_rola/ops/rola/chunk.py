@@ -377,12 +377,10 @@ def _build_sel(D, b, nc, device):
     base-b digit decomposition: leaf = Σ_i d_i·b^(D-1-i)). Tiny [D,b,nc] constant — reconstructs
     the [BT,nc] gate tile from the [BT,b] per-level factors IN-KERNEL. Carries NO sequence dimension,
     so it is NOT the [L,nc] gate."""
-    sel = torch.zeros(D, b, nc, device=device, dtype=torch.float32)
-    for leaf in range(nc):
-        digs = [(leaf // (b ** (D - 1 - i))) % b for i in range(D)]
-        for i, d in enumerate(digs):
-            sel[i, d, leaf] = 1.0
-    return sel
+    leaves = torch.arange(nc, device=device, dtype=torch.long)
+    divs = b ** torch.arange(D - 1, -1, -1, device=device, dtype=torch.long)
+    digits = (leaves.unsqueeze(0) // divs.unsqueeze(1)) % b
+    return torch.nn.functional.one_hot(digits, num_classes=b).permute(0, 2, 1).to(torch.float32).contiguous()
 
 
 def _router_logits(h, Wr, Ww, b_r, b_w, H, build_r=True):
