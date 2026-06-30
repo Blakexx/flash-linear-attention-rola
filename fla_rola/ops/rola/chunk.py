@@ -2054,6 +2054,24 @@ def _stream_factor_lse(x, W, bias, level, branch_block=16):
     return lse
 
 
+def _factor_probs_full(x, W, bias):
+    """Materialize small per-level factor probabilities, not leaf probabilities."""
+    logits = torch.einsum('bld,hkdc->blhkc', x, W.to(x.dtype))
+    if bias is not None:
+        logits = logits + bias.to(x.dtype)[None, None]
+    return torch.softmax(logits.float(), dim=-1)
+
+
+def _route_tile_probs_from_factors(factors, cols, D, b):
+    probs = None
+    for level in range(D):
+        div = b ** (D - 1 - level)
+        digits = ((cols // div) % b).to(torch.long)
+        factor = factors[..., level, digits]
+        probs = factor if probs is None else probs * factor
+    return probs
+
+
 def _route_tile_probs(x, W, bias, lse_levels, cols, D, b):
     """Leaf probability tile [B,L,H,BC] from streamed per-level normalizers."""
     probs = None
@@ -2113,16 +2131,27 @@ def chunk_rola_routed_tiled(q, k, v, x_write, x_read, Wr, Ww, D, b, norm='kappa'
     if b_r is not None:
         b_r, b_w = b_r.to(compute_dtype), b_w.to(compute_dtype)
 
-    read_lse = [_stream_factor_lse(x_read, Wr, b_r, level, branch_block) for level in range(D)]
-    write_lse = [_stream_factor_lse(x_write, Ww, b_w, level, branch_block) for level in range(D)]
+    dense_factors = b <= state_block
+    if dense_factors:
+        read_factors = _factor_probs_full(x_read, Wr, b_r)
+        write_factors = _factor_probs_full(x_write, Ww, b_w)
+        read_lse = write_lse = None
+    else:
+        read_factors = write_factors = None
+        read_lse = [_stream_factor_lse(x_read, Wr, b_r, level, branch_block) for level in range(D)]
+        write_lse = [_stream_factor_lse(x_write, Ww, b_w, level, branch_block) for level in range(D)]
     num_acc = den_acc = None
     for c0 in range(0, nc, state_block):
         c1 = min(c0 + state_block, nc)
         group = c1 - c0
         sel = _build_sel(1, group, group, q.device)
         cols = torch.arange(c0, c1, device=q.device)
-        rt = _route_tile_probs(x_read, Wr, b_r, read_lse, cols, D, b)
-        wt = _route_tile_probs(x_write, Ww, b_w, write_lse, cols, D, b)
+        if dense_factors:
+            rt = _route_tile_probs_from_factors(read_factors, cols, D, b)
+            wt = _route_tile_probs_from_factors(write_factors, cols, D, b)
+        else:
+            rt = _route_tile_probs(x_read, Wr, b_r, read_lse, cols, D, b)
+            wt = _route_tile_probs(x_write, Ww, b_w, write_lse, cols, D, b)
         lr_tile = _fold_probs(rt).to(compute_dtype)
         lw_tile = _fold_probs(wt).to(compute_dtype)
         num, den, _sv, _sd, _ck = _kappa_routed_fwd(
