@@ -484,6 +484,62 @@ def _router_logits(h, Wr, Ww, b_r, b_w, H, build_r=True, h_w=None):
     return lr, lw
 
 
+def _factor_probs_full_folded(h, W, bias, H):
+    """Materialize small per-level factor probabilities [BH,L,D,b], not leaf probabilities."""
+    BH, L, dm = h.shape
+    B = BH // H
+    hr = h.reshape(B, H, L, dm)
+    logits = torch.einsum('bhlm,hdmc->bhldc', hr, W.to(h.dtype))
+    if bias is not None:
+        logits = logits + bias.to(h.dtype)[None, :, None]
+    return torch.softmax(logits.float(), dim=-1).reshape(BH, L, W.shape[1], W.shape[3]).contiguous()
+
+
+def _stream_factor_lse_folded(h, W, bias, H, level, branch_block=16):
+    """logsumexp over one factor level without materializing [BH,L,b]."""
+    BH, L, dm = h.shape
+    B = BH // H
+    hr = h.reshape(B, H, L, dm)
+    b = W.shape[-1]
+    lse = torch.full((B, H, L), -float("inf"), device=h.device, dtype=torch.float32)
+    for lo in range(0, b, branch_block):
+        hi = min(lo + branch_block, b)
+        logits = torch.einsum('bhlm,hmc->bhlc', hr, W[:, level, :, lo:hi].to(h.dtype))
+        if bias is not None:
+            logits = logits + bias[:, level, lo:hi].to(h.dtype)[None, :, None]
+        lse = torch.logaddexp(lse, torch.logsumexp(logits.float(), dim=-1))
+        del logits
+    return lse.reshape(BH, L).contiguous()
+
+
+def _route_tile_probs_from_factors_folded(factors, cols, D, b):
+    probs = None
+    for level in range(D):
+        div = b ** (D - 1 - level)
+        digits = ((cols // div) % b).to(torch.long)
+        factor = factors[..., level, digits]
+        probs = factor if probs is None else probs * factor
+    return probs.contiguous()
+
+
+def _route_tile_probs_folded(h, W, bias, H, lse_levels, cols, D, b):
+    """Leaf probability tile [BH,L,BC] from streamed per-level normalizers."""
+    BH, L, dm = h.shape
+    B = BH // H
+    hr = h.reshape(B, H, L, dm)
+    probs = None
+    for level in range(D):
+        div = b ** (D - 1 - level)
+        digits = ((cols // div) % b).to(torch.long)
+        W_sel = W[:, level, :, digits].to(h.dtype)
+        logits = torch.einsum('bhlm,hmc->bhlc', hr, W_sel)
+        if bias is not None:
+            logits = logits + bias[:, level, digits].to(h.dtype)[None, :, None]
+        factor = torch.exp(logits.float() - lse_levels[level].reshape(B, H, L).unsqueeze(-1))
+        probs = factor if probs is None else probs * factor
+    return probs.reshape(BH, L, cols.numel()).contiguous()
+
+
 def _gates_from_factor_logits(logits, D, b):
     """Fold per-level factor logits [*, D, b] into the explicit leaf gates [*, nc] (the torch leaf-product
     the kernel's Sel-gather mirrors) — for the driver's CPU-side decay/Λ recompute (never the kernel's
@@ -1093,33 +1149,30 @@ class _RoLARoutedFn(torch.autograd.Function):
 
 @input_guard
 def rola_rla_routed_triton(q, k, v, h, Wr, Ww, D, b, chunk=None, BG=16, b_r=None, b_w=None,
-                           lr=None, lw=None, H=None):
+                           H=None, h_w=None):
     """Un-normalized TREE-ROUTED RLA readout via Triton — the shared-gram readout, DIFFERENTIABLE
     end-to-end (the [L,nc] gates and their grads are NEVER materialized). F2b: the per-level routing
     logits (h·Wr+b_r, h·Ww+b_w) are a cuBLAS GEMM (`_router_logits`, autograd-tracked) and the kernel only
     softmax+gathers them; dWr/dWw/dh/db flow through the GEMM-backward. Wr,Ww ∈ [H,D,d_model,b] per-head,
-    optional per-head bias b_r/b_w ∈ [H,D,b]. lr,lw:[BH,L,D,b] may be passed precomputed (the layer's
-    z-loss logits — dedup) instead of (Wr,Ww,b_r,b_w).
+    optional per-head bias b_r/b_w ∈ [H,D,b].
 
     q,k:[BH,L,K]  v:[BH,L,V]  h:[BH,L,d_model]  Wr,Ww:[H,D,d_model,b].  Returns [BH,L,V] at BV=next_pow2(V)."""
-    if lr is None:
-        H = Wr.shape[0]
-        lr, lw = _router_logits(h, Wr, Ww, b_r, b_w, H)
+    H = Wr.shape[0] if H is None else H
+    lr, lw = _router_logits(h, Wr, Ww, b_r, b_w, H, h_w=(h if h_w is None else h_w))
     return _RoLARoutedFn.apply(q, k, v, h, lr, lw, D, b, chunk, BG, H, None)
 
 
 @input_guard
 def rola_gla_routed_triton(q, k, v, h, Wr, Ww, Wg, D, b, chunk=None, BG=16, b_r=None, b_w=None,
-                           lr=None, lw=None, H=None):
+                           H=None, h_w=None, h_g=None):
     """Un-normalized TREE-ROUTED GLA readout via Triton — `rola_rla_routed_triton` + a per-head decay
     WEIGHT Wg:[H,d_model] (GLA), DIFFERENTIABLE end-to-end ([L,nc] gates, the per-state log-decay ld, AND
     their grads NEVER materialized — ld is computed IN-KERNEL from Wg + the write gate, #45). The routing
-    gram uses the DECAYED gates (rt=r·eᵃ, w_end=w·e^{Λ−a}); Wg=None is the RLA path. lr,lw may be passed
-    precomputed (the layer dedup)."""
-    if lr is None:
-        H = Wr.shape[0]
-        lr, lw = _router_logits(h, Wr, Ww, b_r, b_w, H)
-    return _RoLARoutedFn.apply(q, k, v, h, lr, lw, D, b, chunk, BG, H, Wg)
+    gram uses the DECAYED gates (rt=r·eᵃ, w_end=w·e^{Λ−a}); Wg=None is the RLA path."""
+    H = Wr.shape[0] if H is None else H
+    lr, lw = _router_logits(h, Wr, Ww, b_r, b_w, H, h_w=(h if h_w is None else h_w))
+    h_alpha = h if h_g is None else h_g
+    return _RoLARoutedFn.apply(q, k, v, h_alpha, lr, lw, D, b, chunk, BG, H, Wg)
 
 
 # ============================================================================
@@ -1201,7 +1254,7 @@ def _kappa_rescale(r_tile, d_tile, kap, cmask, GLOBAL: tl.constexpr,
 @triton.jit
 def _kappa_fwd_scan_cb_atomic(alpha_ptr, q_ptr, k_ptr, v_ptr, hr_ptr, hw_ptr, wr_ptr, ww_ptr, sel_ptr, kap_ptr,
                               sval_ptr, sden_ptr, num_ptr, den_ptr,
-                              snap_val_ptr, snap_den_ptr, br_ptr, bw_ptr,
+                              snap_val_ptr, snap_den_ptr, br_ptr, bw_ptr, rprob_ptr, wprob_ptr,
                               L, d_model, dqk, dv, nc,
                               H, swr_head, sww_head, sbr_head, sbw_head,
                               sa_b, sa_l, sq_b, sq_l, sq_d, sv_b, sv_l, sv_d, sk_b, sk_l,
@@ -1211,6 +1264,7 @@ def _kappa_fwd_scan_cb_atomic(alpha_ptr, q_ptr, k_ptr, v_ptr, hr_ptr, hw_ptr, wr
                               snm_b, snm_l, snm_v, sdn_b, sdn_l,
                               snv_n, snv_b, snv_c, snv_k, snv_v, snd_n, snd_b, snd_c, snd_k,
                               sbr_lvl, sbr_b, sbw_lvl, sbw_b,
+                              srp_b, srp_l, srp_c, swp_b, swp_l, swp_c,
                               GLOBAL: tl.constexpr, PER_STATE: tl.constexpr, EPS: tl.constexpr,
                               D: tl.constexpr, b: tl.constexpr, BB: tl.constexpr,
                               BT: tl.constexpr, BK: tl.constexpr, BV: tl.constexpr, BD: tl.constexpr,
@@ -1219,7 +1273,7 @@ def _kappa_fwd_scan_cb_atomic(alpha_ptr, q_ptr, k_ptr, v_ptr, hr_ptr, hw_ptr, wr
                               NDM: tl.constexpr, HAS_BIAS: tl.constexpr, USE_G: tl.constexpr, GLA_FLOOR: tl.constexpr,
                               C_LO: tl.constexpr, NCH_LOOP: tl.constexpr,
                               NEED_SNAPSHOTS: tl.constexpr, SAVE_CHECKPOINTS: tl.constexpr,
-                              CHECKPOINT_EVERY: tl.constexpr):
+                              CHECKPOINT_EVERY: tl.constexpr, FLAT_PROBS: tl.constexpr):
     """State-block kappa forward scan: one launch loops over chunks inside each program."""
     pid_b = tl.program_id(0)
     cb = tl.program_id(1)
@@ -1282,13 +1336,19 @@ def _kappa_fwd_scan_cb_atomic(alpha_ptr, q_ptr, k_ptr, v_ptr, hr_ptr, hw_ptr, wr
             G += tl.dot(qc, tl.trans(kc))
         Gc = G * causal
 
-        r_tile, w_tile = _build_rw_tile(hr_ptr, hw_ptr, wr_ptr, ww_ptr, sel_ptr, cols, cmask,
-                                        pid_b, rows, rmask, offs_bb, bmask, d_model,
-                                        shr_b, shr_l, shr_d, shw_b, shw_l, shw_d,
-                                        swr_lvl, swr_d, swr_b, sww_lvl, sww_d, sww_b,
-                                        ssel_lvl, ssel_b, ssel_c,
-                                        br_ptr, bw_ptr, sbr_lvl, sbr_b, sbw_lvl, sbw_b,
-                                        D, BT, BB, BC, BD, NDM, HAS_BIAS)
+        if FLAT_PROBS:
+            r_tile, w_tile = _build_rw_tile_probs(rprob_ptr, wprob_ptr, cols, cmask,
+                                                  pid_b, rows, rmask,
+                                                  srp_b, srp_l, 0, srp_c, swp_b, swp_l, 0, swp_c,
+                                                  BT, BC, BUILD_R=True)
+        else:
+            r_tile, w_tile = _build_rw_tile(hr_ptr, hw_ptr, wr_ptr, ww_ptr, sel_ptr, cols, cmask,
+                                            pid_b, rows, rmask, offs_bb, bmask, d_model,
+                                            shr_b, shr_l, shr_d, shw_b, shw_l, shw_d,
+                                            swr_lvl, swr_d, swr_b, sww_lvl, sww_d, sww_b,
+                                            ssel_lvl, ssel_b, ssel_c,
+                                            br_ptr, bw_ptr, sbr_lvl, sbr_b, sbw_lvl, sbw_b,
+                                            D, BT, BB, BC, BD, NDM, HAS_BIAS)
         if USE_G:
             ldc = _ld_from_w(w_tile, alpha, cmask, GLA_FLOOR)
             a = tl.cumsum(ldc, axis=0)
@@ -1388,7 +1448,7 @@ def _kappa_ckpt_window(NCH):
 
 def _kappa_routed_fwd(q, k, v, h, h_w, Wr, Ww, alpha, kap, D, b, sel, chunk, global_norm, per_state, eps,
                       b_r=None, b_w=None, Wg=None, need_snapshots=False, state_in=None, c_lo=0, c_hi=None,
-                      save_checkpoints=False, checkpoint_every_override=None):
+                      save_checkpoints=False, checkpoint_every_override=None, route_probs=None):
     """Fused global/kappa/per_state tree-routed forward. Returns (num[B,L,BV], den[B,L], snap_val, snap_den).
     #55 snapshot modes (at most one): need_snapshots=True stores the DENSE per-chunk pre-states for chunks
     [c_lo,c_hi) (the backward's per-segment recompute); save_checkpoints=True stores only the SPARSE √NCH
@@ -1457,6 +1517,12 @@ def _kappa_routed_fwd(q, k, v, h, h_w, Wr, Ww, alpha, kap, D, b, sel, chunk, glo
     sa = (alpha.stride(0), alpha.stride(1))
     H = Wr.shape[0]
     br, bw, has_bias = _routing_bias(b_r, b_w, H, D, b, q.device, dtype=q.dtype)
+    rprob = wprob = q.new_empty(1, 1, 1)
+    srp = swp = (0, 0, 0)
+    flat_probs = route_probs is not None
+    if flat_probs:
+        rprob, wprob = (x.contiguous() for x in route_probs)
+        srp, swp = rprob.stride(), wprob.stride()
     sbias = _bias_strides(br, bw, has_bias)
     head = _router_head_strides(Wr, Ww, br, bw, has_bias)
     sWr = (Wr.stride(1), Wr.stride(2), Wr.stride(3))
@@ -1478,6 +1544,7 @@ def _kappa_routed_fwd(q, k, v, h, h_w, Wr, Ww, alpha, kap, D, b, sel, chunk, glo
         snd = (0, 0, 0, 0)
     _kappa_fwd_scan_cb_atomic[(B, NCBLK)](
         alpha, q, k, v, h, h_w, Wr, Ww, sel, kap, Sval, Sden, num, den, snap_val_arg, snap_den_arg, br, bw,
+        rprob, wprob,
         L, d_model, dqk, dv, nc, *head,
         sa[0], sa[1], q.stride(0), q.stride(1), q.stride(2),
         v.stride(0), v.stride(1), v.stride(2), kap.stride(0), kap.stride(1),
@@ -1486,10 +1553,11 @@ def _kappa_routed_fwd(q, k, v, h, h_w, Wr, Ww, alpha, kap, D, b, sel, chunk, glo
         Sval.stride(0), Sval.stride(1), Sval.stride(2), Sval.stride(3),
         Sden.stride(0), Sden.stride(1), Sden.stride(2),
         num.stride(0), num.stride(1), num.stride(2), den.stride(0), den.stride(1),
-        *snv, *snd, *sbias,
+        *snv, *snd, *sbias, *srp, *swp,
         C_LO=c_lo, NCH_LOOP=c_hi - c_lo,
         NEED_SNAPSHOTS=need_snapshots, SAVE_CHECKPOINTS=checkpoint_every is not None,
         CHECKPOINT_EVERY=checkpoint_every or 1,
+        FLAT_PROBS=flat_probs,
         **common)
     # Return the SMEM-fitted `chunk` actually used: the backward's reverse-scan must drive the SAME chunk
     # as this recompute (NCH / per-chunk snapshot alignment) — threading it out is the single source of
@@ -1539,8 +1607,12 @@ def _kappa_fold_level_weight(dr_tile, dw_tile, r_tile, w_tile, fr, fw, sel,
                              HAS_BIAS: tl.constexpr):
     drr = dr_tile * r_tile
     dww_ = dw_tile * w_tile
-    dfr = tl.dot(drr, tl.trans(sel)) / fr
-    dfw = tl.dot(dww_, tl.trans(sel)) / fw
+    # Padded branch columns have fr/fw=0 (BB is power-of-two padded). Avoid forming 0/0 before masking,
+    # because those inactive NaNs can still poison later dot products on some Triton codegen paths.
+    fr_safe = tl.where(bmask[None, :], fr, 1.0)
+    fw_safe = tl.where(bmask[None, :], fw, 1.0)
+    dfr = tl.dot(drr, tl.trans(sel)) / fr_safe
+    dfw = tl.dot(dww_, tl.trans(sel)) / fw_safe
     dfr = tl.where(bmask[None, :], dfr, 0.0)
     dfw = tl.where(bmask[None, :], dfw, 0.0)
     dlr = fr * (dfr - tl.sum(fr * dfr, axis=1)[:, None])
@@ -1751,7 +1823,7 @@ def _kappa_router_bwd_fold(hr_ptr, hw_ptr, hg_ptr, wr_ptr, ww_ptr, sel_ptr, gdr_
     if USE_G:
         for dm in range(NDM):
             offs_dm = dm * BD + tl.arange(0, BD)
-            mmask = offs_dm < d_model
+            mmask = offs_dm < d_model_g
             hc = tl.load(hg_ptr + pid_b * shg_b + rows[:, None] * shg_l + offs_dm[None, :] * shg_d,
                          mask=rmask[:, None] & mmask[None, :], other=0.0)
             wgc = tl.load(wg_ptr + offs_dm * swg_d, mask=mmask, other=0.0)
@@ -2160,7 +2232,7 @@ def _kappa_routed_bwd(q, k, v, h, h_w, h_g, Wr, Ww, kap, alpha, ckpt_val, ckpt_d
     dhg = torch.zeros(B, L, d_model_g, device=q.device, dtype=torch.float32)
     dWr = torch.zeros(H, D, d_model, b, device=q.device, dtype=torch.float32)
     dWw = torch.zeros(H, D, d_model, b, device=q.device, dtype=torch.float32)
-    dWg = torch.zeros(H, d_model, device=q.device, dtype=torch.float32)   # per-head decay-weight grad (#45)
+    dWg = torch.zeros(H, d_model_g, device=q.device, dtype=torch.float32)  # per-head decay-weight grad (#45)
     dkap = torch.zeros(B, L, device=q.device, dtype=torch.float32)
     dSval = torch.zeros(B, nc, dqk, dv, device=q.device, dtype=torch.float32)
     dSden = torch.zeros(B, nc, dqk, device=q.device, dtype=torch.float32)
@@ -2294,6 +2366,50 @@ def _kappa_routed_bwd(q, k, v, h, h_w, h_g, Wr, Ww, kap, alpha, ckpt_val, ckpt_d
     return (dq[..., :dqk], dk[..., :dqk], dvv[..., :dv], dh, dhw, dhg, dWr, dWw, dkap)
 
 
+def _kappa_routed_readout_tiled(qf, kf, vf, hf, hfw, Wr, Ww, kap, alpha, D, b, chunk_size,
+                                global_norm, per_state, eps, b_r=None, b_w=None,
+                                state_block=64, branch_block=16):
+    """No-grad prefill path: stream GEMM-built router probability tiles into the scan."""
+    BHF, L, _dm = hf.shape
+    H = Wr.shape[0]
+    nc = b ** D
+    dense_factors = b <= state_block
+    if dense_factors:
+        read_factors = _factor_probs_full_folded(hf, Wr, b_r, H)
+        write_factors = _factor_probs_full_folded(hfw, Ww, b_w, H)
+        read_lse = write_lse = None
+    else:
+        read_factors = write_factors = None
+        read_lse = [_stream_factor_lse_folded(hf, Wr, b_r, H, level, branch_block) for level in range(D)]
+        write_lse = [_stream_factor_lse_folded(hfw, Ww, b_w, H, level, branch_block) for level in range(D)]
+
+    num_acc = den_acc = None
+    for c0 in range(0, nc, state_block):
+        c1 = min(c0 + state_block, nc)
+        group = c1 - c0
+        cols = torch.arange(c0, c1, device=qf.device)
+        if dense_factors:
+            rt = _route_tile_probs_from_factors_folded(read_factors, cols, D, b)
+            wt = _route_tile_probs_from_factors_folded(write_factors, cols, D, b)
+        else:
+            rt = _route_tile_probs_folded(hf, Wr, b_r, H, read_lse, cols, D, b)
+            wt = _route_tile_probs_folded(hfw, Ww, b_w, H, write_lse, cols, D, b)
+        sel = _build_sel(1, group, group, qf.device)
+        num, den, _sv, _sd, _ck = _kappa_routed_fwd(
+            qf, kf, vf, hf, hfw, Wr, Ww, alpha, kap, 1, group, sel, chunk_size,
+            global_norm, per_state, eps, route_probs=(rt, wt))
+        num_acc = num if num_acc is None else num_acc + num
+        den_acc = den if den_acc is None else den_acc + den
+        del rt, wt, num, den
+
+    den_f = den_acc.float()
+    out = num_acc.float()
+    out.div_(den_f.unsqueeze(-1) + eps)
+    if out.shape[1] > 0:
+        out[:, 0].copy_(vf[:, 0].float() * (den_f[:, 0] / (den_f[:, 0] + eps))[:, None])
+    return out
+
+
 class _RoLARoutedKappaFn(torch.autograd.Function):
     """End-to-end differentiable FUSED kappa/per_state tree-routed RLA path. Forward runs the fused
     chunk-scan (`_kappa_routed_fwd`) and returns the normalized readout. Backward runs the reverse
@@ -2407,16 +2523,16 @@ class _RoLARoutedKappaFn(torch.autograd.Function):
 
 
 def _kappa_routed_readout(qf, kf, vf, hf, hfw, hfg, Wr, Ww, kapf, alpha, D, b, chunk_size,
-                          global_norm, per_state, eps, b_r=None, b_w=None, Wg=None,
-                          lr=None, lw=None, H=None):
+                          global_norm, per_state, eps, b_r=None, b_w=None, Wg=None, H=None):
     """Fused global/kappa/per_state tree-routed readout returning normalized out[BH,L,V],
-    differentiable. kapf:[BH,L,1]. F2b: the per-level routing logits (h·Wr+b_r, h·Ww+b_w) are a cuBLAS
-    GEMM done by the caller; the kernel only softmax+gathers them; dWr/dWw/dh/db flow through those
-    precomputed logits. lr,lw:[BH,L,D,b] are required. Optional precomputed alpha:[BH,L] enables GLA;
-    alpha=None is the RLA path."""
+    differentiable in grad mode. No-grad prefill streams GEMM-built router probability tiles into the scan
+    to avoid both full router logits and repeated in-kernel h·W projection."""
     kap = kapf.reshape(qf.shape[0], qf.shape[1]).contiguous()    # [BH,L]
     if (alpha is None) != (Wg is None):
         raise ValueError("GLA kappa path requires both precomputed `alpha` and `Wg`; RLA passes neither.")
+    if not torch.is_grad_enabled():
+        return _kappa_routed_readout_tiled(qf, kf, vf, hf, hfw, Wr, Ww, kap, alpha, D, b, chunk_size,
+                                           global_norm, per_state, eps, b_r=b_r, b_w=b_w)
     ckpt_inputs = (qf, kf, vf, hf, hfw, hfg, Wr, Ww, kap, alpha, b_r, b_w, Wg)
     save_checkpoints = torch.is_grad_enabled() and any(
         t is not None and t.requires_grad for t in ckpt_inputs)
@@ -2650,20 +2766,20 @@ def _ld_from_Wg_torch(hf, wf, Wg, H):
 
 
 def _rola_routed_readout(qf, kf, vf, hf, Wr, Ww, D, b, chunk_size, b_r=None, b_w=None, Wg=None,
-                         lr=None, lw=None, H=None, h_gf=None):
+                         H=None, h_wf=None, h_gf=None):
     """Folded tree-routed numerator-only readout. CUDA → in-kernel routed Triton kernels (gates AND the
     GLA decay ld never materialized); else → eager core on explicit gates (CPU reference path). Optional
     bias b_r/b_w. Optional per-head decay weight Wg:[H,d_model] (GLA) → the decayed routed readout; Wg=None
-    is RLA. lr,lw:[BH,L,D,b] may be passed precomputed (the layer dedup)."""
+    is RLA."""
+    h_write = hf if h_wf is None else h_wf
     h_decay = hf if h_gf is None else h_gf
     if qf.is_cuda:
         if Wg is not None:
-            return rola_gla_routed_triton(qf, kf, vf, h_decay, Wr, Ww, Wg, D, b, chunk=chunk_size,
-                                          b_r=b_r, b_w=b_w, lr=lr, lw=lw, H=H)
+            return rola_gla_routed_triton(qf, kf, vf, hf, Wr, Ww, Wg, D, b, chunk=chunk_size,
+                                          b_r=b_r, b_w=b_w, H=H, h_w=h_write, h_g=h_decay)
         return rola_rla_routed_triton(qf, kf, vf, hf, Wr, Ww, D, b, chunk=chunk_size, b_r=b_r, b_w=b_w,
-                                      lr=lr, lw=lw, H=H)
-    if lr is None or lw is None:
-        raise ValueError("chunk_rola_routed raw CPU path requires precomputed `rl` and `wl` logits.")
+                                      H=H, h_w=h_write)
+    lr, lw = _router_logits(hf, Wr, Ww, b_r, b_w, H, build_r=True, h_w=h_write)
     r = _gates_from_factor_logits(lr, D, b)
     w = _gates_from_factor_logits(lw, D, b)
     ld = _ld_from_Wg_torch(h_decay, w, Wg, Wr.shape[0]) if Wg is not None else None
@@ -2672,7 +2788,7 @@ def _rola_routed_readout(qf, kf, vf, hf, Wr, Ww, D, b, chunk_size, b_r=None, b_w
 
 @input_guard
 def chunk_rola_routed(q, k, v, h, Wr, Ww, D, b, norm='kappa', kappa=None, scale=None, eps=1e-5,
-                      b_r=None, b_w=None, Wg=None, wl=None, rl=None, alpha=None, h_w=None, h_g=None):
+                      b_r=None, b_w=None, Wg=None, alpha=None, h_w=None, h_g=None):
     """TREE-ROUTED RoLA (in-kernel routing) readout with built-in normalization. DIFFERENTIABLE
     end-to-end. ALL norms (incl. the production 'kappa'/'per_state') are fully fused — the [L,nc]
     gates, the per-state den d, the rescaled read gate r̃, AND (GLA) the per-state log-decay ld are
@@ -2748,18 +2864,12 @@ def chunk_rola_routed(q, k, v, h, Wr, Ww, D, b, norm='kappa', kappa=None, scale=
     hfg = foldc(h_g)
 
     def folded_logits():
-        if wl is None or rl is None:
-            return _router_logits(hf, Wr, Ww, b_r, b_w, H, build_r=True, h_w=hfw)
-
-        def fold5(t):   # [B,T,H,D,b] -> [B*H,T,D,b]
-            return t.permute(0, 2, 1, 3, 4).reshape(B * H, T, t.shape[-2], t.shape[-1]).to(compute_dtype)
-        return fold5(rl), fold5(wl)
+        return _router_logits(hf, Wr, Ww, b_r, b_w, H, build_r=True, h_w=hfw)
 
     if norm == 'raw':
-        lr, lw = folded_logits()
         return unfold(_rola_routed_readout(qf, kf, vf, hf, Wr, Ww, D, b, chunk_size,
-                                           b_r=b_r, b_w=b_w, Wg=Wgf, lr=lr, lw=lw, H=H,
-                                           h_gf=hfg)).to(v.dtype)
+                                           b_r=b_r, b_w=b_w, Wg=Wgf, H=H,
+                                           h_wf=hfw, h_gf=hfg)).to(v.dtype)
 
     # 'kappa'/'per_state': the production read-gate rescale r̃ = r·(d+ε)^{−κ} | r/(d+ε), where the
     # per-state den d_i^c = Σ_{j≤i} (φq_i·φk_j) w_j^c. The FUSED path (`_kappa_routed_readout`) computes

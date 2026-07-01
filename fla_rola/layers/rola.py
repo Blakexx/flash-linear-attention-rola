@@ -125,7 +125,6 @@ class RoLA(nn.Module):
         tie_router_init: bool = False,
         router_bias: bool = False,
         qk_norm: bool = False,
-        router_zloss_coef: float = 0.0,
         use_short_conv: bool = False,
         conv_size: int = 4,
         conv_bias: bool = False,
@@ -152,8 +151,6 @@ class RoLA(nn.Module):
         self.state_norm = state_norm
         self.tie_routers = tie_routers
         self.qk_norm = qk_norm
-        self.router_zloss_coef = router_zloss_coef
-        self._router_aux = None                       # stashed per forward; read by get_auxiliary_loss
         self.use_short_conv = use_short_conv
         self.mode = 'chunk'   # training/prefill path; short-seq decode auto-switches to fused_recurrent
         self.conv_size = conv_size
@@ -282,22 +279,6 @@ class RoLA(nn.Module):
             g = (g.unsqueeze(-1) * f[..., i, :].unsqueeze(-2)).flatten(-2)
         return g                                                  # [B,L,H,nc]
 
-    def _stash_zloss(self, wl, rl):
-        """ST-MoE router z-loss on the FACTOR logits — penalize Σ_lvl logsumexp(level logits)^2, the
-        per-level log-partition magnitude (flat: the single softmax, == the old dense z-loss). Summed
-        over the D levels of read+write. Stashed per forward; read by get_auxiliary_loss."""
-        if self.router_zloss_coef <= 0.0:
-            return
-
-        def zl(lg):  # lg:[B,L,H,D,b] -> per-level logsumexpsq, summed over levels
-            return torch.logsumexp(lg.float(), dim=-1).square().mean(dim=(0, 1, 2)).sum()
-        self._router_aux = self.router_zloss_coef * (zl(wl) + (zl(rl) if self.read_W is not None else 0.0))
-
-    def get_auxiliary_loss(self):
-        """Router z-loss from the last forward (zoology's trainer auto-sums this across modules; the
-        HF RoLAForCausalLM aggregates it explicitly). 0.0 when router_zloss_coef == 0."""
-        return self._router_aux if self._router_aux is not None else 0.0
-
     def _log_decay(self, x, write_gates, alpha_logits=None):
         B, L = x.shape[0], x.shape[1]
         H = self.num_heads
@@ -425,21 +406,15 @@ class RoLA(nn.Module):
         needs_router_logits = (
             mode == 'fused_recurrent'
             or use_cache
-            or self.router_zloss_coef > 0.0
-            or (mode == 'chunk' and (not hidden_states.is_cuda or self.state_norm == 'raw'))
+            or (mode == 'chunk' and not hidden_states.is_cuda)
         )
         if needs_router_logits:
-            # Router z-loss is stashed from the (cheap, [L,nc]-free) per-level FACTOR logits on BOTH paths —
-            # the chunk kernel never materializes the gates, so the layer computes the logits here purely for
-            # the auxiliary loss + (decode) gate folding. With short conv enabled, the temporal filter is
-            # applied before the state-count-dependent router projection so route conv cost does not grow
-            # with H * D * b.
+            # Decode/cache and CPU reference paths need explicit per-level logits. The CUDA chunk path stays
+            # weights-in and does not materialize router logits.
             wl = self._factor_logits(wx, self.write_W, self.write_b)
             rl = self._factor_logits(rx, self.read_W, self.read_b) if self.read_W is not None else wl
-            self._stash_zloss(wl, rl)
         else:
             wl = rl = None
-            self._router_aux = None
 
         # The ops own dtype/autocast (their Triton autograd Functions carry @input_guard +
         # @autocast_custom_fwd/bwd), so the layer no longer hand-rolls the cast. `output_final_state`
@@ -468,7 +443,7 @@ class RoLA(nn.Module):
                 qf, kf, v, h_read, self.write_W if self.read_W is None else self.read_W, self.write_W,
                 D, b, norm=self.state_norm, kappa=kap, scale=1.0,
                 b_r=(self.write_b if self.read_W is None else self.read_b), b_w=self.write_b, Wg=Wg,
-                wl=wl, rl=rl, alpha=alpha, h_w=h_write, h_g=h_decay)
+                alpha=alpha, h_w=h_write, h_g=h_decay)
             recurrent_state = None
             if use_cache:
                 # Prefill→decode handoff (inference only): the routed readout stays [L,nc]-free, but the

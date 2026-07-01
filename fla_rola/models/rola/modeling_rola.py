@@ -48,8 +48,7 @@ class RoLABlock(GradientCheckpointingLayer):
                            states_per_head=config.states_per_head, num_heads=config.num_heads)
         self.attn = RoLA(hidden_size=config.hidden_size, layer_idx=layer_idx,
                          routing=getattr(config, "routing", "flat"),
-                         qk_norm=getattr(config, "qk_norm", False),
-                         router_zloss_coef=getattr(config, "router_zloss_coef", 0.0), **kw)
+                         qk_norm=getattr(config, "qk_norm", False), **kw)
         self.mlp_norm = (RMSNorm if config.fuse_norm else nn.RMSNorm)(config.hidden_size, eps=config.norm_eps)
         self.mlp = GatedMLP(
             hidden_size=config.hidden_size,
@@ -312,10 +311,6 @@ class RoLAForCausalLM(RoLAPreTrainedModel, FLAGenerationMixin):
             else:
                 loss = criterion(logits.view(labels.numel(), -1), labels.view(-1))
                 loss = l2_warp(loss, logits) if self.config.use_l2warp else loss
-            if getattr(self.config, "router_zloss_coef", 0.0) > 0:    # ST-MoE router z-loss
-                loss = loss + sum(m.get_auxiliary_loss() for m in self.modules()
-                                  if hasattr(m, "get_auxiliary_loss"))
-
         if not return_dict:
             output = (logits,) + outputs[1:]
             return (loss,) + output if loss is not None else output

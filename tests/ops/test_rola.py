@@ -62,17 +62,11 @@ def _relmax(a, b):
 
 
 def _routed_kwargs(h, Wr, Ww, D, b, Wg=None, b_r=None, b_w=None):
-    """Build the production chunk_rola_routed side inputs: per-level logits, plus scalar GLA alpha."""
-    wl = torch.einsum('bthm,hdmc->bthdc', h, Ww.to(h.dtype))
-    rl = torch.einsum('bthm,hdmc->bthdc', h, Wr.to(h.dtype))
-    if b_w is not None:
-        wl = wl + b_w.to(h.dtype)[None, None]
-    if b_r is not None:
-        rl = rl + b_r.to(h.dtype)[None, None]
+    """Build the only non-weight routed side input: scalar GLA alpha."""
     alpha = None
     if Wg is not None:
         alpha = torch.sigmoid(torch.einsum('bthm,hm->bth', h.float(), Wg.float()))
-    return dict(wl=wl.contiguous(), rl=rl.contiguous(), alpha=alpha)
+    return dict(alpha=alpha)
 
 
 _GLA_BWD_TOL = 1.2e-1   # GLA decay fp32 floor (NOT a kernel bug): the gate/decay grads (drg,dwg,dld) flow
@@ -1195,8 +1189,8 @@ class TestStructuralGates:
             'clamp-mode must warn'
 
     # ---- no-[*,L,nc]-materialization allocation watches (the saved-activation win) -------------------
-    def test_raw_split_streams_match_precomputed_logits(self):
-        """Raw GLA must use separate read, write, and decay streams when logits are built internally."""
+    def test_raw_split_streams_match_explicit_reference(self):
+        """Raw GLA must use separate read, write, and decay streams in the weights-in API."""
         if device != 'cuda':
             pytest.skip('RoLA Triton kernels require CUDA')
         torch.manual_seed(0)
@@ -1211,16 +1205,48 @@ class TestStructuralGates:
         Ww = (torch.randn(H, D, dm, b, device=device) * 0.2).to(torch.bfloat16)
         Wg = (torch.randn(H, dm, device=device) * 0.2).to(torch.float32)
 
-        rl = torch.einsum('bthm,hdmc->bthdc', h_read, Wr)
-        wl = torch.einsum('bthm,hdmc->bthdc', h_write, Ww)
         alpha = torch.sigmoid(torch.einsum('bthm,hm->bth', h_decay.float(), Wg))
         streamed = C.chunk_rola_routed(q, k, v, h_read, Wr, Ww, D, b, norm='raw',
                                        scale=1.0, Wg=Wg, alpha=alpha,
                                        h_w=h_write, h_g=h_decay)
-        explicit = C.chunk_rola_routed(q, k, v, h_read, Wr, Ww, D, b, norm='raw',
-                                       scale=1.0, Wg=Wg, wl=wl, rl=rl, alpha=alpha,
-                                       h_w=h_write, h_g=h_decay)
-        assert _relmax(streamed, explicit) < 2e-4
+
+        def fold(x):
+            return x.permute(0, 2, 1, 3).reshape(B * H, T, x.shape[-1])
+
+        def unfold(x):
+            return x.view(B, H, T, -1).permute(0, 2, 1, 3).contiguous()
+
+        qf, kf, vf = fold(q), fold(k), fold(v)
+        hf, hwf, hgf = fold(h_read), fold(h_write), fold(h_decay)
+        lr, lw = C._router_logits(hf, Wr, Ww, None, None, H, h_w=hwf)
+        r = C._gates_from_factor_logits(lr, D, b).to(q.dtype)
+        w = C._gates_from_factor_logits(lw, D, b).to(q.dtype)
+        ld = C._ld_from_Wg_torch(hgf, w, Wg, H)
+        explicit = unfold(C._rola_chunk_core(qf.float(), kf.float(), vf.float(), w.float(), r.float(), ld, 64))
+        assert _relmax(streamed, explicit) < 5e-3
+
+    @pytest.mark.parametrize('gla', [False, True])
+    def test_no_grad_tiled_prefill_matches_scan(self, gla):
+        """No-grad prefill uses tiled GEMM routing and should match the differentiable scan."""
+        if device != 'cuda':
+            pytest.skip('RoLA Triton kernels require CUDA')
+        torch.manual_seed(0)
+        B, T, H, Kd, V, dm, D, b = 1, 128, 2, 16, 16, 32, 3, 2
+        q = (torch.nn.functional.elu(torch.randn(B, T, H, Kd, device=device)) + 1.0).to(torch.bfloat16)
+        k = (torch.nn.functional.elu(torch.randn(B, T, H, Kd, device=device)) + 1.0).to(torch.bfloat16)
+        v = torch.randn(B, T, H, V, device=device, dtype=torch.bfloat16)
+        h = torch.randn(B, T, H, dm, device=device, dtype=torch.bfloat16)
+        Wr = (torch.randn(H, D, dm, b, device=device) * 0.2).to(torch.bfloat16)
+        Ww = (torch.randn(H, D, dm, b, device=device) * 0.2).to(torch.bfloat16)
+        kap = (torch.rand(B, T, H, 1, device=device) * 0.5).to(torch.bfloat16)
+        Wg = (torch.randn(H, dm, device=device) * 0.2).to(torch.float32) if gla else None
+        route = _routed_kwargs(h, Wr, Ww, D, b, Wg=Wg)
+        with torch.no_grad():
+            tiled = C.chunk_rola_routed(q, k, v, h, Wr, Ww, D, b, norm='kappa',
+                                        kappa=kap, scale=1.0, Wg=Wg, **route)
+        scan = C.chunk_rola_routed(q, k, v, h, Wr, Ww, D, b, norm='kappa',
+                                   kappa=kap, scale=1.0, Wg=Wg, **route)
+        assert _relmax(tiled, scan) < 1e-2
 
     @pytest.mark.parametrize('norm', ['global', 'kappa', 'per_state'])
     def test_kappa_routed_no_LNC_materialization(self, norm):
