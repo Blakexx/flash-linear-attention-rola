@@ -1195,10 +1195,35 @@ def _kappa_rescale(r_tile, d_tile, kap, cmask, GLOBAL: tl.constexpr,
             rt = r_tile * tl.exp(-kap[:, None] * tl.log(de))
     return tl.where(cmask[None, :], rt, 0.0)
 
+
+@triton.jit
+def _kappa_precompute_g(q_ptr, k_ptr, g_ptr,
+                        L, dqk, C_LO: tl.constexpr,
+                        sq_b, sq_l, sq_d, sg_b, sg_c, sg_i, sg_j,
+                        BT: tl.constexpr, BK: tl.constexpr, ND: tl.constexpr):
+    pid_b = tl.program_id(0)
+    ci = tl.program_id(1)
+    offs_t = tl.arange(0, BT)
+    rows = (C_LO + ci) * BT + offs_t
+    rmask = rows < L
+    G = tl.zeros([BT, BT], dtype=tl.float32)
+    for d0 in range(ND):
+        offs_k = d0 * BK + tl.arange(0, BK)
+        kmask = offs_k < dqk
+        qc = tl.load(q_ptr + pid_b * sq_b + rows[:, None] * sq_l + offs_k[None, :] * sq_d,
+                     mask=rmask[:, None] & kmask[None, :], other=0.0)
+        kc = tl.load(k_ptr + pid_b * sq_b + rows[:, None] * sq_l + offs_k[None, :] * sq_d,
+                     mask=rmask[:, None] & kmask[None, :], other=0.0)
+        G += tl.dot(qc, tl.trans(kc))
+    tl.store(g_ptr + pid_b * sg_b + ci * sg_c + offs_t[:, None] * sg_i + offs_t[None, :] * sg_j,
+             G, mask=rmask[:, None] & rmask[None, :])
+
+
 @triton.jit
 def _kappa_fwd_scan_cb_atomic(alpha_ptr, q_ptr, k_ptr, v_ptr, hr_ptr, hw_ptr, wr_ptr, ww_ptr, sel_ptr, kap_ptr,
                               sval_ptr, sden_ptr, num_ptr, den_ptr,
                               snap_val_ptr, snap_den_ptr, br_ptr, bw_ptr, rprob_ptr, wprob_ptr,
+                              g_ptr,
                               L, d_model, dqk, dv, nc,
                               H, swr_head, sww_head, sbr_head, sbw_head,
                               sa_b, sa_l, sq_b, sq_l, sq_d, sv_b, sv_l, sv_d, sk_b, sk_l,
@@ -1209,6 +1234,7 @@ def _kappa_fwd_scan_cb_atomic(alpha_ptr, q_ptr, k_ptr, v_ptr, hr_ptr, hw_ptr, wr
                               snv_n, snv_b, snv_c, snv_k, snv_v, snd_n, snd_b, snd_c, snd_k,
                               sbr_lvl, sbr_b, sbw_lvl, sbw_b,
                               srp_b, srp_l, srp_c, swp_b, swp_l, swp_c,
+                              sg_b, sg_c, sg_i, sg_j,
                               GLOBAL: tl.constexpr, PER_STATE: tl.constexpr, EPS: tl.constexpr,
                               D: tl.constexpr, b: tl.constexpr, BB: tl.constexpr,
                               BT: tl.constexpr, BK: tl.constexpr, BV: tl.constexpr, BD: tl.constexpr,
@@ -1217,7 +1243,7 @@ def _kappa_fwd_scan_cb_atomic(alpha_ptr, q_ptr, k_ptr, v_ptr, hr_ptr, hw_ptr, wr
                               NDM: tl.constexpr, HAS_BIAS: tl.constexpr, USE_G: tl.constexpr, GLA_FLOOR: tl.constexpr,
                               C_LO: tl.constexpr, NCH_LOOP: tl.constexpr,
                               NEED_SNAPSHOTS: tl.constexpr, SAVE_CHECKPOINTS: tl.constexpr,
-                              CHECKPOINT_EVERY: tl.constexpr):
+                              CHECKPOINT_EVERY: tl.constexpr, PRECOMPUTED_G: tl.constexpr):
     """State-block kappa forward scan: one launch loops over chunks inside each program."""
     pid_b = tl.program_id(0)
     cb = tl.program_id(1)
@@ -1269,15 +1295,19 @@ def _kappa_fwd_scan_cb_atomic(alpha_ptr, q_ptr, k_ptr, v_ptr, hr_ptr, hw_ptr, wr
         kap = tl.load(kap_ptr + pid_b*sk_b + rows*sk_l, mask=rmask, other=0.0)
         causal = (offs_t[:, None] >= offs_t[None, :]) & rmask[:, None] & rmask[None, :]
 
-        G = tl.zeros([BT, BT], dtype=tl.float32)
-        for d0 in range(ND):
-            offs_k = d0 * BK + tl.arange(0, BK)
-            kmask = offs_k < dqk
-            qc = tl.load(q_ptr + pid_b*sq_b + rows[:, None]*sq_l + offs_k[None, :]*sq_d,
-                         mask=rmask[:, None] & kmask[None, :], other=0.0)
-            kc = tl.load(k_ptr + pid_b*sq_b + rows[:, None]*sq_l + offs_k[None, :]*sq_d,
-                         mask=rmask[:, None] & kmask[None, :], other=0.0)
-            G += tl.dot(qc, tl.trans(kc))
+        if PRECOMPUTED_G:
+            G = tl.load(g_ptr + pid_b * sg_b + ci * sg_c + offs_t[:, None] * sg_i + offs_t[None, :] * sg_j,
+                        mask=rmask[:, None] & rmask[None, :], other=0.0).to(tl.float32)
+        else:
+            G = tl.zeros([BT, BT], dtype=tl.float32)
+            for d0 in range(ND):
+                offs_k = d0 * BK + tl.arange(0, BK)
+                kmask = offs_k < dqk
+                qc = tl.load(q_ptr + pid_b*sq_b + rows[:, None]*sq_l + offs_k[None, :]*sq_d,
+                             mask=rmask[:, None] & kmask[None, :], other=0.0)
+                kc = tl.load(k_ptr + pid_b*sq_b + rows[:, None]*sq_l + offs_k[None, :]*sq_d,
+                             mask=rmask[:, None] & kmask[None, :], other=0.0)
+                G += tl.dot(qc, tl.trans(kc))
         Gc = G * causal
 
         r_tile, w_tile = _build_rw_tile_logits(hr_ptr, hw_ptr, sel_ptr, cols, cmask,
@@ -1420,6 +1450,19 @@ def _kappa_routed_fwd(q, k, v, lr, lw, alpha, kap, D, b, sel, chunk, global_norm
         Sden = state_in[1].clone()
     if c_hi is None:
         c_hi = NCH
+    precompute_g = NCBLK > 1
+    if precompute_g:
+        Gbuf = torch.empty(B, c_hi - c_lo, chunk, chunk, device=q.device, dtype=torch.float32)
+        _kappa_precompute_g[(B, c_hi - c_lo)](
+            q, k, Gbuf, L, dqk, c_lo,
+            q.stride(0), q.stride(1), q.stride(2),
+            Gbuf.stride(0), Gbuf.stride(1), Gbuf.stride(2), Gbuf.stride(3),
+            BT=chunk, BK=BK, ND=ND,
+            num_warps=4, num_stages=1)
+        sG = Gbuf.stride()
+    else:
+        Gbuf = q.new_empty(1, 1, 1, 1)
+        sG = (0, 0, 0, 0)
     # #55: save_checkpoints (the differentiable forward) → store the sparse √NCH boundary states the
     # backward seeds its segment recomputes from. Resolved to the shared window so fwd-store/bwd-index agree.
     checkpoint_every = _kappa_ckpt_window(NCH) if save_checkpoints else None
@@ -1477,7 +1520,7 @@ def _kappa_routed_fwd(q, k, v, lr, lw, alpha, kap, D, b, sel, chunk, global_norm
         snd = (0, 0, 0, 0)
     _kappa_fwd_scan_cb_atomic[(B, NCBLK)](
         alpha, q, k, v, lr, lw, br, bw, sel, kap, Sval, Sden, num, den, snap_val_arg, snap_den_arg, br, bw,
-        rprob, wprob,
+        rprob, wprob, Gbuf,
         L, d_model, dqk, dv, nc, *head,
         sa[0], sa[1], q.stride(0), q.stride(1), q.stride(2),
         v.stride(0), v.stride(1), v.stride(2), kap.stride(0), kap.stride(1),
@@ -1487,9 +1530,11 @@ def _kappa_routed_fwd(q, k, v, lr, lw, alpha, kap, D, b, sel, chunk, global_norm
         Sden.stride(0), Sden.stride(1), Sden.stride(2),
         num.stride(0), num.stride(1), num.stride(2), den.stride(0), den.stride(1),
         *snv, *snd, *sbias, *srp, *swp,
+        *sG,
         C_LO=c_lo, NCH_LOOP=c_hi - c_lo,
         NEED_SNAPSHOTS=need_snapshots, SAVE_CHECKPOINTS=checkpoint_every is not None,
         CHECKPOINT_EVERY=checkpoint_every or 1,
+        PRECOMPUTED_G=precompute_g,
         **common)
     # Return the SMEM-fitted `chunk` actually used: the backward's reverse-scan must drive the SAME chunk
     # as this recompute (NCH / per-chunk snapshot alignment) — threading it out is the single source of
