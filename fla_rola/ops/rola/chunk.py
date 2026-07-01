@@ -1527,6 +1527,51 @@ def _kappa_rescale_bwd(drt_tile, r_tile, d_tile, kap, cmask,
 
 
 @triton.jit
+def _normalize_readout_kernel(num_ptr, den_ptr, v_ptr, out_ptr,
+                              total, L: tl.constexpr, dv: tl.constexpr,
+                              sn_b, sn_l, sn_v, sd_b, sd_l, sv_b, sv_l, sv_d, so_b, so_l, so_v,
+                              EPS: tl.constexpr, BLOCK: tl.constexpr):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < total
+    d = offs % dv
+    t = (offs // dv) % L
+    b = offs // (L * dv)
+    den = tl.load(den_ptr + b * sd_b + t * sd_l, mask=mask, other=0.0).to(tl.float32)
+    val = tl.load(num_ptr + b * sn_b + t * sn_l + d * sn_v, mask=mask, other=0.0).to(tl.float32)
+    val = val / (den + EPS)
+    if L > 0:
+        v0 = tl.load(v_ptr + b * sv_b + d * sv_d, mask=mask & (t == 0), other=0.0).to(tl.float32)
+        first = v0 * (den / (den + EPS))
+        val = tl.where(t == 0, first, val)
+    tl.store(num_ptr + b * sn_b + t * sn_l + d * sn_v, val, mask=mask)
+    tl.store(out_ptr + b * so_b + t * so_l + d * so_v, val, mask=mask)
+
+
+def _normalize_readout(num, den, v, eps, out_dtype, save_fp32):
+    """Normalize fp32 numerator in-place and return the dtype-visible readout.
+
+    `num` is kept as the fp32 normalized output when backward needs strict dden = -do·out/(den+eps).
+    The returned tensor is cast in the same Triton epilogue, which avoids separate torch div/copy/cast
+    launches and avoids the layer wrapper recasting through fp32.
+    """
+    if num.numel() == 0:
+        return num if save_fp32 or out_dtype == torch.float32 else num.to(out_dtype)
+    out = num if out_dtype == torch.float32 else torch.empty_like(num, dtype=out_dtype)
+    B, L, dv = num.shape
+    total = B * L * dv
+    block = 256
+    _normalize_readout_kernel[(triton.cdiv(total, block),)](
+        num, den, v, out, total, L, dv,
+        num.stride(0), num.stride(1), num.stride(2),
+        den.stride(0), den.stride(1),
+        v.stride(0), v.stride(1), v.stride(2),
+        out.stride(0), out.stride(1), out.stride(2),
+        EPS=eps, BLOCK=block,
+        num_warps=4)
+    return out
+
+
+@triton.jit
 def _kappa_router_bwd_fold(hr_ptr, hw_ptr, hg_ptr, wr_ptr, ww_ptr, sel_ptr, gdr_ptr, gdw_ptr,
                            dhr_ptr, dhw_ptr, dhg_ptr, dwr_ptr, dww_ptr, br_ptr, bw_ptr, dbr_ptr, dbw_ptr,
                            wg_ptr, dwg_ptr, dld_ptr,
@@ -2176,14 +2221,8 @@ class _RoLARoutedKappaFn(torch.autograd.Function):
                 global_norm, per_state, eps, H)
             ckv = ckd = None
         den_f = den.float()
-        out = num.float()
-        out.div_(den_f.unsqueeze(-1) + eps)
-        if out.shape[1] > 0:
-            # At the first token there is no prior state and the causal block contains only the diagonal,
-            # so num_0 = den_0 * v_0 for every normalized mode. Use that identity directly; the generic
-            # tiled numerator/denominator path is algebraically equivalent but leaves a tiny fp32 mismatch
-            # that gets amplified in the kappa-gradient cancellation.
-            out[:, 0].copy_(v[:, 0].float() * (den_f[:, 0] / (den_f[:, 0] + eps))[:, None])
+        out_ret = _normalize_readout(num, den_f, v, eps, q_dtype, save_fp32=True)
+        out = num
         # #45: the GLA decay's saved activation is the [H,d_model] Wg (NOT a [L,nc] ld) — the saved-act win.
         # Save fp32 out/den so backward owns the normalization and can avoid the worst dκ num/den
         # cancellation at the custom autograd boundary.
@@ -2194,7 +2233,7 @@ class _RoLARoutedKappaFn(torch.autograd.Function):
         ctx.q_dtype = q_dtype
         ctx.h_dtype = h_dtype
         ctx.use_g = use_g
-        return out.to(q_dtype)
+        return out_ret
 
     @staticmethod
     @input_guard
@@ -2252,12 +2291,7 @@ def _kappa_routed_readout(qf, kf, vf, hf, hfw, hfg, Wr, Ww, kapf, alpha, D, b, c
         num, den, _sv, _sd, _ck = _kappa_routed_fwd(
             qf, kf, vf, lr, lw, alpha, kap, D, b, _build_sel(D, b, b ** D, qf.device), chunk_size,
             global_norm, per_state, eps, H)
-        out = num.float()
-        den_f = den.float()
-        out.div_(den_f.unsqueeze(-1) + eps)
-        if out.shape[1] > 0:
-            out[:, 0].copy_(vf[:, 0].float() * (den_f[:, 0] / (den_f[:, 0] + eps))[:, None])
-        return out
+        return _normalize_readout(num, den.float(), vf, eps, qf.dtype, save_fp32=False)
     ckpt_inputs = (qf, kf, vf, hf, hfw, hfg, Wr, Ww, kap, alpha, b_r, b_w, Wg)
     save_checkpoints = torch.is_grad_enabled() and any(
         t is not None and t.requires_grad for t in ckpt_inputs)
@@ -2610,7 +2644,7 @@ def chunk_rola_routed(q, k, v, h, Wr, Ww, D, b, norm='kappa', kappa=None, scale=
                                     chunk_size, global_norm=(norm == 'global'),
                                     per_state=(norm == 'per_state'), eps=eps,
                                     b_r=b_r, b_w=b_w, Wg=Wgf, H=H)
-        return unfold(out.float()).to(v.dtype)
+        return unfold(out).to(v.dtype)
 
     # CPU reference path (qf not on CUDA) for all normalized norms: the per-state den pre-pass on
     # explicit gates + the eager-core numerator. ALL CUDA normalized norms (incl. 'global') route through
