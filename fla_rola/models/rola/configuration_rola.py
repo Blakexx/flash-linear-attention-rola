@@ -22,7 +22,6 @@ class RoLAConfig(PretrainedConfig):
         num_heads: int = 8,
         qk_norm: bool = False,                              # per-head qk-rmsnorm (LM-scale stabilizer)
         router_bias: bool = False,                          # bias on read/write router projections
-        router_zloss_coef: float = 0.0,                     # ST-MoE router z-loss (0 = off)
         # --- backbone (mirrors GLAConfig) ---
         hidden_size: int = 1024,
         num_hidden_layers: int = 24,
@@ -54,7 +53,6 @@ class RoLAConfig(PretrainedConfig):
         self.num_heads = num_heads
         self.qk_norm = qk_norm
         self.router_bias = router_bias
-        self.router_zloss_coef = router_zloss_coef
 
         self.hidden_size = hidden_size
         self.num_hidden_layers = num_hidden_layers
