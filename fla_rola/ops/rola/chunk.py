@@ -540,6 +540,40 @@ def _route_tile_probs_folded(h, W, bias, H, lse_levels, cols, D, b):
     return probs.reshape(BH, L, cols.numel()).contiguous()
 
 
+def _route_factor_cache(h_read, h_write, Wr, Ww, b_r, b_w, H, D, b, state_block, branch_block):
+    """Build the small factor cache used to stream leaf-probability tiles.
+
+    For ordinary tree/square routing, `b` is small, so storing [BH,L,D,b] factor probabilities is much
+    cheaper than storing [BH,L,b**D] leaves. For very wide flat routing, stream each level's logsumexp and
+    compute only the requested leaf tile.
+    """
+    dense_factors = b <= state_block
+    if dense_factors:
+        return (
+            True,
+            _factor_probs_full_folded(h_read, Wr, b_r, H),
+            _factor_probs_full_folded(h_write, Ww, b_w, H),
+            None,
+            None,
+        )
+    read_lse = [_stream_factor_lse_folded(h_read, Wr, b_r, H, level, branch_block) for level in range(D)]
+    write_lse = [_stream_factor_lse_folded(h_write, Ww, b_w, H, level, branch_block) for level in range(D)]
+    return False, None, None, read_lse, write_lse
+
+
+def _route_tile_probs_cached(h_read, h_write, Wr, Ww, b_r, b_w, H, D, b, cols,
+                             dense_factors, read_factors, write_factors, read_lse, write_lse):
+    if dense_factors:
+        return (
+            _route_tile_probs_from_factors_folded(read_factors, cols, D, b),
+            _route_tile_probs_from_factors_folded(write_factors, cols, D, b),
+        )
+    return (
+        _route_tile_probs_folded(h_read, Wr, b_r, H, read_lse, cols, D, b),
+        _route_tile_probs_folded(h_write, Ww, b_w, H, write_lse, cols, D, b),
+    )
+
+
 def _gates_from_factor_logits(logits, D, b):
     """Fold per-level factor logits [*, D, b] into the explicit leaf gates [*, nc] (the torch leaf-product
     the kernel's Sel-gather mirrors) — for the driver's CPU-side decay/Λ recompute (never the kernel's
@@ -664,21 +698,39 @@ def _rola_routed_fwd_intra(q_ptr, k_ptr, v_ptr, h_ptr, lr_ptr, lw_ptr, sel_ptr, 
         kc = tl.load(k_ptr + b*sq_b + rows[:, None]*sq_l + offs_d[None, :]*sq_d,
                      mask=rmask[:, None] & dmask[None, :], other=0.0)
         G += tl.dot(qc, tl.trans(kc))
-    R = tl.zeros([BT, BT], dtype=tl.float32)
-    for sb in range(NB):
-        offs_c = sb * BG + tl.arange(0, BG)
-        cmask = offs_c < nc
-        rgc, wgc = _build_rw_tile_logits(lr_ptr, lw_ptr, sel_ptr, offs_c, cmask,
-                                         b, rows, rmask, offs_bb, bmask,
-                                         slo_b, slo_l, slo_lvl, slo_bb, slo_b, slo_l, slo_lvl, slo_bb,
-                                         ssel_lvl, ssel_b, ssel_c, D, BT, BB, BG)
-        if USE_G:
+    if not USE_G:
+        # Exact square/tree factorization:
+        #   Σ_leaf Π_l fr_i,l[d_l] fw_j,l[d_l] = Π_l Σ_branch fr_i,l[branch] fw_j,l[branch].
+        # This removes the nc/BG loop for the intra gram when decay does not make gates leaf-specific.
+        R = tl.full([BT, BT], 1.0, dtype=tl.float32)
+        neg = tl.full([BT, BB], float('-inf'), dtype=tl.float32)
+        for lvl in range(D):
+            lw = tl.load(lw_ptr + b * slo_b + rows[:, None] * slo_l + lvl * slo_lvl + offs_bb[None, :] * slo_bb,
+                         mask=rmask[:, None] & bmask[None, :], other=0.0).to(tl.float32)
+            lr = tl.load(lr_ptr + b * slo_b + rows[:, None] * slo_l + lvl * slo_lvl + offs_bb[None, :] * slo_bb,
+                         mask=rmask[:, None] & bmask[None, :], other=0.0).to(tl.float32)
+            lw = tl.where(bmask[None, :], lw, neg)
+            lr = tl.where(bmask[None, :], lr, neg)
+            ew = tl.exp(lw - tl.max(lw, axis=1)[:, None])
+            er = tl.exp(lr - tl.max(lr, axis=1)[:, None])
+            fw = ew / tl.sum(ew, axis=1)[:, None]
+            fr = er / tl.sum(er, axis=1)[:, None]
+            R *= tl.dot(fr, tl.trans(fw))
+    else:
+        R = tl.zeros([BT, BT], dtype=tl.float32)
+        for sb in range(NB):
+            offs_c = sb * BG + tl.arange(0, BG)
+            cmask = offs_c < nc
+            rgc, wgc = _build_rw_tile_logits(lr_ptr, lw_ptr, sel_ptr, offs_c, cmask,
+                                             b, rows, rmask, offs_bb, bmask,
+                                             slo_b, slo_l, slo_lvl, slo_bb, slo_b, slo_l, slo_lvl, slo_bb,
+                                             ssel_lvl, ssel_b, ssel_c, D, BT, BB, BG)
             ldc = _ld_from_w(wgc, alpha, cmask, GLA_FLOOR)
             a = tl.cumsum(ldc, axis=0)
             _ea, ea_g, ena_g = _decay_factors(a)        # ANCHORED intra-gram pair (no e^{-a} overflow)
             rgc = rgc * ea_g
             wgc = wgc * ena_g
-        R += tl.dot(rgc.to(tl.float32), tl.trans(wgc))
+            R += tl.dot(rgc.to(tl.float32), tl.trans(wgc))
     vc = tl.load(v_ptr + b*sv_b + rows[:, None]*sv_l + offs_v[None, :]*sv_d,
                  mask=rmask[:, None] & (offs_v[None, :] < dv), other=0.0)
     causal = (offs_t[:, None] >= offs_t[None, :]) & rmask[:, None] & rmask[None, :]
@@ -2366,41 +2418,47 @@ def _kappa_routed_bwd(q, k, v, h, h_w, h_g, Wr, Ww, kap, alpha, ckpt_val, ckpt_d
     return (dq[..., :dqk], dk[..., :dqk], dvv[..., :dv], dh, dhw, dhg, dWr, dWw, dkap)
 
 
-def _kappa_routed_readout_tiled(qf, kf, vf, hf, hfw, Wr, Ww, kap, alpha, D, b, chunk_size,
-                                global_norm, per_state, eps, b_r=None, b_w=None,
-                                state_block=64, branch_block=16):
-    """No-grad prefill path: stream GEMM-built router probability tiles into the scan."""
-    BHF, L, _dm = hf.shape
+def _kappa_routed_fwd_tiled(qf, kf, vf, hf, hfw, Wr, Ww, kap, alpha, D, b, chunk_size,
+                            global_norm, per_state, eps, b_r=None, b_w=None, state_block=64,
+                            branch_block=16):
+    """Stream GEMM-built router probability tiles into the kappa/global scan.
+
+    This is the no-grad progressive-router forward: build only a [BH,L,state_block] read/write
+    probability tile, scan that state slice, accumulate num/den, then free the tile. Training keeps the
+    strict in-kernel checkpoint path so saved states and backward recompute use the same fp32 route math.
+    """
+    BHF, L, dqk = qf.shape
+    dv = vf.shape[-1]
     H = Wr.shape[0]
     nc = b ** D
-    dense_factors = b <= state_block
-    if dense_factors:
-        read_factors = _factor_probs_full_folded(hf, Wr, b_r, H)
-        write_factors = _factor_probs_full_folded(hfw, Ww, b_w, H)
-        read_lse = write_lse = None
-    else:
-        read_factors = write_factors = None
-        read_lse = [_stream_factor_lse_folded(hf, Wr, b_r, H, level, branch_block) for level in range(D)]
-        write_lse = [_stream_factor_lse_folded(hfw, Ww, b_w, H, level, branch_block) for level in range(D)]
+    dense_factors, read_factors, write_factors, read_lse, write_lse = _route_factor_cache(
+        hf, hfw, Wr, Ww, b_r, b_w, H, D, b, state_block, branch_block)
 
     num_acc = den_acc = None
     for c0 in range(0, nc, state_block):
         c1 = min(c0 + state_block, nc)
         group = c1 - c0
         cols = torch.arange(c0, c1, device=qf.device)
-        if dense_factors:
-            rt = _route_tile_probs_from_factors_folded(read_factors, cols, D, b)
-            wt = _route_tile_probs_from_factors_folded(write_factors, cols, D, b)
-        else:
-            rt = _route_tile_probs_folded(hf, Wr, b_r, H, read_lse, cols, D, b)
-            wt = _route_tile_probs_folded(hfw, Ww, b_w, H, write_lse, cols, D, b)
+        rt, wt = _route_tile_probs_cached(
+            hf, hfw, Wr, Ww, b_r, b_w, H, D, b, cols,
+            dense_factors, read_factors, write_factors, read_lse, write_lse)
         sel = _build_sel(1, group, group, qf.device)
-        num, den, _sv, _sd, _ck = _kappa_routed_fwd(
+        num, den, ckv_tile, ckd_tile, _ck = _kappa_routed_fwd(
             qf, kf, vf, hf, hfw, Wr, Ww, alpha, kap, 1, group, sel, chunk_size,
             global_norm, per_state, eps, route_probs=(rt, wt))
         num_acc = num if num_acc is None else num_acc + num
         den_acc = den if den_acc is None else den_acc + den
-        del rt, wt, num, den
+        del rt, wt, num, den, ckv_tile, ckd_tile
+
+    return num_acc, den_acc
+
+
+def _kappa_routed_readout_tiled(qf, kf, vf, hf, hfw, Wr, Ww, kap, alpha, D, b, chunk_size,
+                                global_norm, per_state, eps, b_r=None, b_w=None):
+    """No-grad prefill path: stream GEMM-built router probability tiles into the scan."""
+    num_acc, den_acc = _kappa_routed_fwd_tiled(
+        qf, kf, vf, hf, hfw, Wr, Ww, kap, alpha, D, b, chunk_size,
+        global_norm, per_state, eps, b_r=b_r, b_w=b_w)
 
     den_f = den_acc.float()
     out = num_acc.float()
@@ -2443,11 +2501,12 @@ class _RoLARoutedKappaFn(torch.autograd.Function):
             q, k, v, kap = (x.float().contiguous() for x in (q, k, v, kap))
             alphaf = alphac.float().contiguous() if use_g else None
             Wgc = Wgc.float().contiguous() if Wgc is not None else None
-            num, den, ckv, ckd, _ck = _kappa_routed_fwd(q, k, v, h, h_w, Wr, Ww, alphaf, kap, D, b, sel, chunk,
-                                                        global_norm, per_state, eps,
-                                                        b_r=br if has_bias else None,
-                                                        b_w=bw if has_bias else None, Wg=Wgc,
-                                                        save_checkpoints=True)
+            num, den, ckv, ckd, _ck = _kappa_routed_fwd(
+                q, k, v, h, h_w, Wr, Ww, alphaf, kap, D, b, sel, chunk,
+                global_norm, per_state, eps,
+                b_r=br if has_bias else None,
+                b_w=bw if has_bias else None, Wg=Wgc,
+                save_checkpoints=True)
         else:
             num, den, _sv, _sd, _ck = _kappa_routed_fwd(q, k, v, h, h_w, Wr, Ww, alphac if use_g else None, kap,
                                                         D, b, sel, chunk, global_norm, per_state, eps,
