@@ -420,7 +420,7 @@ class TestIntraConfigEquivalence:
 
     @pytest.mark.parametrize('gla', [False, True])
     def test_kappa_sparse_checkpoints_match_dense_checkpoint_bwd(self, gla):
-        """#55 proof: the production sqrt-spaced checkpoint backward must match the old dense every-chunk
+        """#55 proof: the production sparse-checkpoint backward must match the old dense every-chunk
         snapshot schedule. This compares the actual fused backward kernels, not only the fp64 reference."""
         if device != 'cuda':
             pytest.skip('RoLA Triton kernels require CUDA')
@@ -440,7 +440,7 @@ class TestIntraConfigEquivalence:
         sel = C._build_sel(D, b, b ** D, q.device)
         chunk = 64
 
-        num_s, den_s, ckv_s, ckd_s, _ = C._kappa_routed_fwd(
+        num_s, den_s, ckv_s, ckd_s, ck_s = C._kappa_routed_fwd(
             q, k, v, h, h, Wr, Ww, None, None, alpha, kap, D, b, sel, chunk,
             global_norm=False, per_state=False, eps=EPS, H=H, save_checkpoints=True)
         num_d, den_d, ckv_d, ckd_d, _ = C._kappa_routed_fwd(
@@ -462,11 +462,10 @@ class TestIntraConfigEquivalence:
         dden_d = -(do * out_d).sum(-1) / (den_d + EPS)
         gs = C._kappa_routed_bwd(
             q, k, v, h, h, h, Wr, Ww, None, None, kap, alpha, ckv_s, ckd_s, out_s, dnum_s, dden_s, D, b, sel, chunk,
-            global_norm=False, per_state=False, eps=EPS, H=H, Wg=Wg)
+            global_norm=False, per_state=False, eps=EPS, H=H, route_window=ck_s[1], Wg=Wg)
         gd = C._kappa_routed_bwd(
             q, k, v, h, h, h, Wr, Ww, None, None, kap, alpha, ckv_d, ckd_d, out_d, dnum_d, dden_d, D, b, sel, chunk,
-            global_norm=False, per_state=False, eps=EPS, H=H, Wg=Wg,
-            checkpoint_window_override=1)
+            global_norm=False, per_state=False, eps=EPS, H=H, route_window=1, Wg=Wg)
         names = ['dq', 'dk', 'dv', 'dhr', 'dhw', 'dhg', 'dWr', 'dWw', 'dbr', 'dbw', 'dkap'] + (['dWg'] if gla else [])
         for name, sparse, dense in zip(names, gs, gd):
             assert _relmax(sparse, dense) < 2e-4, f'{name}: sparse vs dense checkpoint rel {_relmax(sparse, dense):.2e}'

@@ -27,6 +27,8 @@ import triton.language as tl
 
 from fla_rola.ops.rola.routed_bwd_kernels import (  # production tree-routed backward kernels (the in-kernel router-grad fold)
     _build_alpha,  # in-kernel per-state log-decay helpers (#45): alpha=sigmoid(h·Wg), ld=clamp(log(1-w(1-alpha)))
+    _build_factors as _build_factors_logits,
+    _build_level_factors as _build_level_factors_logits,
     _decay_factors,  # re-anchored GLA decay factors (ea TRUE; ea_g/ena_g anchored intra-gram pair — fp32-overflow kill)
     _ld_from_w,
 )
@@ -403,100 +405,6 @@ def _bias_strides(br, bw, has_bias):
 def _router_head_strides(Wr, Ww, br, bw, has_bias):
     H = Wr.shape[0]
     return (H, Wr.stride(0), Ww.stride(0), br.stride(0) if has_bias else 0, bw.stride(0) if has_bias else 0)
-
-
-@triton.jit
-def _build_rw_tile(hr_ptr, hw_ptr, wr_ptr, ww_ptr, sel_ptr, offs_c, cmask,
-                   bn, rows, rmask, offs_bb, bmask, d_model,
-                   shr_b, shr_l, shr_d, shw_b, shw_l, shw_d,
-                   swr_lvl, swr_d, swr_b, sww_lvl, sww_d, sww_b,
-                   ssel_lvl, ssel_b, ssel_c,
-                   br_ptr, bw_ptr, sbr_lvl, sbr_b, sbw_lvl, sbw_b,
-                   D: tl.constexpr, BT: tl.constexpr, BB: tl.constexpr,
-                   BG: tl.constexpr, BD: tl.constexpr, NDM: tl.constexpr,
-                   HAS_BIAS: tl.constexpr, BUILD_R: tl.constexpr = True):
-    r_tile = tl.full([BT, BG], 1.0, dtype=tl.float32)
-    w_tile = tl.full([BT, BG], 1.0, dtype=tl.float32)
-    for lvl in range(D):
-        lr = tl.zeros([BT, BB], dtype=tl.float32)
-        lw = tl.zeros([BT, BB], dtype=tl.float32)
-        for dm in range(NDM):
-            offs_dm = dm * BD + tl.arange(0, BD)
-            mmask = offs_dm < d_model
-            hwc = tl.load(hw_ptr + bn * shw_b + rows[:, None] * shw_l + offs_dm[None, :] * shw_d,
-                          mask=rmask[:, None] & mmask[None, :], other=0.0)
-            ww = tl.load(ww_ptr + lvl * sww_lvl + offs_dm[:, None] * sww_d + offs_bb[None, :] * sww_b,
-                         mask=mmask[:, None] & bmask[None, :], other=0.0)
-            lw += tl.dot(hwc, ww)
-            if BUILD_R:
-                hrc = tl.load(hr_ptr + bn * shr_b + rows[:, None] * shr_l + offs_dm[None, :] * shr_d,
-                              mask=rmask[:, None] & mmask[None, :], other=0.0)
-                wr = tl.load(wr_ptr + lvl * swr_lvl + offs_dm[:, None] * swr_d + offs_bb[None, :] * swr_b,
-                             mask=mmask[:, None] & bmask[None, :], other=0.0)
-                lr += tl.dot(hrc, wr)
-        if HAS_BIAS:
-            bwc = tl.load(bw_ptr + lvl * sbw_lvl + offs_bb * sbw_b, mask=bmask, other=0.0)
-            lw += bwc[None, :]
-            if BUILD_R:
-                brc = tl.load(br_ptr + lvl * sbr_lvl + offs_bb * sbr_b, mask=bmask, other=0.0)
-                lr += brc[None, :]
-        neg = tl.full([BT, BB], float('-inf'), dtype=tl.float32)
-        lw = tl.where(bmask[None, :], lw, neg)
-        ew = tl.exp(lw - tl.max(lw, axis=1)[:, None])
-        fw = ew / tl.sum(ew, axis=1)[:, None]
-        sel = tl.load(sel_ptr + lvl * ssel_lvl + offs_bb[:, None] * ssel_b + offs_c[None, :] * ssel_c,
-                      mask=bmask[:, None] & cmask[None, :], other=0.0)
-        w_tile *= tl.dot(fw, sel)
-        if BUILD_R:
-            lr = tl.where(bmask[None, :], lr, neg)
-            er = tl.exp(lr - tl.max(lr, axis=1)[:, None])
-            fr = er / tl.sum(er, axis=1)[:, None]
-            r_tile *= tl.dot(fr, sel)
-    w_tile = tl.where(cmask[None, :], w_tile, 0.0)
-    if BUILD_R:
-        r_tile = tl.where(cmask[None, :], r_tile, 0.0)
-    return r_tile, w_tile
-
-
-@triton.jit
-def _build_level_factors_weights(hr_ptr, hw_ptr, wr_ptr, ww_ptr, sel_ptr, offs_c, cmask,
-                                 bn, rows, rmask, offs_bb, bmask, d_model,
-                                 shr_b, shr_l, shr_d, shw_b, shw_l, shw_d,
-                                 swr_lvl, swr_d, swr_b, sww_lvl, sww_d, sww_b,
-                                 ssel_lvl, ssel_b, ssel_c,
-                                 br_ptr, bw_ptr, sbr_lvl, sbr_b, sbw_lvl, sbw_b,
-                                 lvl: tl.constexpr, BT: tl.constexpr, BB: tl.constexpr,
-                                 BD: tl.constexpr, NDM: tl.constexpr, HAS_BIAS: tl.constexpr):
-    lr = tl.zeros([BT, BB], dtype=tl.float32)
-    lw = tl.zeros([BT, BB], dtype=tl.float32)
-    for dm in range(NDM):
-        offs_dm = dm * BD + tl.arange(0, BD)
-        mmask = offs_dm < d_model
-        hrc = tl.load(hr_ptr + bn * shr_b + rows[:, None] * shr_l + offs_dm[None, :] * shr_d,
-                      mask=rmask[:, None] & mmask[None, :], other=0.0)
-        hwc = tl.load(hw_ptr + bn * shw_b + rows[:, None] * shw_l + offs_dm[None, :] * shw_d,
-                      mask=rmask[:, None] & mmask[None, :], other=0.0)
-        wr = tl.load(wr_ptr + lvl * swr_lvl + offs_dm[:, None] * swr_d + offs_bb[None, :] * swr_b,
-                     mask=mmask[:, None] & bmask[None, :], other=0.0)
-        ww = tl.load(ww_ptr + lvl * sww_lvl + offs_dm[:, None] * sww_d + offs_bb[None, :] * sww_b,
-                     mask=mmask[:, None] & bmask[None, :], other=0.0)
-        lr += tl.dot(hrc, wr)
-        lw += tl.dot(hwc, ww)
-    if HAS_BIAS:
-        brc = tl.load(br_ptr + lvl * sbr_lvl + offs_bb * sbr_b, mask=bmask, other=0.0)
-        bwc = tl.load(bw_ptr + lvl * sbw_lvl + offs_bb * sbw_b, mask=bmask, other=0.0)
-        lr += brc[None, :]
-        lw += bwc[None, :]
-    neg = tl.full([BT, BB], float('-inf'), dtype=tl.float32)
-    lr = tl.where(bmask[None, :], lr, neg)
-    lw = tl.where(bmask[None, :], lw, neg)
-    er = tl.exp(lr - tl.max(lr, axis=1)[:, None])
-    ew = tl.exp(lw - tl.max(lw, axis=1)[:, None])
-    fr = er / tl.sum(er, axis=1)[:, None]
-    fw = ew / tl.sum(ew, axis=1)[:, None]
-    sel = tl.load(sel_ptr + lvl * ssel_lvl + offs_bb[:, None] * ssel_b + offs_c[None, :] * ssel_c,
-                  mask=bmask[:, None] & cmask[None, :], other=0.0)
-    return fr, fw, sel
 
 
 @triton.jit
@@ -1329,7 +1237,8 @@ def _kappa_fwd_scan_cb_atomic(alpha_ptr, q_ptr, k_ptr, v_ptr, hr_ptr, hw_ptr, wr
                               NDM: tl.constexpr, HAS_BIAS: tl.constexpr, USE_G: tl.constexpr, GLA_FLOOR: tl.constexpr,
                               C_LO: tl.constexpr, NCH_LOOP: tl.constexpr,
                               NEED_SNAPSHOTS: tl.constexpr, SAVE_CHECKPOINTS: tl.constexpr,
-                              CHECKPOINT_EVERY: tl.constexpr, PRECOMPUTED_G: tl.constexpr):
+                              CHECKPOINT_EVERY: tl.constexpr, SNAP_BASE: tl.constexpr,
+                              PRECOMPUTED_G: tl.constexpr):
     """State-block kappa forward scan: one launch loops over chunks inside each program."""
     pid_b = tl.program_id(0)
     cb = tl.program_id(1)
@@ -1356,7 +1265,7 @@ def _kappa_fwd_scan_cb_atomic(alpha_ptr, q_ptr, k_ptr, v_ptr, hr_ptr, hw_ptr, wr
 
         if NEED_SNAPSHOTS or SAVE_CHECKPOINTS:
             write_snap = True
-            snap_i = ci
+            snap_i = SNAP_BASE + ci
             if SAVE_CHECKPOINTS:
                 write_snap = (c_abs % CHECKPOINT_EVERY) == 0
                 snap_i = c_abs // CHECKPOINT_EVERY
@@ -1396,13 +1305,13 @@ def _kappa_fwd_scan_cb_atomic(alpha_ptr, q_ptr, k_ptr, v_ptr, hr_ptr, hw_ptr, wr
                 G += tl.dot(qc, tl.trans(kc))
         Gc = G * causal
 
-        r_tile, w_tile = _build_rw_tile(
-            hr_ptr, hw_ptr, wr_ptr, ww_ptr, sel_ptr, cols, cmask,
-            pid_b, rows, rmask, offs_bb, bmask, d_model,
-            shr_b, shr_l, shr_d, shw_b, shw_l, shw_d,
-            swr_lvl, swr_d, swr_b, sww_lvl, sww_d, sww_b,
-            ssel_lvl, ssel_b, ssel_c, br_ptr, bw_ptr, sbr_lvl, sbr_b, sbw_lvl, sbw_b,
-            D, BT, BB, BC, BD, NDM, HAS_BIAS, BUILD_R=True)
+        route_rows = ci * BT + offs_t
+        r_tile, w_tile = _build_rw_tile_logits(hr_ptr, hw_ptr, sel_ptr, cols, cmask,
+                                               pid_b, route_rows, rmask, offs_bb, bmask,
+                                               shr_b, shr_l, swr_lvl, swr_b,
+                                               shw_b, shw_l, sww_lvl, sww_b,
+                                               ssel_lvl, ssel_b, ssel_c,
+                                               D, BT, BB, BC, BUILD_R=True)
         if USE_G:
             ldc = _ld_from_w(w_tile, alpha, cmask, GLA_FLOOR)
             a = tl.cumsum(ldc, axis=0)
@@ -1500,13 +1409,34 @@ def _kappa_ckpt_window(NCH):
     return max(1, math.ceil(math.sqrt(NCH)))
 
 
+def _kappa_route_window(NCH, B, chunk, D, b, dqk, dv, nc, route_dtype, device):
+    """Memory-budgeted route/checkpoint window.
+
+    The window is as large as the current GPU memory budget allows while bounding both transient router
+    logits and backward segment snapshots. This keeps small/medium problems in one GEMM-backed scan window
+    and progressively tiles only when the route/snapshot working set would become material.
+    """
+    if NCH <= 1 or not torch.cuda.is_available() or torch.device(device).type != 'cuda':
+        return max(1, NCH)
+    try:
+        free, _total = torch.cuda.mem_get_info(device)
+    except RuntimeError:
+        return _kappa_ckpt_window(NCH)
+    elem = torch.empty((), device=device, dtype=route_dtype).element_size()
+    route_per_chunk = 2 * B * chunk * D * b * elem
+    snap_per_chunk = B * nc * dqk * (dv + 1) * torch.tensor([], dtype=torch.float32).element_size()
+    per_chunk = max(1, route_per_chunk, snap_per_chunk)
+    budget = max(per_chunk, free // 16)
+    return max(1, min(NCH, budget // per_chunk))
+
+
 def _kappa_routed_fwd(q, k, v, h, h_w, Wr, Ww, b_r, b_w, alpha, kap, D, b, sel, chunk,
                       global_norm, per_state, eps, H, need_snapshots=False, state_in=None,
                       c_lo=0, c_hi=None, save_checkpoints=False, checkpoint_every_override=None):
     """Fused global/kappa/per_state tree-routed forward. Returns (num[B,L,BV], den[B,L], snap_val, snap_den).
     #55 snapshot modes (at most one): need_snapshots=True stores the DENSE per-chunk pre-states for chunks
-    [c_lo,c_hi) (the backward's per-segment recompute); save_checkpoints=True stores only the SPARSE √NCH
-    boundary states (the differentiable forward, for the backward to seed segments from). Both default off →
+    [c_lo,c_hi) (the backward's per-segment recompute); save_checkpoints=True stores only sparse
+    memory-budgeted boundary states (the differentiable forward, for the backward to seed segments from). Both default off →
     (..., None, None) — inference / non-grad forward allocates no snapshot tensor (no prefill blowup).
     Optional precomputed per-head decay alpha:[B,L] (GLA, #45) → USE_G decayed scan. No [L,nc]
     gate/den/r̃/ld buffer is materialized."""
@@ -1517,7 +1447,7 @@ def _kappa_routed_fwd(q, k, v, h, h_w, Wr, Ww, b_r, b_w, alpha, kap, D, b, sel, 
     BC = 16   # tl.dot needs the gram dim >=16; the nc tail is cmask'd (was max(16,min(nc,16)) ≡ 16)
     BK = _kappa_bk_cap(dqk, dv, min(chunk, _CHUNK_FWD), BC)  # feature-tile (loop ND) — bounds the [BT,BC*BK] tiles
     BV = _kappa_bv_tile(dqk, dv, BC)                     # value-tile (loop ND_V) so [BC*BK,BV] fits SRAM
-    BD, NDM = _router_bd_ndm(d_model, b)
+    BD, NDM = 16, 1
     BB = max(16, triton.next_power_of_2(b))
     # The [BT,BC*BK] rq/wk tiles scale with BT → the chunk is SMEM-derived (one uniform formula, fwd+bwd):
     # the largest pow2 BT whose dominant fp32 chunk tile plus the backward BT² live set fits the device
@@ -1537,24 +1467,13 @@ def _kappa_routed_fwd(q, k, v, h, h_w, Wr, Ww, b_r, b_w, alpha, kap, D, b, sel, 
         Sden = state_in[1].clone()
     if c_hi is None:
         c_hi = NCH
-    precompute_g = NCBLK > 1
-    if precompute_g:
-        Gbuf = torch.empty(B, c_hi - c_lo, chunk, chunk, device=q.device, dtype=torch.float32)
-        _kappa_precompute_g[(B, c_hi - c_lo)](
-            q, k, Gbuf, L, dqk, c_lo,
-            q.stride(0), q.stride(1), q.stride(2),
-            Gbuf.stride(0), Gbuf.stride(1), Gbuf.stride(2), Gbuf.stride(3),
-            BT=chunk, BK=BK, ND=ND,
-            num_warps=4, num_stages=1)
-        sG = Gbuf.stride()
-    else:
-        Gbuf = q.new_empty(1, 1, 1, 1)
-        sG = (0, 0, 0, 0)
-    # #55: save_checkpoints (the differentiable forward) → store the sparse √NCH boundary states the
-    # backward seeds its segment recomputes from. Resolved to the shared window so fwd-store/bwd-index agree.
-    checkpoint_every = _kappa_ckpt_window(NCH) if save_checkpoints else None
+    # #55: save_checkpoints (the differentiable forward) → store sparse boundary states the backward seeds
+    # its segment recomputes from. Resolved to the shared memory-budgeted window so fwd-store/bwd-index agree.
+    fitted_window = _kappa_route_window(NCH, B, chunk, D, b, dqk, dv, nc, h.dtype, q.device)
+    checkpoint_every = fitted_window if save_checkpoints else None
     if checkpoint_every is not None and checkpoint_every_override is not None:
         checkpoint_every = max(1, int(checkpoint_every_override))
+    route_window = checkpoint_every or fitted_window
     # F7: num at the TRUE dv (not the padded next_pow2(dv)) — the in-kernel store is already vfmask'd to
     # `offs_vf < dv` (the [dv, NDVP*BV) pad lanes never touch memory), so the buffer needs only dv columns,
     # exactly like dq/dk/dvv above. Saves the BVO−dv pad columns (the [B,L,*] alloc) every forward.
@@ -1566,9 +1485,9 @@ def _kappa_routed_fwd(q, k, v, h, h_w, Wr, Ww, b_r, b_w, alpha, kap, D, b, sel, 
     # F6: NCH is the LEADING axis so the backward's per-chunk slice `snap_*[c]` is an already-contiguous
     # [B,nc,dqk,dv]/[B,nc,dqk] view (identical strides to the contiguous dSval/dSden the kernels assume) —
     # dropping the per-chunk `.contiguous()` copy in `_kappa_routed_bwd` (output byte-identical).
-    # #55 sqrt-checkpointing: need_snapshots stores the DENSE per-chunk pre-states for chunks [c_lo,c_hi)
+    # #55 checkpointing: need_snapshots stores the DENSE per-chunk pre-states for chunks [c_lo,c_hi)
     # (a segment recompute, O(segment·state)); checkpoint_every stores only every W-th state (the sparse
-    # Pass-1 boundary checkpoints the backward seeds segments from, O(√NCH·state)). At most one is set —
+    # Pass-1 boundary checkpoints the backward seeds segments from. At most one is set —
     # never the old [NCH,...] all-snapshot peak (∝ L² when nc scales with L).
     if need_snapshots:
         snap_val = torch.zeros(c_hi - c_lo, B, nc, dqk, dv, device=q.device, dtype=torch.float32)
@@ -1583,15 +1502,11 @@ def _kappa_routed_fwd(q, k, v, h, h_w, Wr, Ww, b_r, b_w, alpha, kap, D, b, sel, 
     alpha = alpha.float().contiguous() if use_g else q.new_empty(1, 1)
     sa = (alpha.stride(0), alpha.stride(1))
     h, h_w, Wr, Ww = (x.contiguous() for x in (h, h_w, Wr, Ww))
-    br, bw, has_bias = _routing_bias(b_r, b_w, H, D, b, q.device, dtype=Wr.dtype)
+    br, bw, has_bias = _routing_bias(None, None, H, D, b, q.device, dtype=Wr.dtype)
     rprob = wprob = q.new_empty(1, 1, 1)
     srp = swp = (0, 0, 0)
     sbias = _bias_strides(br, bw, has_bias)
-    head = _router_head_strides(Wr, Ww, br, bw, has_bias)
-    sWr = (Wr.stride(1), Wr.stride(2), Wr.stride(3))
-    sWw = (Ww.stride(1), Ww.stride(2), Ww.stride(3))
-    sHr = (h.stride(0), h.stride(1), h.stride(2))
-    sHw = (h_w.stride(0), h_w.stride(1), h_w.stride(2))
+    head = (H, 0, 0, 0, 0)
     common = dict(GLOBAL=global_norm, PER_STATE=per_state, EPS=eps, D=D, b=b, BB=BB, BT=chunk,
                   BK=BK, BV=BV, BD=BD, BC=BC, NCBLK=NCBLK, ND=ND, NDV=triton.cdiv(dv, BV),
                   NDVP=triton.next_power_of_2(triton.cdiv(dv, BV)),
@@ -1605,28 +1520,51 @@ def _kappa_routed_fwd(q, k, v, h, h_w, Wr, Ww, b_r, b_w, alpha, kap, D, b, sel, 
     else:
         snv = (0, 0, 0, 0, 0)
         snd = (0, 0, 0, 0)
-    _kappa_fwd_scan_cb_atomic[(B, NCBLK)](
-        alpha, q, k, v, h, h_w, Wr, Ww, sel, kap, Sval, Sden, num, den, snap_val_arg, snap_den_arg, br, bw,
-        rprob, wprob, Gbuf,
-        L, d_model, dqk, dv, nc, *head,
-        sa[0], sa[1], q.stride(0), q.stride(1), q.stride(2),
-        v.stride(0), v.stride(1), v.stride(2), kap.stride(0), kap.stride(1),
-        *sHr, *sHw, *sWr, *sWw,
-        sel.stride(0), sel.stride(1), sel.stride(2),
-        Sval.stride(0), Sval.stride(1), Sval.stride(2), Sval.stride(3),
-        Sden.stride(0), Sden.stride(1), Sden.stride(2),
-        num.stride(0), num.stride(1), num.stride(2), den.stride(0), den.stride(1),
-        *snv, *snd, *sbias, *srp, *swp,
-        *sG,
-        C_LO=c_lo, NCH_LOOP=c_hi - c_lo,
-        NEED_SNAPSHOTS=need_snapshots, SAVE_CHECKPOINTS=checkpoint_every is not None,
-        CHECKPOINT_EVERY=checkpoint_every or 1,
-        PRECOMPUTED_G=precompute_g,
-        **common)
+    for win_lo in range(c_lo, c_hi, route_window):
+        win_hi = min(c_hi, win_lo + route_window)
+        t0 = win_lo * chunk
+        t1 = min(L, win_hi * chunk)
+        lr, lw = _router_logits(h[:, t0:t1], Wr, Ww, b_r, b_w, H, build_r=True, h_w=h_w[:, t0:t1])
+        lr, lw = lr.contiguous(), lw.contiguous()
+        sHr = (lr.stride(0), lr.stride(1), 0)
+        sHw = (lw.stride(0), lw.stride(1), 0)
+        sWr = (lr.stride(2), 0, lr.stride(3))
+        sWw = (lw.stride(2), 0, lw.stride(3))
+        precompute_g = NCBLK > 1
+        if precompute_g:
+            Gbuf = torch.empty(B, win_hi - win_lo, chunk, chunk, device=q.device, dtype=torch.float32)
+            _kappa_precompute_g[(B, win_hi - win_lo)](
+                q, k, Gbuf, L, dqk, win_lo,
+                q.stride(0), q.stride(1), q.stride(2),
+                Gbuf.stride(0), Gbuf.stride(1), Gbuf.stride(2), Gbuf.stride(3),
+                BT=chunk, BK=BK, ND=ND,
+                num_warps=4, num_stages=1)
+            sG = Gbuf.stride()
+        else:
+            Gbuf = q.new_empty(1, 1, 1, 1)
+            sG = (0, 0, 0, 0)
+        _kappa_fwd_scan_cb_atomic[(B, NCBLK)](
+            alpha, q, k, v, lr, lw, br, bw, sel, kap, Sval, Sden, num, den, snap_val_arg, snap_den_arg, br, bw,
+            rprob, wprob, Gbuf,
+            L, 1, dqk, dv, nc, *head,
+            sa[0], sa[1], q.stride(0), q.stride(1), q.stride(2),
+            v.stride(0), v.stride(1), v.stride(2), kap.stride(0), kap.stride(1),
+            *sHr, *sHw, *sWr, *sWw,
+            sel.stride(0), sel.stride(1), sel.stride(2),
+            Sval.stride(0), Sval.stride(1), Sval.stride(2), Sval.stride(3),
+            Sden.stride(0), Sden.stride(1), Sden.stride(2),
+            num.stride(0), num.stride(1), num.stride(2), den.stride(0), den.stride(1),
+            *snv, *snd, *sbias, *srp, *swp,
+            *sG,
+            C_LO=win_lo, NCH_LOOP=win_hi - win_lo,
+            NEED_SNAPSHOTS=need_snapshots, SAVE_CHECKPOINTS=checkpoint_every is not None,
+            CHECKPOINT_EVERY=checkpoint_every or 1, SNAP_BASE=win_lo - c_lo,
+            PRECOMPUTED_G=precompute_g,
+            **common)
     # Return the SMEM-fitted `chunk` actually used: the backward's reverse-scan must drive the SAME chunk
     # as this recompute (NCH / per-chunk snapshot alignment) — threading it out is the single source of
     # truth (no re-fit-must-match-the-fit coupling).
-    return num, den, snap_val, snap_den, chunk
+    return num, den, snap_val, snap_den, (chunk, checkpoint_every or route_window)
 
 
 @triton.jit
@@ -1704,12 +1642,13 @@ def _normalize_readout(num, den, v, eps, out_dtype, save_fp32):
 
 
 @triton.jit
-def _kappa_router_bwd_fold(hr_ptr, hw_ptr, hg_ptr, wr_ptr, ww_ptr, sel_ptr, gdr_ptr, gdw_ptr,
+def _kappa_router_bwd_fold(lr_ptr, lw_ptr, h_ptr, h_w_ptr, hg_ptr, wr_ptr, ww_ptr, sel_ptr, gdr_ptr, gdw_ptr,
                            dhr_ptr, dhw_ptr, dhg_ptr, dwr_ptr, dww_ptr, br_ptr, bw_ptr, dbr_ptr, dbw_ptr,
                            wg_ptr, dwg_ptr, dld_ptr,
-                           L, d_model, d_model_g, nc, t_start,
+                           L, d_model, d_model_g, nc, t_start, route_t0,
                            H, swr_head, sww_head, sbr_head, sbw_head,
-                           shr_b, shr_l, shr_d, shw_b, shw_l, shw_d, shg_b, shg_l, shg_d,
+                           sl_b, sl_l, sl_lvl, sl_bb,
+                           sh_b, sh_l, sh_d, shw_b, shw_l, shw_d, shg_b, shg_l, shg_d,
                            swr_lvl, swr_d, swr_b, sww_lvl, sww_d, sww_b,
                            ssel_lvl, ssel_b, ssel_c, sg_b, sg_t, sg_c,
                            sdhr_b, sdhr_l, sdhr_d, sdhw_b, sdhw_l, sdhw_d, sdhg_b, sdhg_l, sdhg_d,
@@ -1745,13 +1684,12 @@ def _kappa_router_bwd_fold(hr_ptr, hw_ptr, hg_ptr, wr_ptr, ww_ptr, sel_ptr, gdr_
         dz = tl.zeros([BT], dtype=tl.float32)
     cols = cb * BC + offs_c
     cmask = cols < nc
-    r_tile, w_tile = _build_rw_tile(
-        hr_ptr, hw_ptr, wr_ptr, ww_ptr, sel_ptr, cols, cmask,
-        pid_b, rows, rmask, offs_bb, bmask, d_model,
-        shr_b, shr_l, shr_d, shw_b, shw_l, shw_d,
-        swr_lvl, swr_d, swr_b, sww_lvl, sww_d, sww_b,
-        ssel_lvl, ssel_b, ssel_c, br_ptr, bw_ptr, sbr_lvl, sbr_b, sbw_lvl, sbw_b,
-        D, BT, BB, BC, BD, NDM, HAS_BIAS, BUILD_R=True)
+    route_rows = rows - route_t0
+    r_tile, w_tile = _build_factors_logits(
+        lr_ptr, lw_ptr, sel_ptr, cols, cmask,
+        pid_b, route_rows, rmask, offs_bb, bmask,
+        sl_b, sl_l, sl_lvl, sl_bb, ssel_lvl, ssel_b, ssel_c,
+        D, BT, BB, BC)
     dr_tile = tl.load(gdr_ptr + pid_b * sg_b + offs_t[:, None] * sg_t + cols[None, :] * sg_c,
                       mask=rmask[:, None] & cmask[None, :], other=0.0)
     dw_tile = tl.load(gdw_ptr + pid_b * sg_b + offs_t[:, None] * sg_t + cols[None, :] * sg_c,
@@ -1771,18 +1709,16 @@ def _kappa_router_bwd_fold(hr_ptr, hw_ptr, hg_ptr, wr_ptr, ww_ptr, sel_ptr, gdr_
         dw_tile += dld * (-one_minus_a / m)
         dz += tl.sum(dld * (w_tile / m), axis=1) * (alpha * (1.0 - alpha))
     for lvl in tl.static_range(0, D):
-        fr, fw, sel = _build_level_factors_weights(
-            hr_ptr, hw_ptr, wr_ptr, ww_ptr, sel_ptr, cols, cmask,
-            pid_b, rows, rmask, offs_bb, bmask, d_model,
-            shr_b, shr_l, shr_d, shw_b, shw_l, shw_d,
-            swr_lvl, swr_d, swr_b, sww_lvl, sww_d, sww_b,
-            ssel_lvl, ssel_b, ssel_c, br_ptr, bw_ptr, sbr_lvl, sbr_b, sbw_lvl, sbw_b,
-            lvl, BT, BB, BD, NDM, HAS_BIAS)
+        fr, fw, sel = _build_level_factors_logits(
+            lr_ptr, lw_ptr, sel_ptr, cols, cmask,
+            pid_b, route_rows, rmask, offs_bb, bmask,
+            sl_b, sl_l, sl_lvl, sl_bb, ssel_lvl, ssel_b, ssel_c,
+            lvl, BT, BB)
         _fold_level_weights(
             dr_tile, dw_tile, r_tile, w_tile, fr, fw, sel,
-            hr_ptr, hw_ptr, wr_ptr, ww_ptr, dhr_ptr, dhw_ptr, dwr_ptr, dww_ptr, dbr_ptr, dbw_ptr,
+            h_ptr, h_w_ptr, wr_ptr, ww_ptr, dhr_ptr, dhw_ptr, dwr_ptr, dww_ptr, dbr_ptr, dbw_ptr,
             br_ptr, bw_ptr, pid_b, rows, rmask, offs_bb, bmask, d_model,
-            shr_b, shr_l, shr_d, shw_b, shw_l, shw_d,
+            sh_b, sh_l, sh_d, shw_b, shw_l, shw_d,
             swr_lvl, swr_d, swr_b, sww_lvl, sww_d, sww_b,
             sdhr_b, sdhr_l, sdhr_d, sdhw_b, sdhw_l, sdhw_d,
             sbr_lvl, sbr_b, sbw_lvl, sbw_b,
@@ -1803,7 +1739,7 @@ def _kappa_router_bwd_fold(hr_ptr, hw_ptr, hg_ptr, wr_ptr, ww_ptr, sel_ptr, gdr_
 @triton.jit
 def _kappa_bwd_state(hr_ptr, hw_ptr, hg_ptr, k_ptr, v_ptr, wr_ptr, ww_ptr, sel_ptr, wg_ptr, sval_ptr, sden_ptr,
                      dsval_ptr, dsden_ptr, dk_ptr, dv_ptr, gdw_ptr, gda_ptr, br_ptr, bw_ptr,
-                     L, d_model, d_model_g, dqk, dv, nc, t_start,
+                     L, d_model, d_model_g, dqk, dv, nc, t_start, route_t0,
                      H, swr_head, sww_head, sbr_head, sbw_head,
                      shr_b, shr_l, shr_d, shw_b, shw_l, shw_d, shg_b, shg_l, shg_d,
                      sq_b, sq_l, sq_d, sv_b, sv_l, sv_d,
@@ -1847,13 +1783,12 @@ def _kappa_bwd_state(hr_ptr, hw_ptr, hg_ptr, k_ptr, v_ptr, wr_ptr, ww_ptr, sel_p
     cb = tl.program_id(1)
     cols = cb * BC + offs_c
     cmask = cols < nc
-    _r, w_tile = _build_rw_tile(
-        hr_ptr, hw_ptr, wr_ptr, ww_ptr, sel_ptr, cols, cmask,
-        pid_b, rows, rmask, offs_bb, bmask, d_model,
-        shr_b, shr_l, shr_d, shw_b, shw_l, shw_d,
-        swr_lvl, swr_d, swr_b, sww_lvl, sww_d, sww_b,
-        ssel_lvl, ssel_b, ssel_c, br_ptr, bw_ptr, sbr_lvl, sbr_b, sbw_lvl, sbw_b,
-        D, BT, BB, BC, BD, NDM, HAS_BIAS, BUILD_R=False)
+    route_rows = rows - route_t0
+    _r, w_tile = _build_factors_logits(
+        hr_ptr, hw_ptr, sel_ptr, cols, cmask,
+        pid_b, route_rows, rmask, offs_bb, bmask,
+        shr_b, shr_l, swr_lvl, swr_b, ssel_lvl, ssel_b, ssel_c,
+        D, BT, BB, BC)
     if USE_G:
         ldc = _ld_from_w(w_tile, alpha, cmask, GLA_FLOOR)
         a = tl.cumsum(ldc, axis=0)
@@ -1932,7 +1867,7 @@ def _kappa_bwd_read(hr_ptr, hw_ptr, hg_ptr, q_ptr, k_ptr, v_ptr, wr_ptr, ww_ptr,
                     sval_ptr, sden_ptr, dnum_ptr, dden_ptr,
                     dsval_ptr, dsden_ptr, dq_ptr, dk_ptr, dv_ptr, dkap_ptr, gdr_ptr, gdw_ptr, gda_ptr,
                     br_ptr, bw_ptr,
-                    L, d_model, d_model_g, dqk, dv, nc, t_start,
+                    L, d_model, d_model_g, dqk, dv, nc, t_start, route_t0,
                     H, swr_head, sww_head, sbr_head, sbw_head,
                     shr_b, shr_l, shr_d, shw_b, shw_l, shw_d, shg_b, shg_l, shg_d,
                     sq_b, sq_l, sq_d, sv_b, sv_l, sv_d, sk_b, sk_l,
@@ -1999,13 +1934,12 @@ def _kappa_bwd_read(hr_ptr, hw_ptr, hg_ptr, q_ptr, k_ptr, v_ptr, wr_ptr, ww_ptr,
     cb = tl.program_id(1)
     cols = cb * BC + offs_c
     cmask = cols < nc
-    r_tile, w_tile = _build_rw_tile(
-        hr_ptr, hw_ptr, wr_ptr, ww_ptr, sel_ptr, cols, cmask,
-        pid_b, rows, rmask, offs_bb, bmask, d_model,
-        shr_b, shr_l, shr_d, shw_b, shw_l, shw_d,
-        swr_lvl, swr_d, swr_b, sww_lvl, sww_d, sww_b,
-        ssel_lvl, ssel_b, ssel_c, br_ptr, bw_ptr, sbr_lvl, sbr_b, sbw_lvl, sbw_b,
-        D, BT, BB, BC, BD, NDM, HAS_BIAS, BUILD_R=True)
+    route_rows = rows - route_t0
+    r_tile, w_tile = _build_factors_logits(
+        hr_ptr, hw_ptr, sel_ptr, cols, cmask,
+        pid_b, route_rows, rmask, offs_bb, bmask,
+        shr_b, shr_l, swr_lvl, swr_b, ssel_lvl, ssel_b, ssel_c,
+        D, BT, BB, BC)
     if USE_G:
         ldc = _ld_from_w(w_tile, alpha, cmask, GLA_FLOOR)
         a = tl.cumsum(ldc, axis=0)
@@ -2156,7 +2090,7 @@ def _kappa_bwd_read(hr_ptr, hw_ptr, hg_ptr, q_ptr, k_ptr, v_ptr, wr_ptr, ww_ptr,
 
 def _kappa_routed_bwd(q, k, v, h, h_w, h_g, Wr, Ww, b_r, b_w, kap, alpha,
                       ckpt_val, ckpt_den, out, dnum, dden, D, b, sel, chunk,
-                      global_norm, per_state, eps, H, Wg=None, checkpoint_window_override=None):
+                      global_norm, per_state, eps, H, route_window, Wg=None):
     """Reverse chunk-scan backward for the fused global/kappa/per_state path. Carries dSval,dSden
     adjoints; recomputes r,w,d,r_tilde transiently per chunk; folds the [BT,nc] gate-grads into
     dWr,dWw,dh (and db_r/db_w when a routing bias is present — transient, never [L,nc]). Returns
@@ -2182,7 +2116,7 @@ def _kappa_routed_bwd(q, k, v, h, h_w, h_g, Wr, Ww, b_r, b_w, kap, alpha,
     chunk = _kappa_fit_chunk(dqk, dv, chunk, BC)
     BK = _kappa_bk_cap(dqk, dv, chunk, BC)   # feature-tile (loop ND) — bounds the [BT,BC*BK] tiles
     BV = _kappa_bv_tile(dqk, dv, BC, BK)     # value-tile (loop ND_V) so the [BC*BK,BV] state slices fit
-    BD, NDM = _router_bd_ndm(d_model_g, b)
+    BD, NDM = _router_bd_ndm(max(d_model, d_model_g), b)
     BB = max(16, triton.next_power_of_2(b))
     NCBLK = triton.cdiv(nc, BC)
     ND = triton.cdiv(dqk, BK)
@@ -2226,10 +2160,11 @@ def _kappa_routed_bwd(q, k, v, h, h_w, h_g, Wr, Ww, b_r, b_w, kap, alpha,
     sH = (h.stride(0), h.stride(1), h.stride(2))
     sHw = (h_w.stride(0), h_w.stride(1), h_w.stride(2))
     sHg = (h_g.stride(0), h_g.stride(1), h_g.stride(2))
+    sSel = (sel.stride(0), sel.stride(1), sel.stride(2))
+    weight_head = _router_head_strides(Wr, Ww, br, bw, has_bias)
+    logit_head = (H, 0, 0, 0, 0)
     sWr = (Wr.stride(1), Wr.stride(2), Wr.stride(3))
     sWw = (Ww.stride(1), Ww.stride(2), Ww.stride(3))
-    sSel = (sel.stride(0), sel.stride(1), sel.stride(2))
-    head = _router_head_strides(Wr, Ww, br, bw, has_bias)
     # snapshot (Sval_j/Sden_j) strides for the state-bwd ZdZ term — same (B, flat-k, v) layout as dSval.
     sSV = (dSval.stride(0), dSval.stride(2), dSval.stride(3))   # (B, flat-k=dqk-axis, v)
     sSD = (dSden.stride(0), dSden.stride(2))                    # (B, flat-k)
@@ -2241,16 +2176,13 @@ def _kappa_routed_bwd(q, k, v, h, h_w, h_g, Wr, Ww, b_r, b_w, kap, alpha,
     read_common = dict(GLOBAL=global_norm, PER_STATE=per_state, EPS=eps, D=D, b=b, BB=BB, BT=chunk,
                        BK=BK, BV=BV, BD=BD, BC=BC, ND=ND, NDM=NDM,
                        HAS_BIAS=has_bias, USE_G=use_g, GLA_FLOOR=_GLA_FLOOR, num_warps=4, num_stages=1)
-    # #55 sqrt-checkpointing: the FORWARD saved only √NCH boundary checkpoints (ckpt_val/ckpt_den, passed
-    # in). Here we recompute each segment's W pre-state snapshots on demand from its checkpoint (Pass 2,
-    # below) — peak snapshot mem ~2√NCH·state instead of the old all-snapshot NCH·state (∝ L² when nc∝L), at
-    # NO extra forward pass (the forward already paid the scan; it just stashed √NCH states). The reverse-scan
-    # order is unchanged (global c=NCH-1..0), preserving carried adjoints and GLA decay. Segment recompute
-    # seeds fp32 state from the same fp32 forward checkpoints, so fp32 matches the all-snapshot path exactly;
-    # bf16 remains within normal rounding-scale tolerance. W matches the forward's via _kappa_ckpt_window.
-    W = _kappa_ckpt_window(NCH) if checkpoint_window_override is None else max(1, int(checkpoint_window_override))
+    # The forward saved memory-budgeted boundary checkpoints. Backward uses the exact same window, recomputes
+    # each segment's pre-state snapshots from its checkpoint, and builds only that segment's compact router
+    # logits. The reverse-scan order is unchanged, preserving carried adjoints and GLA decay.
+    W = max(1, int(route_window))
     seg_lo = NCH   # chunk range [seg_lo, seg_hi) of the currently-loaded segment snapshots (lazy, reverse)
-    seg_val = seg_den = None
+    seg_val = seg_den = lr_seg = lw_seg = None
+    sL = sLw = sWrl = sWwl = None
     for c in reversed(range(NCH)):
         if c < seg_lo:
             # crossed into the previous segment (reverse order): recompute its W pre-states from the
@@ -2261,31 +2193,40 @@ def _kappa_routed_bwd(q, k, v, h, h_w, h_g, Wr, Ww, b_r, b_w, kap, alpha,
                 q, k, v, h, h_w, Wr, Ww, b_r, b_w, alpha if use_g else None, kap, D, b, sel, chunk,
                 global_norm, per_state, eps, H, need_snapshots=True,
                 state_in=(ckpt_val[seg], ckpt_den[seg]), c_lo=seg_lo, c_hi=seg_hi)
+            t0, t1 = seg_lo * chunk, min(L, seg_hi * chunk)
+            lr_seg, lw_seg = _router_logits(h[:, t0:t1], Wr, Ww, b_r, b_w, H, build_r=True, h_w=h_w[:, t0:t1])
+            lr_seg, lw_seg = lr_seg.contiguous(), lw_seg.contiguous()
+            sL = (lr_seg.stride(0), lr_seg.stride(1), 0)
+            sLw = (lw_seg.stride(0), lw_seg.stride(1), 0)
+            sWrl = (lr_seg.stride(2), 0, lr_seg.stride(3))
+            sWwl = (lw_seg.stride(2), 0, lw_seg.stride(3))
         Sval = seg_val[c - seg_lo]    # per-chunk pre-state (recomputed), contiguous [B,nc,dqk,dv] slice
         Sden = seg_den[c - seg_lo]
         gdw.zero_()
         # K1: state-update bwd (reads adjoint of Sval_{j+1}/Sden_{j+1}; produces dk,dv + state half of dw +
         # the USE_G carry/w_end da-pieces, using the chunk-start snapshot Sval_j/Sden_j for the Λ-coupling).
         _kappa_bwd_state[(B, NCBLK)](
-            h, h_w, h_g, k, v, Wr, Ww, sel, Wg, Sval, Sden, dSval, dSden, dk, dvv, gdw, gda, br, bw,
-            L, d_model, d_model_g, dqk, dv, nc, c * chunk, *head,
-            *sH, *sHw, *sHg, *sB, *sV, *sWr, *sWw, *sSel, swg[0], swg[1], *sSV, *sSD, *sGD, *sga, *sBias,
+            lr_seg, lw_seg, h_g, k, v, br, bw, sel, Wg, Sval, Sden, dSval, dSden, dk, dvv, gdw, gda, br, bw,
+            L, 1, d_model_g, dqk, dv, nc, c * chunk, seg_lo * chunk, *logit_head,
+            *sL, *sLw, *sHg, *sB, *sV, *sWrl, *sWwl, *sSel, swg[0], swg[1], *sSV, *sSD, *sGD, *sga, *sBias,
             **state_common)
         # K2: readout/den/d bwd (adds dw, produces dr,dq,dv-intra,dkappa; folds dSval/dSden adjoints).
         _kappa_bwd_read[(B, NCBLK)](
-            h, h_w, h_g, q, k, v, Wr, Ww, sel, kap, Wg, Sval, Sden, dnum, dden,
+            lr_seg, lw_seg, h_g, q, k, v, br, bw, sel, kap, Wg, Sval, Sden, dnum, dden,
             dSval, dSden, dq, dk, dvv, dkap, gdr, gdw, gda, br, bw,
-            L, d_model, d_model_g, dqk, dv, nc, c * chunk, *head,
-            *sH, *sHw, *sHg, *sB, *sV, kap.stride(0), kap.stride(1), *sWr, *sWw, *sSel, swg[0], swg[1], *sSV, *sSD,
+            L, 1, d_model_g, dqk, dv, nc, c * chunk, seg_lo * chunk, *logit_head,
+            *sL, *sLw, *sHg, *sB, *sV, kap.stride(0), kap.stride(1), *sWrl, *sWwl, *sSel, swg[0], swg[1], *sSV, *sSD,
             dnum.stride(0), dnum.stride(1), dnum.stride(2), dden.stride(0), dden.stride(1), *sGD, *sga,
             *sBias,
             **read_common)
         # Fold transient gate-grads directly through the router softmax into dh/dW/db. USE_G reverse-cumsums
         # gda in-kernel, then splits dld into dWg plus decay and write-gate contributions.
         _kappa_router_bwd_fold[(B, NCBLK)](
-            h, h_w, h_g, Wr, Ww, sel, gdr, gdw, dh, dhw, dhg, dWr, dWw, br, bw, dbr, dbw,
+            lr_seg, lw_seg, h, h_w, h_g, Wr, Ww, sel, gdr, gdw, dh, dhw, dhg, dWr, dWw, br, bw, dbr, dbw,
             Wg, dWg, gda,
-            L, d_model, d_model_g, nc, c * chunk, *head, *sH, *sHw, *sHg, *sWr, *sWw, *sSel,
+            L, d_model, d_model_g, nc, c * chunk, seg_lo * chunk, *weight_head,
+            lr_seg.stride(0), lr_seg.stride(1), lr_seg.stride(2), lr_seg.stride(3),
+            *sH, *sHw, *sHg, *sWr, *sWw, *sSel,
             gdr.stride(0), gdr.stride(1), gdr.stride(2),
             dh.stride(0), dh.stride(1), dh.stride(2),
             dhw.stride(0), dhw.stride(1), dhw.stride(2),
@@ -2362,11 +2303,11 @@ class _RoLARoutedKappaFn(torch.autograd.Function):
             q, k, v, kap = (x.float().contiguous() for x in (q, k, v, kap))
             alphaf = alphac.float().contiguous() if use_g else None
             Wgc = Wgc.float().contiguous() if Wgc is not None else None
-            num, den, ckv, ckd, _ck = _kappa_routed_fwd(
+            num, den, ckv, ckd, ck_info = _kappa_routed_fwd(
                 q, k, v, h, h_w, Wr, Ww, b_rc, b_wc, alphaf, kap, D, b, sel, chunk,
                 global_norm, per_state, eps, H, save_checkpoints=True)
         else:
-            num, den, _sv, _sd, _ck = _kappa_routed_fwd(
+            num, den, _sv, _sd, ck_info = _kappa_routed_fwd(
                 q, k, v, h, h_w, Wr, Ww, b_rc, b_wc, alphac if use_g else None, kap, D, b, sel, chunk,
                 global_norm, per_state, eps, H)
             ckv = ckd = None
@@ -2377,7 +2318,8 @@ class _RoLARoutedKappaFn(torch.autograd.Function):
         # Save fp32 out/den so backward owns the normalization and can avoid the worst dκ num/den
         # cancellation at the custom autograd boundary.
         ctx.save_for_backward(q, k, v, h, h_w, h_g, Wr, Ww, b_rc, b_wc, kap, alphac, Wgc, ckv, ckd, out, den_f)
-        ctx.D, ctx.b, ctx.chunk = D, b, chunk
+        ctx.D, ctx.b = D, b
+        ctx.chunk, ctx.route_window = ck_info
         ctx.global_norm, ctx.per_state, ctx.eps = global_norm, per_state, eps
         ctx.H = H
         ctx.q_dtype = q_dtype
@@ -2397,7 +2339,7 @@ class _RoLARoutedKappaFn(torch.autograd.Function):
         H = ctx.H
         nc = b ** D
         sel = _build_sel(D, b, nc, q.device)
-        # The route tiles are rebuilt from h/W/b in-kernel; q/k/v/kap keep fp32 for the den/decay-sensitive path.
+        # Router logits are rebuilt a segment at a time; q/k/v/kap stay fp32 for the den/decay-sensitive path.
         q, k, v, kap = (x.float().contiguous() for x in (q, k, v, kap))
         h, h_w, h_g, Wr, Ww = (x.contiguous() for x in (h, h_w, h_g, Wr, Ww))
         b_r = b_r.contiguous() if b_r is not None else None
@@ -2405,7 +2347,7 @@ class _RoLARoutedKappaFn(torch.autograd.Function):
         Wgf = Wg.float().contiguous() if use_g else None
         # #55: _kappa_routed_bwd re-fits the chunk from the ctx ceiling via the shared _kappa_fit_chunk
         # (idempotent → same chunk + NCH + window as the forward), then recomputes each segment's snapshots
-        # on demand from √NCH checkpoints that match the old dense recompute for q/k/v/kap state precision.
+        # on demand from sparse checkpoints that match the old dense recompute for q/k/v/kap state precision.
         # Reverse-scan order and routing operand dtypes are unchanged.
         den_e = den.unsqueeze(-1) + eps
         do = do.float().contiguous()
@@ -2415,7 +2357,7 @@ class _RoLARoutedKappaFn(torch.autograd.Function):
             q, k, v, h, h_w, h_g, Wr, Ww, b_r if ctx.has_bias else None, b_w if ctx.has_bias else None,
             kap, alpha.float().contiguous() if use_g else None,
             ckpt_val, ckpt_den, out.float(), dnum, dden,
-            D, b, sel, chunk, global_norm, per_state, eps, H, Wg=Wgf)
+            D, b, sel, chunk, global_norm, per_state, eps, H, ctx.route_window, Wg=Wgf)
         dq, dk, dv, dh, dhw, dhg, dWr, dWw, dbr, dbw, dkap = grads[:11]
         dWg = grads[11] if use_g else None
         q_dtype = ctx.q_dtype
@@ -2436,8 +2378,8 @@ class _RoLARoutedKappaFn(torch.autograd.Function):
 def _kappa_routed_readout(qf, kf, vf, hf, hfw, hfg, Wr, Ww, kapf, alpha, D, b, chunk_size,
                           global_norm, per_state, eps, b_r=None, b_w=None, Wg=None, H=None):
     """Fused global/kappa/per_state tree-routed readout returning normalized out[BH,L,V],
-    differentiable in grad mode. Kernels build only the current [BT,BC] route tile from h/W/b and fold
-    tile adjoints directly into router grads; no training path materializes compact [L,D,b] logits."""
+    differentiable in grad mode. Training builds only bounded route-logit windows and folds tile adjoints
+    directly into router grads; no training path materializes full-sequence compact [L,D,b] logits."""
     kap = kapf.reshape(qf.shape[0], qf.shape[1]).contiguous()    # [BH,L]
     if (alpha is None) != (Wg is None):
         raise ValueError("GLA kappa path requires both precomputed `alpha` and `Wg`; RLA passes neither.")
